@@ -330,6 +330,7 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 			     rt.view.base_array_slice_index, rt.view.last_array_slice_index,
 			     render_target_slice_offset);
 	}
+	r->base_array_layer   = view.base_layer;
 	const uint32_t levels = rt.attrib2.num_mip_levels + 1u;
 	if (levels == 0 || levels > 16 || rt.view.current_mip_level >= levels) {
 		EXIT("unsupported render-target mip range: current=%u levels=%u\n",

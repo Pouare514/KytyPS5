@@ -624,7 +624,7 @@ ClassifyRenderTargetOverlap(const RenderTargetInfo& cached, bool cached_gpu_modi
 	}
 	// For an equal-address allocation-pool entry, a changed block raster or block size is a new
 	// image allocation, not a view of the old image. In Kyty we can only retire an
-	// already-published target with page-isolated storage :)
+	// already-published target with page-isolated storage.
 	const bool page_isolated =
 	    cached.address % TRACKER_PAGE_SIZE == 0 && cached.size % TRACKER_PAGE_SIZE == 0 &&
 	    requested.address % TRACKER_PAGE_SIZE == 0 && requested.size % TRACKER_PAGE_SIZE == 0;

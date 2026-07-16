@@ -387,18 +387,9 @@ struct TextureCache::ReadbackWorker {
 		}
 		download.resize(info.size);
 		std::fill(download.begin(), download.end(), 0);
-		std::vector<ImageBufferCopy> regions;
-		regions.reserve(info.layers);
-		for (uint32_t layer = 0; layer < info.layers; layer++) {
-			ImageBufferCopy region {};
-			region.offset    = static_cast<uint32_t>(slice_size * layer);
-			region.pitch     = info.pitch;
-			region.width     = info.width;
-			region.height    = info.height;
-			region.src_layer = layer;
-			region.aspect    = VK_IMAGE_ASPECT_DEPTH_BIT;
-			regions.push_back(region);
-		}
+		const auto regions =
+		    MakeLayeredImageBufferCopies(info.layers, slice_size, info.pitch, info.width,
+		                                 info.height, VK_IMAGE_ASPECT_DEPTH_BIT);
 		UtilFillBuffer(cached.ctx, download.data(), info.size, regions, cached.image,
 		               cached.image->layout);
 		guest.resize(info.size);
@@ -467,17 +458,8 @@ struct TextureCache::ReadbackWorker {
 		}
 		download.resize(info.size);
 		std::fill(download.begin(), download.end(), 0);
-		std::vector<ImageBufferCopy> regions;
-		regions.reserve(layers);
-		for (uint32_t layer = 0; layer < layers; layer++) {
-			ImageBufferCopy region {};
-			region.offset    = static_cast<uint32_t>(slice_size * layer);
-			region.pitch     = info.pitch;
-			region.width     = info.width;
-			region.height    = info.height;
-			region.src_layer = layer;
-			regions.push_back(region);
-		}
+		const auto regions =
+		    MakeLayeredImageBufferCopies(layers, slice_size, info.pitch, info.width, info.height);
 		UtilFillBuffer(cached.ctx, download.data(), info.size, regions, cached.image,
 		               cached.image->layout);
 		if (tiled) {
@@ -3046,7 +3028,6 @@ void TextureCache::MarkGpuWritten(VulkanImage* image) {
 				    cached->depth.htile_address, cached->depth.htile_size, true,
 				    [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
 				meta->second.gpu_modified = true;
-				meta->second.clear_mask   = 0;
 			}
 		}
 		if (!cached->gpu_modified) {
@@ -3110,29 +3091,34 @@ void TextureCache::SynchronizeRenderTargetToBufferLocked(CachedImage& cached) {
 	    target.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
 	const auto    rows = static_cast<uint64_t>(target.height - 1);
 	TileSizeAlign exact {};
-	const bool    exact_tiled = tiled &&
-	                            TileGetRenderTargetSize(target.width, target.height, target.pitch,
-	                                                    target.bytes_per_element, &exact) &&
-	                            exact.align == 65536 && exact.size == target.size;
+	const bool    single_slice = TileGetRenderTargetSize(target.width, target.height, target.pitch,
+	                                                     target.bytes_per_element, &exact);
+	const bool    layered_size = target.layers != 0 && single_slice &&
+	                             exact.size <= UINT64_MAX / target.layers &&
+	                             exact.size * target.layers == target.size;
+	const bool    exact_tiled  = tiled && exact.align == 65536 && layered_size;
 	if (cached.kind != CachedImage::Kind::RenderTarget || !cached.gpu_modified ||
 	    cached.buffer_modified || cached.ctx == nullptr || cached.image == nullptr ||
 	    (!linear && !exact_tiled) || target.address == 0 || target.size == 0 || target.width == 0 ||
 	    target.height == 0 || target.pitch < target.width || target.bytes_per_element == 0 ||
-	    target.levels != 1 || rows > (UINT64_MAX - target.width) / target.pitch) {
+	    target.layers == 0 || target.size % target.layers != 0 || target.size > UINT32_MAX ||
+	    target.levels != 1 || cached.image->layers != target.layers ||
+	    rows > (UINT64_MAX - target.width) / target.pitch) {
 		EXIT("TextureCache: unsupported render-target buffer synchronization, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " extent=%ux%u pitch=%u bpe=%u levels=%u tile=%u"
+		     " extent=%ux%u pitch=%u bpe=%u levels=%u layers=%u/%u tile=%u"
 		     " gpu_modified=%d buffer_modified=%d\n",
 		     target.address, target.size, target.width, target.height, target.pitch,
-		     target.bytes_per_element, target.levels, target.tile_mode, cached.gpu_modified,
-		     cached.buffer_modified);
+		     target.bytes_per_element, target.levels, target.layers, cached.image->layers,
+		     target.tile_mode, cached.gpu_modified, cached.buffer_modified);
 	}
 	const auto linear_elements = rows * target.pitch + target.width;
 	if (linear_elements > UINT64_MAX / target.bytes_per_element) {
 		EXIT("TextureCache: render-target buffer synchronization size overflow\n");
 	}
 	const auto linear_size = linear_elements * target.bytes_per_element;
-	if (linear_size > target.size || cached.image->format != target.format ||
+	const auto slice_size  = target.size / target.layers;
+	if (linear_size > slice_size || cached.image->format != target.format ||
 	    cached.image->extent.width != target.width ||
 	    cached.image->extent.height != target.height ||
 	    (tiled && target.bytes_per_element != 1 && target.bytes_per_element != 2 &&
@@ -3149,7 +3135,9 @@ void TextureCache::SynchronizeRenderTargetToBufferLocked(CachedImage& cached) {
 	VulkanDeviceWaitIdle(cached.ctx);
 	m_buffer_transition_linear.resize(target.size);
 	std::fill(m_buffer_transition_linear.begin(), m_buffer_transition_linear.end(), 0);
-	UtilFillBuffer(cached.ctx, m_buffer_transition_linear.data(), linear_size, target.pitch,
+	const auto regions = MakeLayeredImageBufferCopies(target.layers, slice_size, target.pitch,
+	                                                  target.width, target.height);
+	UtilFillBuffer(cached.ctx, m_buffer_transition_linear.data(), target.size, regions,
 	               cached.image, cached.image->layout);
 	if (tiled) {
 		m_buffer_transition_guest.resize(target.size);
@@ -3171,7 +3159,7 @@ void TextureCache::SynchronizeRenderTargetToBufferLocked(CachedImage& cached) {
 	cached.buffer_modified = true;
 }
 
-void TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
+bool TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
                                            bool formatted_buffer_write) {
 	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
@@ -3226,23 +3214,24 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
 		sampled_write = sampled;
 	}
 	if (match == m_images.end()) {
-		return;
+		return false;
 	}
 	if (sampled_write) {
 		(**match).buffer_modified = true;
-		return;
+		return true;
 	}
 	if (action == BufferImageAlias::VideoOutWrite) {
 		auto& cached           = **match;
 		cached.buffer_modified = true;
-		return;
+		return true;
 	}
 	if (action == BufferImageAlias::RenderTargetWrite) {
 		SynchronizeRenderTargetToBufferLocked(**match);
-		return;
+		return true;
 	}
 	m_memory_tracker.UntrackMemory(vaddr, size);
 	m_images.erase(match);
+	return true;
 }
 
 DepthStencilVulkanImage* TextureCache::FindDepthTargetByRange(uint64_t vaddr, uint64_t size) {

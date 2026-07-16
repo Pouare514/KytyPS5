@@ -32,6 +32,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -1247,6 +1248,24 @@ void RenderDrawIndexAuto(uint64_t submit_id, CommandBuffer* buffer, HW::Context*
 	                    index_bind, false, false, true);
 }
 
+bool IsSameColorResolveSubresource(const RenderColorInfo& src, const RenderColorInfo& dst) {
+	return src.base_addr == dst.base_addr && src.base_mip_level == dst.base_mip_level &&
+	       src.base_array_layer == dst.base_array_layer;
+}
+
+ImageImageCopy MakeColorResolveCopy(const RenderColorInfo& src, const RenderColorInfo& dst,
+                                    uint32_t width, uint32_t height) {
+	ImageImageCopy region {};
+	region.src_image = src.vulkan_buffer;
+	region.src_level = src.base_mip_level;
+	region.dst_level = dst.base_mip_level;
+	region.width     = width;
+	region.height    = height;
+	region.src_layer = src.base_array_layer;
+	region.dst_layer = dst.base_array_layer;
+	return region;
+}
+
 static bool ResolveColorTargets(uint64_t submit_id, CommandBuffer* buffer, const HW::Context& hw,
                                 uint32_t render_target_slice_offset) {
 	if (hw.GetColorControl().mode != 3) {
@@ -1268,7 +1287,7 @@ static bool ResolveColorTargets(uint64_t submit_id, CommandBuffer* buffer, const
 	    src.type == RenderColorType::NoColorOutput || dst.type == RenderColorType::NoColorOutput) {
 		return false;
 	}
-	if (src.base_addr == dst.base_addr && src.base_mip_level == dst.base_mip_level) {
+	if (IsSameColorResolveSubresource(src, dst)) {
 		return true;
 	}
 
@@ -1278,14 +1297,7 @@ static bool ResolveColorTargets(uint64_t submit_id, CommandBuffer* buffer, const
 		return false;
 	}
 
-	std::vector<ImageImageCopy> regions;
-	ImageImageCopy              region {};
-	region.src_image = src.vulkan_buffer;
-	region.src_level = src.base_mip_level;
-	region.dst_level = dst.base_mip_level;
-	region.width     = width;
-	region.height    = height;
-	regions.push_back(region);
+	const std::array regions {MakeColorResolveCopy(src, dst, width, height)};
 
 	MarkRenderTargetGpuWritten(dst);
 	UtilImageToImage(buffer, regions, dst.vulkan_buffer, dst.vulkan_buffer->layout);

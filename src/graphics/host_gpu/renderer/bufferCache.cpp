@@ -1001,7 +1001,7 @@ std::pair<VulkanBuffer*, uint64_t> BufferCache::ObtainBuffer(CommandBuffer*  com
 				     " size=0x%016" PRIx64 " read=%d written=%d formatted=%d\n",
 				     vaddr, size, is_read, is_written, is_formatted);
 			}
-			m_texture_cache->InvalidateMemoryFromGPU(vaddr, size, true);
+			(void)m_texture_cache->InvalidateMemoryFromGPU(vaddr, size, true);
 		}
 	}
 	if (is_written) {
@@ -1421,6 +1421,7 @@ void BufferCache::CopyBuffer(CommandBuffer* command, GraphicContext* ctx, uint64
 	}
 	ValidateGpuAccess(src_vaddr, size, true, false);
 	ValidateGpuAccess(dst_vaddr, size, false, true);
+	bool dst_image_transition = false;
 	{
 		std::lock_guard transaction(m_resource_mutex);
 		const bool src_image_gpu = m_texture_cache->HasGpuModifiedRangeOverlap(src_vaddr, size);
@@ -1452,7 +1453,7 @@ void BufferCache::CopyBuffer(CommandBuffer* command, GraphicContext* ctx, uint64
 			     " dst=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 			     src_vaddr, dst_vaddr, size);
 		}
-		m_texture_cache->InvalidateMemoryFromGPU(dst_vaddr, size);
+		dst_image_transition = m_texture_cache->InvalidateMemoryFromGPU(dst_vaddr, size);
 		// A clean target destination is handled above like a protected host write. Target
 		// aliases that require an actual GPU buffer copy remain unsupported.
 		if (m_texture_cache->HasGpuTargetPageOverlap(dst_vaddr, size)) {
@@ -1470,7 +1471,8 @@ void BufferCache::CopyBuffer(CommandBuffer* command, GraphicContext* ctx, uint64
 		}
 	}
 	const auto [src, src_offset] = ObtainBuffer(command, ctx, src_vaddr, size, false, true);
-	const auto [dst, dst_offset] = ObtainBuffer(command, ctx, dst_vaddr, size, true, false);
+	const auto [dst, dst_offset] =
+	    ObtainBuffer(command, ctx, dst_vaddr, size, true, false, dst_image_transition);
 	if (src == dst && src_offset < dst_offset + size && dst_offset < src_offset + size) {
 		EXIT("BufferCache: resolved Vulkan copy ranges overlap, src_offset=0x%016" PRIx64
 		     " dst_offset=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",

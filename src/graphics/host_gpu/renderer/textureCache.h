@@ -56,7 +56,7 @@ public:
 	                                               uint64_t size, uint32_t packed_clear);
 	void               MarkGpuWritten(VulkanImage* image);
 	void               PrepareHostWrite(uint64_t vaddr, uint64_t size);
-	void               InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
+	[[nodiscard]] bool InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
 	                                           bool formatted_buffer_write = false);
 	[[nodiscard]] RenderTextureVulkanImage* FindRenderTargetByRange(CommandBuffer* command,
 	                                                                uint64_t vaddr, uint64_t size);

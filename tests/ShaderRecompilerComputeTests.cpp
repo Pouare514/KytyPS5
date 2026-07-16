@@ -15,7 +15,9 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderState.h"
 #include "graphics/host_gpu/renderer/resourceMutex.h"
+#include "graphics/host_gpu/renderer/tiler.h"
 #include "graphics/host_gpu/renderer/textureCache.h"
+#include "graphics/host_gpu/utils.h"
 #include "graphics/shader/recompiler/BindingLayout.h"
 #include "graphics/shader/recompiler/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -9485,6 +9487,31 @@ void CheckStorageTextureVolumeUploadLayout() {
   std::printf("[host]    %-32s ok\n", "StorageTextureVolumeUpload");
 }
 
+void CheckColorResolveLayers() {
+  RenderColorInfo src{};
+  RenderColorInfo dst{};
+  src.base_addr = dst.base_addr = 0x12340000;
+  src.base_mip_level = dst.base_mip_level = 2;
+  src.base_array_layer = 1;
+  dst.base_array_layer = 3;
+  src.vulkan_buffer = reinterpret_cast<VulkanImage *>(uintptr_t{1});
+
+  Require("ColorResolveLayers", "identity",
+          !IsSameColorResolveSubresource(src, dst),
+          "different array layers were treated as the same resolve subresource");
+  const auto copy = MakeColorResolveCopy(src, dst, 128, 64);
+  Require("ColorResolveLayers", "region",
+          copy.src_image == src.vulkan_buffer && copy.src_level == 2 &&
+              copy.dst_level == 2 && copy.src_layer == 1 &&
+              copy.dst_layer == 3 && copy.width == 128 && copy.height == 64,
+          "color resolve dropped its source or destination array layer");
+  dst.base_array_layer = src.base_array_layer;
+  Require("ColorResolveLayers", "same subresource",
+          IsSameColorResolveSubresource(src, dst),
+          "matching color resolve subresources were not recognized");
+  std::printf("[host]    %-32s ok\n", "ColorResolveLayers");
+}
+
 void CheckRenderTargetTileRoundTrip() {
   struct Case {
     uint32_t width;
@@ -9529,6 +9556,64 @@ void CheckRenderTargetTileRoundTrip() {
               "linear-to-tiled render-target conversion did not round-trip");
     }
   }
+  constexpr uint32_t width = 257;
+  constexpr uint32_t height = 131;
+  constexpr uint32_t bytes_per_element = 4;
+  constexpr uint32_t layers = 3;
+  const auto pitch = TileGetRenderTargetPitch(width, bytes_per_element);
+  TileSizeAlign storage{};
+  Require("RenderTargetTileRoundTrip", "layered layout",
+          TileGetRenderTargetSize(width, height, pitch, bytes_per_element,
+                                  &storage) &&
+              storage.size <= UINT32_MAX / layers,
+          "layered render-target test layout was rejected");
+  RenderTargetInfo info{};
+  info.address = 1;
+  info.size = storage.size * layers;
+  info.format = VK_FORMAT_R8G8B8A8_UNORM;
+  info.width = width;
+  info.height = height;
+  info.pitch = pitch;
+  info.bytes_per_element = bytes_per_element;
+  info.tile_mode = Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+  info.layers = layers;
+  std::vector<uint8_t> linear(info.size, 0);
+  for (uint32_t layer = 0; layer < layers; layer++) {
+    for (uint32_t y = 0; y < height; y++) {
+      const auto row = storage.size * layer +
+                       static_cast<uint64_t>(y) * pitch * bytes_per_element;
+      std::fill_n(linear.data() + row, width * bytes_per_element,
+                  static_cast<uint8_t>(0x31 + layer * 0x27));
+    }
+  }
+  std::vector<uint8_t> tiled(info.size, 0xcd);
+  std::vector<uint8_t> restored(info.size, 0xa5);
+  Tiler tiler;
+  tiler.TileImage(tiled.data(), linear.data(), info);
+  for (uint32_t layer = 0; layer < layers; layer++) {
+    TileConvertTiledToLinearRenderTarget(
+        restored.data() + storage.size * layer,
+        tiled.data() + storage.size * layer, width, height, pitch,
+        bytes_per_element, storage.size);
+    for (uint32_t y = 0; y < height; y++) {
+      const auto row = storage.size * layer +
+                       static_cast<uint64_t>(y) * pitch * bytes_per_element;
+      Require("RenderTargetTileRoundTrip", "layered contents",
+              std::memcmp(linear.data() + row, restored.data() + row,
+                          width * bytes_per_element) == 0,
+              "layered render-target conversion crossed array slices");
+    }
+  }
+  const auto regions = MakeLayeredImageBufferCopies(
+      layers, storage.size, pitch, width, height);
+  Require("RenderTargetTileRoundTrip", "layered regions",
+          regions.size() == layers && regions[0].offset == 0 &&
+              regions[1].offset == storage.size &&
+              regions[2].offset == storage.size * 2 &&
+              regions[0].src_layer == 0 && regions[1].src_layer == 1 &&
+              regions[2].src_layer == 2 && regions[2].pitch == pitch &&
+              regions[2].width == width && regions[2].height == height,
+          "layered image-buffer regions did not preserve slice offsets");
   std::printf("[host]    %-32s ok\n", "RenderTargetTileRoundTrip");
 }
 
@@ -10083,7 +10168,8 @@ void CheckOverlappingMetadataViews() {
 void CheckGpuMetadataReuse() {
   constexpr uintptr_t base = 0x0000000200010000ull;
   constexpr uint64_t allocation_size = 0x20000;
-  constexpr uint64_t metadata_size = 0x8000;
+  constexpr uint64_t metadata_size = 0x18000;
+  constexpr uint32_t layers = 3;
   auto *memory = static_cast<uint8_t *>(VirtualAlloc(
       reinterpret_cast<void *>(base), allocation_size,
       MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -10100,22 +10186,34 @@ void CheckGpuMetadataReuse() {
   buffer_cache.SetTextureCache(texture_cache);
   page_manager.OnGpuMap(base, allocation_size);
 
-  texture_cache.RegisterMeta(base, metadata_size);
+  texture_cache.RegisterMeta(base, metadata_size, layers);
   Require("GpuMetadataReuse", "clear", texture_cache.ClearMeta(base),
           "metadata clear setup failed");
-  texture_cache.InvalidateMemoryFromGPU(base, allocation_size);
+  const bool full_image_transition =
+      texture_cache.InvalidateMemoryFromGPU(base, allocation_size);
   Require("GpuMetadataReuse", "discard",
-          !texture_cache.IsMeta(base) &&
+          !full_image_transition && !texture_cache.IsMeta(base) &&
               !texture_cache.HasMetaRangeOverlap(base, allocation_size),
-          "fully overwritten metadata identity was retained");
-  texture_cache.RegisterMeta(base, metadata_size);
+          "metadata-only overwrite retained identity or claimed an image transition");
+  texture_cache.RegisterMeta(base, metadata_size, layers);
   Require("GpuMetadataReuse", "re-register",
           texture_cache.IsMetaRange(base, metadata_size) &&
               texture_cache.ClearMeta(base),
           "metadata identity could not be reused after a GPU overwrite");
-  texture_cache.InvalidateMemoryFromGPU(base + 0x1000, 0x1000);
-  Require("GpuMetadataReuse", "partial discard", !texture_cache.IsMeta(base),
-          "partially overwritten metadata identity was retained");
+  Require("GpuMetadataReuse", "layered clear",
+          texture_cache.IsMetaCleared(base, 0) &&
+              texture_cache.IsMetaCleared(base, 1) &&
+              texture_cache.IsMetaCleared(base, 2) &&
+              texture_cache.TouchMeta(base, 1, false) &&
+              texture_cache.IsMetaCleared(base, 0) &&
+              !texture_cache.IsMetaCleared(base, 1) &&
+              texture_cache.IsMetaCleared(base, 2),
+          "consuming one metadata slice erased another slice's lazy clear");
+  const bool partial_image_transition =
+      texture_cache.InvalidateMemoryFromGPU(base + 0x1000, 0x1000);
+  Require("GpuMetadataReuse", "partial discard",
+          !partial_image_transition && !texture_cache.IsMeta(base),
+          "partial metadata overwrite retained identity or claimed an image transition");
 
   texture_cache.UnmapMemory(base, allocation_size);
   page_manager.OnGpuUnmap(base, allocation_size);
@@ -11379,6 +11477,13 @@ int main(int argc, char **argv) {
     CheckOverlappingMetadataViews();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--layered-image-only") == 0) {
+    CheckColorResolveLayers();
+    CheckRenderTargetTileRoundTrip();
+    CheckDepthTargetTileRoundTrip();
+    CheckGpuMetadataReuse();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-view-only") == 0) {
     CheckSampledColorViews();
     return 0;
@@ -11445,6 +11550,7 @@ int main(int argc, char **argv) {
   CheckStorageTextureDepthTileUploadLayout();
   CheckStorageTextureLinearReadbackLayout();
   CheckStorageImageSwizzleSpecializationId();
+  CheckColorResolveLayers();
   CheckRenderTargetTileRoundTrip();
   CheckDepthTargetTileRoundTrip();
   CheckStencilTargetTileRoundTrip();

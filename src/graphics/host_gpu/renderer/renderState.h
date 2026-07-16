@@ -15,6 +15,7 @@ namespace Libs::Graphics {
 
 class CommandBuffer;
 struct DepthStencilVulkanImage;
+struct ImageImageCopy;
 struct RenderTextureVulkanImage;
 struct ShaderVertexInputInfo;
 struct VulkanImage;
@@ -236,12 +237,19 @@ struct RenderColorInfo {
 	VkFormat          format             = VK_FORMAT_UNDEFINED;
 	VkExtent2D        extent             = {};
 	uint32_t          base_mip_level     = 0;
+	uint32_t          base_array_layer   = 0;
 	uint64_t          base_addr          = 0;
 	uint64_t          buffer_size        = 0;
 	uint32_t          target_slot        = 0;
 	bool              color_clear_enable = false;
 	VkClearColorValue color_clear_value {};
 };
+
+[[nodiscard]] bool           IsSameColorResolveSubresource(const RenderColorInfo& src,
+                                                           const RenderColorInfo& dst);
+[[nodiscard]] ImageImageCopy MakeColorResolveCopy(const RenderColorInfo& src,
+                                                  const RenderColorInfo& dst, uint32_t width,
+                                                  uint32_t height);
 
 struct ScissorRect {
 	int left   = 0;

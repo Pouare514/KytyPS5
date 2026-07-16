@@ -22,6 +22,27 @@ static Common::Mutex              g_scratch_buffer_mutex;
 static std::unique_ptr<uint8_t[]> g_scratch_buffer;
 static uint64_t                   g_scratch_buffer_capacity = 0;
 
+std::vector<ImageBufferCopy> MakeLayeredImageBufferCopies(uint32_t layers, uint64_t slice_size,
+                                                          uint32_t pitch, uint32_t width,
+                                                          uint32_t           height,
+                                                          VkImageAspectFlags aspect) {
+	if (layers == 0 || slice_size == 0 || slice_size > UINT32_MAX ||
+	    slice_size > UINT32_MAX / layers || pitch < width || width == 0 || height == 0) {
+		EXIT("invalid layered image-buffer copy layout\n");
+	}
+	std::vector<ImageBufferCopy> regions(layers);
+	for (uint32_t layer = 0; layer < layers; layer++) {
+		auto& region     = regions[layer];
+		region.offset    = static_cast<uint32_t>(slice_size * layer);
+		region.pitch     = pitch;
+		region.width     = width;
+		region.height    = height;
+		region.src_layer = layer;
+		region.aspect    = aspect;
+	}
+	return regions;
+}
+
 UtilScratchBuffer::UtilScratchBuffer(uint64_t size) {
 	EXIT_IF(size == 0);
 

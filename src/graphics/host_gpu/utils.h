@@ -6,6 +6,7 @@
 
 #include <span>
 #include <utility>
+#include <vector>
 #include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
@@ -63,6 +64,11 @@ struct ImageImageCopy {
 	int                dst_y;
 	int                dst_z = 0;
 };
+
+[[nodiscard]] std::vector<ImageBufferCopy>
+MakeLayeredImageBufferCopies(uint32_t layers, uint64_t slice_size, uint32_t pitch, uint32_t width,
+                             uint32_t           height,
+                             VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT);
 
 enum class StagingBufferType { Texture, Vertex, ReadBack };
 
