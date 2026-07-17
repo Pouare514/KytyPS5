@@ -95,7 +95,9 @@ the Vulkan/SPIR-V validation rules.
 - Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
   **C++ Clang tools for Windows** component
 - Qt 6 for MSVC 2022 64-bit, including Concurrent, Network, and Widgets
-- Vulkan SDK 1.4.350 (same version as CI and `scripts/build-windows.cmd`)
+- Vulkan SDK 1.4.350 (same version as CI and `scripts/build-windows.cmd`). Set `VULKAN_SDK` to the SDK
+  root (e.g. `C:\VulkanSDK\1.4.350.0`); CMake expects `Lib\vulkan-1.lib` under that path. CI
+  verifies this before configuring.
 
 The Microsoft C++ compiler (`cl.exe`) is not supported; use `clang-cl`.
 

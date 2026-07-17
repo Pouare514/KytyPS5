@@ -7,24 +7,34 @@ add_subdirectory(SDL2)
 
 add_library(vulkan-1 UNKNOWN IMPORTED GLOBAL)
 
+set(_vulkan_sdk_lib_dirs "")
+if(DEFINED ENV{VULKAN_SDK} AND NOT "$ENV{VULKAN_SDK}" STREQUAL "")
+	list(APPEND _vulkan_sdk_lib_dirs
+		"$ENV{VULKAN_SDK}/Lib"
+		"$ENV{VULKAN_SDK}/Lib32"
+		"$ENV{VULKAN_SDK}/Lib/x64"
+	)
+endif()
+
 if(MINGW)
-	find_library(Vulkan_Lib NAMES libvulkan-1.dll.a vulkan-1
-	             PATHS "$ENV{VULKAN_SDK}/Lib" "$ENV{VULKAN_SDK}/Lib32" NO_DEFAULT_PATH)
+	find_library(Vulkan_Lib NAMES libvulkan-1.dll.a vulkan-1 vulkan-1.lib
+	             PATHS ${_vulkan_sdk_lib_dirs} NO_DEFAULT_PATH)
 	if(NOT Vulkan_Lib)
-		find_library(Vulkan_Lib NAMES libvulkan-1.dll.a vulkan-1)
+		find_library(Vulkan_Lib NAMES libvulkan-1.dll.a vulkan-1 vulkan-1.lib)
 	endif()
 elseif(WIN32)
-	find_library(Vulkan_Lib NAMES vulkan-1
-	             PATHS "$ENV{VULKAN_SDK}/Lib" "$ENV{VULKAN_SDK}/Lib32" NO_DEFAULT_PATH)
+	find_library(Vulkan_Lib NAMES vulkan-1 vulkan-1.lib
+	             PATHS ${_vulkan_sdk_lib_dirs} NO_DEFAULT_PATH)
 	if(NOT Vulkan_Lib)
-		find_library(Vulkan_Lib NAMES vulkan-1)
+		find_library(Vulkan_Lib NAMES vulkan-1 vulkan-1.lib)
 	endif()
 elseif(LINUX)
 	find_library(Vulkan_Lib vulkan)
 endif()
 
 if(NOT Vulkan_Lib OR Vulkan_Lib MATCHES "-NOTFOUND$")
-	message(FATAL_ERROR "Vulkan library was not found")
+	message(FATAL_ERROR
+		"Vulkan library was not found (VULKAN_SDK='$ENV{VULKAN_SDK}', searched: ${_vulkan_sdk_lib_dirs})")
 endif()
 
 set_target_properties(vulkan-1 PROPERTIES IMPORTED_LOCATION "${Vulkan_Lib}")
