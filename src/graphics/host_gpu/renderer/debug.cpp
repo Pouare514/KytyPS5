@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/debug.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -6,7 +8,6 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/renderer/renderState.h"
 
 #include <atomic>
 #include <cmath>
@@ -368,15 +369,6 @@ static void RtCheck(const HW::RenderTarget& rt) {
 		}
 		if (!RenderIsColorTileMode(rt.attrib3.tile_mode)) {
 			EXIT("unknown PS5 render-target tile mode: 0x%08" PRIx32 "\n", rt.attrib3.tile_mode);
-		}
-		if (rt.attrib3.tile_mode != 0x0000001b) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: using generic PS5 color tile fallback for "
-				     "tile_mode=0x%08" PRIx32 "\n",
-				     rt.attrib3.tile_mode);
-				logged = true;
-			}
 		}
 		if (!RenderIsColorDimension(rt.attrib3.dimension)) {
 			EXIT("unknown PS5 render-target dimension: 0x%08" PRIx32 "\n", rt.attrib3.dimension);

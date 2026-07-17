@@ -6,18 +6,21 @@
 #include "common/common.h"
 #include "common/file.h"
 #include "common/threads.h"
-#include "graphics/host_gpu/renderer/renderState.h"
+#include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/shader/shader.h"
 
 #include <cstddef>
 #include <memory>
 #include <span>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 #include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
 
+struct RenderColorInfo;
+struct RenderDepthInfo;
 struct VulkanFramebuffer;
 
 namespace HW {
@@ -25,6 +28,60 @@ class Context;
 class Shader;
 struct ComputeShaderInfo;
 } // namespace HW
+
+#pragma pack(push, 1)
+
+struct PipelineStaticParameters {
+	float                      viewport_scale[3]        = {};
+	float                      viewport_offset[3]       = {};
+	bool                       negative_one_to_one      = false;
+	int                        scissor_ltrb[4]          = {0};
+	VkPrimitiveTopology        topology                 = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+	bool                       with_depth               = false;
+	bool                       depth_test_enable        = false;
+	bool                       depth_write_enable       = false;
+	VkCompareOp                depth_compare_op         = VK_COMPARE_OP_NEVER;
+	bool                       depth_bounds_test_enable = false;
+	float                      depth_min_bounds         = 0.0f;
+	float                      depth_max_bounds         = 0.0f;
+	bool                       stencil_test_enable      = false;
+	PipelineStencilStaticState stencil_front;
+	PipelineStencilStaticState stencil_back;
+	uint32_t                   color_count                                        = 1;
+	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
+	bool                       cull_front                                         = false;
+	bool                       cull_back                                          = false;
+	bool                       face                                               = false;
+	uint8_t                    color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
+	uint8_t                    color_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
+	uint8_t                    color_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
+	uint8_t                    alpha_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
+	uint8_t                    alpha_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
+	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
+	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+	bool                       blend_bypass[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+	float                      blend_color_red                                    = 0.0f;
+	float                      blend_color_green                                  = 0.0f;
+	float                      blend_color_blue                                   = 0.0f;
+	float                      blend_color_alpha                                  = 0.0f;
+
+	bool operator==(const PipelineStaticParameters& other) const noexcept;
+};
+
+#pragma pack(pop)
+
+static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
+static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
+static_assert(alignof(PipelineStaticParameters) == 1);
+static_assert(sizeof(PipelineStaticParameters) ==
+              sizeof(float[3]) + sizeof(float[3]) + sizeof(bool) + sizeof(int[4]) +
+                  sizeof(VkPrimitiveTopology) + sizeof(bool) * 3 + sizeof(VkCompareOp) +
+                  sizeof(bool) + sizeof(float) * 2 + sizeof(bool) +
+                  sizeof(PipelineStencilStaticState) * 2 + sizeof(uint32_t) +
+                  sizeof(uint32_t[RENDER_COLOR_ATTACHMENTS_MAX]) + sizeof(bool) * 3 +
+                  sizeof(uint8_t[RENDER_COLOR_ATTACHMENTS_MAX]) * 6 +
+                  sizeof(bool[RENDER_COLOR_ATTACHMENTS_MAX]) * 3 + sizeof(float) * 4);
 
 class PipelineCache {
 public:

@@ -28,6 +28,10 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 	return descriptor.dwords[0] == 0 && (descriptor.dwords[1] & 0xffu) == 0;
 }
 
+bool ValidImageDescriptor(const DescriptorValue& descriptor) {
+	return ((descriptor.dwords[3] >> 28u) & 0x8u) != 0;
+}
+
 uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
 	return descriptor.dwords[3] & 0xfffu;
 }
@@ -223,6 +227,11 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	cursor += program.info.buffers.size();
 	next.images.assign(cursor, cursor + program.info.images.size());
 	cursor += program.info.images.size();
+	for (auto& descriptor: next.images) {
+		if (!ValidImageDescriptor(descriptor)) {
+			descriptor.dwords.fill(0);
+		}
+	}
 	next.samplers.assign(cursor, cursor + program.info.samplers.size());
 	cursor += program.info.samplers.size();
 	for (const auto& address: program.info.addresses) {

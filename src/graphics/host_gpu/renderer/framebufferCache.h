@@ -6,12 +6,15 @@
 #include "common/common.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/renderState.h"
+#include "graphics/host_gpu/renderer/renderTarget.h"
 
 #include <vector>
 #include <vulkan/vulkan_core.h>
 
 namespace Libs::Graphics {
+
+struct RenderColorInfo;
+struct RenderDepthInfo;
 
 static constexpr VkImageLayout RENDER_COLOR_IMAGE_LAYOUT = VK_IMAGE_LAYOUT_GENERAL;
 

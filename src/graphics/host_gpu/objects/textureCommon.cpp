@@ -21,7 +21,8 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(uint32_t raw_layout, uint32_
 	const auto layout = static_cast<Prospero::ChannelLayout>(raw_layout);
 	const auto type   = static_cast<Prospero::ChannelType>(raw_type);
 	const auto order  = static_cast<Prospero::ChannelOrder>(raw_order);
-	const auto is     = [=](Prospero::ChannelLayout l, Prospero::ChannelType t, Prospero::ChannelOrder o) {
+	const auto is     = [=](Prospero::ChannelLayout l, Prospero::ChannelType t,
+	                        Prospero::ChannelOrder o) {
 		return layout == l && type == t && order == o;
 	};
 
@@ -29,79 +30,108 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(uint32_t raw_layout, uint32_
 	    raw_order <= Prospero::GpuEnumValue(Prospero::ChannelOrder::kAltReversed)) {
 		return {VK_FORMAT_R8_UNORM, 1};
 	}
-	if (is(Prospero::ChannelLayout::k8_8, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k8_8, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R8G8_UNORM, 2};
 	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R8G8B8A8_UNORM, 4};
 	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R8G8B8A8_SNORM, 4};
 	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSrgb, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSrgb,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R8G8B8A8_SRGB, 4};
 	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kAlt)) {
+	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kAlt)) {
 		return {VK_FORMAT_B8G8R8A8_UNORM, 4};
 	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSNorm, Prospero::ChannelOrder::kAlt)) {
+	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSNorm,
+	       Prospero::ChannelOrder::kAlt)) {
 		return {VK_FORMAT_B8G8R8A8_SNORM, 4};
 	}
-	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSrgb, Prospero::ChannelOrder::kAlt)) {
+	if (is(Prospero::ChannelLayout::k8_8_8_8, Prospero::ChannelType::kSrgb,
+	       Prospero::ChannelOrder::kAlt)) {
 		return {VK_FORMAT_B8G8R8A8_SRGB, 4};
 	}
-	if (is(Prospero::ChannelLayout::k5_5_5_1, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k5_5_5_1, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R5G5B5A1_UNORM_PACK16, 2};
 	}
-	if (is(Prospero::ChannelLayout::k4_4_4_4, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kReversed)) {
+	if (is(Prospero::ChannelLayout::k4_4_4_4, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kReversed)) {
 		return {VK_FORMAT_B4G4R4A4_UNORM_PACK16, 2};
 	}
-	if (is(Prospero::ChannelLayout::k10_10_10_2, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k10_10_10_2, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4};
 	}
-	if (is(Prospero::ChannelLayout::k10_10_10_2, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kAlt)) {
+	if (is(Prospero::ChannelLayout::k10_10_10_2, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kAlt)) {
 		return {VK_FORMAT_A2R10G10B10_UNORM_PACK32, 4};
 	}
-	if (is(Prospero::ChannelLayout::k11_11_10, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k11_11_10, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4};
 	}
-	if (is(Prospero::ChannelLayout::k16, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16_UNORM, 2};
 	}
-	if (is(Prospero::ChannelLayout::k16, Prospero::ChannelType::kUInt, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16, Prospero::ChannelType::kUInt,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16_UINT, 2};
 	}
-	if (is(Prospero::ChannelLayout::k16, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16_SFLOAT, 2};
 	}
-	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16G16_UNORM, 4};
 	}
-	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kSNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kSNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16G16_SNORM, 4};
 	}
-	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kUInt, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kUInt,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16G16_UINT, 4};
 	}
-	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16_16, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16G16_SFLOAT, 4};
 	}
-	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kUNorm, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kUNorm,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16G16B16A16_UNORM, 8};
 	}
-	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R16G16B16A16_SFLOAT, 8};
 	}
-	if (is(Prospero::ChannelLayout::k32, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k16_16_16_16, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kReversed)) {
+		return {VK_FORMAT_R16G16B16A16_SFLOAT, 8, Prospero::ColorMappingAbgr};
+	}
+	if (is(Prospero::ChannelLayout::k32, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R32_SFLOAT, 4};
 	}
-	if (is(Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kUInt, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kUInt,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R32G32_UINT, 8};
 	}
-	if (is(Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k32_32, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R32G32_SFLOAT, 8};
 	}
-	if (is(Prospero::ChannelLayout::k32_32_32_32, Prospero::ChannelType::kFloat, Prospero::ChannelOrder::kStandard)) {
+	if (is(Prospero::ChannelLayout::k32_32_32_32, Prospero::ChannelType::kFloat,
+	       Prospero::ChannelOrder::kStandard)) {
 		return {VK_FORMAT_R32G32B32A32_SFLOAT, 16};
 	}
 	EXIT("unsupported render-target format combination: layout=%u type=%u order=%u\n", raw_layout,
@@ -227,9 +257,9 @@ VkComponentMapping TextureGetComponentMapping(uint32_t swizzle) {
 
 bool TextureCheckFormat(GraphicContext* ctx, VkImageCreateInfo* image_info) {
 	VkImageFormatProperties props {};
-	if (vkGetPhysicalDeviceImageFormatProperties(
-	        ctx->physical_device, image_info->format, image_info->imageType, image_info->tiling,
-	        image_info->usage, image_info->flags, &props) == VK_ERROR_FORMAT_NOT_SUPPORTED) {
+	if (ctx->GetImageFormatProperties(image_info->format, image_info->imageType, image_info->tiling,
+	                                  image_info->usage, image_info->flags,
+	                                  &props) == VK_ERROR_FORMAT_NOT_SUPPORTED) {
 		auto apply_fallback = [&](VkFormat replacement, const char* message) {
 			image_info->format = replacement;
 			const bool result  = TextureCheckFormat(ctx, image_info);
@@ -254,9 +284,9 @@ bool TextureCheckFormat(GraphicContext* ctx, VkImageCreateInfo* image_info) {
 
 static bool TextureCheckFormatExact(GraphicContext* ctx, const VkImageCreateInfo& image_info) {
 	VkImageFormatProperties props {};
-	return vkGetPhysicalDeviceImageFormatProperties(
-	           ctx->physical_device, image_info.format, image_info.imageType, image_info.tiling,
-	           image_info.usage, image_info.flags, &props) != VK_ERROR_FORMAT_NOT_SUPPORTED;
+	return ctx->GetImageFormatProperties(image_info.format, image_info.imageType, image_info.tiling,
+	                                     image_info.usage, image_info.flags,
+	                                     &props) != VK_ERROR_FORMAT_NOT_SUPPORTED;
 }
 
 bool TextureCheckStorageSwizzle(VkImageCreateInfo* image_info, VkComponentMapping* components) {
@@ -450,7 +480,8 @@ bool TextureIsCubeTexture(uint64_t type) {
 
 bool TextureIsLayeredTexture(uint64_t type) {
 	const auto image_type = static_cast<Prospero::ImageType>(type);
-	return image_type == Prospero::ImageType::kCube || image_type == Prospero::ImageType::kColor1DArray ||
+	return image_type == Prospero::ImageType::kCube ||
+	       image_type == Prospero::ImageType::kColor1DArray ||
 	       image_type == Prospero::ImageType::kColor2DArray ||
 	       image_type == Prospero::ImageType::kColor2DMsaaArray;
 }
@@ -661,11 +692,13 @@ static uint64_t CalcTextureSliceStride(const TileSizeOffset* level_sizes, uint64
 }
 
 static uint64_t CalcLinearUploadLevelSize(uint32_t fmt, uint32_t pitch, uint32_t height) {
-	if (const uint32_t bytes_per_element = Prospero::NumBytesPerElement(fmt); bytes_per_element != 0) {
+	if (const uint32_t bytes_per_element = Prospero::NumBytesPerElement(fmt);
+	    bytes_per_element != 0) {
 		return static_cast<uint64_t>(pitch) * height * bytes_per_element;
 	}
 
-	if (const uint32_t bytes_per_block = Prospero::BlockCompressedBytesPerBlock(fmt); bytes_per_block != 0) {
+	if (const uint32_t bytes_per_block = Prospero::BlockCompressedBytesPerBlock(fmt);
+	    bytes_per_block != 0) {
 		const uint32_t blocks_w = std::max((pitch + 3u) / 4u, 1u);
 		const uint32_t blocks_h = std::max((height + 3u) / 4u, 1u);
 		return static_cast<uint64_t>(blocks_w) * blocks_h * bytes_per_block;
@@ -734,7 +767,8 @@ TextureUploadLayout TextureCalcUploadLayout(uint32_t fmt, uint64_t width, uint64
 			    (TileIsStandard64KBTextureSupported(static_cast<uint32_t>(fmt)) &&
 			     tile_mode == Prospero::TileMode::kStandard64KB);
 			layout.fmt_tiled_depth =
-			    (allow_depth_tile && Prospero::RenderTargetBytesPerElement(static_cast<uint32_t>(fmt)) != 0 &&
+			    (allow_depth_tile &&
+			     Prospero::RenderTargetBytesPerElement(static_cast<uint32_t>(fmt)) != 0 &&
 			     tile_mode == Prospero::TileMode::kDepth);
 			if (!layout.fmt_tiled_render_target && !layout.fmt_tiled_standard256b &&
 			    !layout.fmt_tiled_standard4kb && !layout.fmt_tiled_standard64kb &&
@@ -824,7 +858,8 @@ TextureBuildUploadRegions(const TextureUploadLayout& layout, VkFormat image_form
 			if (layout.fmt_tiled_depth && layout.level_sizes[i].x != 0) {
 				regions[region_index].pitch = layout.level_sizes[i].x;
 			} else if (!layout.volume_texture &&
-			           static_cast<Prospero::TileMode>(layout.tile) == Prospero::TileMode::kLinear &&
+			           static_cast<Prospero::TileMode>(layout.tile) ==
+			               Prospero::TileMode::kLinear &&
 			           layout.padded_sizes[i].width != 0) {
 				regions[region_index].pitch = layout.padded_sizes[i].width;
 			} else {
@@ -955,7 +990,8 @@ void TextureUploadGuestImage(GraphicContext* ctx, VulkanImage* vk_obj, const voi
 			UploadFmaskIdentity(ctx, vk_obj, regions, dst_layout, owner);
 			return;
 		}
-		const uint32_t bytes_per_element = Prospero::RenderTargetBytesPerElement(static_cast<uint32_t>(fmt));
+		const uint32_t bytes_per_element =
+		    Prospero::RenderTargetBytesPerElement(static_cast<uint32_t>(fmt));
 		if (bytes_per_element == 1) {
 			UtilFillImage(ctx, vk_obj, src_data, size, regions, dst_layout);
 		} else {

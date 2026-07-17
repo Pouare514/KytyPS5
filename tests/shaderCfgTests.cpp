@@ -4,6 +4,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/objects/textureCommon.h"
 #include "graphics/host_gpu/renderer/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/shaderSubgroup.h"
 #include "graphics/shader/recompiler/ExecMask.h"
@@ -133,6 +134,24 @@ uint32_t SpirvInstructionOpcodeCount(const std::vector<uint32_t>& binary, uint32
 		i += word_count;
 	}
 	return count;
+}
+
+bool SpirvContainsVectorShuffle(const std::vector<uint32_t>&   binary,
+                                const std::array<uint32_t, 4>& selectors) {
+	for (size_t i = 5; i < binary.size();) {
+		const uint32_t word       = binary[i];
+		const uint32_t op         = word & 0xffffu;
+		const uint32_t word_count = word >> 16u;
+		if (word_count == 0 || i + word_count > binary.size()) {
+			return false;
+		}
+		if (op == 79u && word_count == 9u &&
+		    std::equal(selectors.begin(), selectors.end(), binary.begin() + i + 5u)) {
+			return true;
+		}
+		i += word_count;
+	}
+	return false;
 }
 
 bool SpirvContainsCapability(const std::vector<uint32_t>& binary, uint32_t capability) {
@@ -5696,6 +5715,82 @@ void TestNewShaderRecompilerExpPixelOutputs() {
 	CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestRenderTargetReverseFloat16ExportMapping() {
+	const auto format =
+	    TextureGetRenderTargetFormat(Prospero::GpuEnumValue(Prospero::ChannelLayout::k16_16_16_16),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelType::kFloat),
+	                                 Prospero::GpuEnumValue(Prospero::ChannelOrder::kReversed));
+	Check(format.format == VK_FORMAT_R16G16B16A16_SFLOAT && format.bytes_per_element == 8u,
+	      "reverse RGBA16F render target did not retain its native host format "
+	      "and size");
+	Check(format.export_mapping == Prospero::ColorMappingAbgr &&
+	          format.export_mapping.ApplyMask(0x1u) == 0x8u &&
+	          format.export_mapping.ApplyMask(0x2u) == 0x4u &&
+	          format.export_mapping.ApplyMask(0x4u) == 0x2u &&
+	          format.export_mapping.ApplyMask(0x8u) == 0x1u &&
+	          format.export_mapping.ApplyMask(0xfu) == 0xfu,
+	      "reverse RGBA16F render-target export or write-mask mapping is "
+	      "incorrect");
+	const auto legacy_alt = TextureGetRenderTargetFormat(
+	    Prospero::GpuEnumValue(Prospero::ChannelLayout::k8_8_8_8),
+	    Prospero::GpuEnumValue(Prospero::ChannelType::kUNorm),
+	    Prospero::GpuEnumValue(Prospero::ChannelOrder::kAlt));
+	Check(legacy_alt.format == VK_FORMAT_B8G8R8A8_UNORM && legacy_alt.export_mapping.IsIdentity(),
+	      "legacy BGRA render target acquired a duplicate shader export mapping");
+
+	const uint32_t shader[] = {
+	    EncodeExp0(0x00, 0xf),
+	    EncodeExp1(0, 1, 2, 3), // MRT0
+	    0xbf810000u,
+	};
+	ShaderPixelInputInfo identity_info;
+	ShaderPixelInputInfo reversed_info;
+	reversed_info.target_export_mapping[0] = format.export_mapping;
+
+	ShaderRecompiler::CompileOptions options;
+	options.stage            = ShaderType::Pixel;
+	options.pixel_input_info = &identity_info;
+	ShaderRecompiler::CompileResult identity_result;
+	std::string                     error;
+	Check(ShaderRecompiler::TryRecompile(shader, options, &identity_result, &error), error.c_str());
+	Check(SpirvInstructionOpcodeCount(identity_result.spirv, 79u) == 0u,
+	      "identity MRT export unexpectedly added a component shuffle");
+
+	options.pixel_input_info = &reversed_info;
+	ShaderRecompiler::CompileResult reversed_result;
+	Check(ShaderRecompiler::TryRecompile(shader, options, &reversed_result, &error), error.c_str());
+	Check(SpirvContainsVectorShuffle(reversed_result.spirv, {3u, 2u, 1u, 0u}),
+	      "reverse MRT export did not emit a WZYX component shuffle");
+	CheckSpirvBinaryValidates(reversed_result.spirv);
+
+	HW::PixelShaderInfo regs {};
+	Check(ShaderGetIdPS(&regs, &identity_info, false) !=
+	          ShaderGetIdPS(&regs, &reversed_info, false),
+	      "pixel shader cache identity omitted the render-target export mapping");
+
+	regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+	regs.ps_regs.chksum    = 0xf16ab6f000000001ull;
+	ShaderMappedData mapped {};
+	mapped.code_size_bytes = sizeof(shader);
+	ShaderMapUserData(regs.ps_regs.data_addr, mapped);
+	HW::ShaderRegisters sh {};
+	ShaderVertexInputInfo vs_info {};
+	vs_info.stage.program = std::make_shared<ShaderRecompiler::IR::Program>();
+	std::array<Prospero::ColorComponentMapping, 8> mappings {};
+	mappings[0] = format.export_mapping;
+	ShaderPixelInputInfo      compiled_info {};
+	std::span<const uint32_t> compiled_spirv;
+	Check(ShaderCompileInfoPS(&regs, &sh, ShaderLaneMaskMode::NativeWave, &vs_info, mappings,
+	                          &compiled_info, &compiled_spirv) &&
+	          compiled_info.target_export_mapping[0].IsIdentity(),
+	      "inactive reverse MRT mapping was not normalized out of the shader cache key");
+	sh.target_output_mode[0] = 4;
+	Check(ShaderCompileInfoPS(&regs, &sh, ShaderLaneMaskMode::NativeWave, &vs_info, mappings,
+	                          &compiled_info, &compiled_spirv) &&
+	          compiled_info.target_export_mapping[0] == format.export_mapping,
+	      "active reverse MRT mapping was lost before shader specialization");
+}
+
 void TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled() {
 	constexpr uint32_t ExecutionModeEarlyFragmentTests = 9;
 
@@ -6510,10 +6605,11 @@ void TestPixelProgramCacheDescriptorSetIdentity() {
 			}
 			ShaderVertexInputInfo vs_info {};
 			vs_info.stage.program = std::move(vs_program);
+			const std::array<Prospero::ColorComponentMapping, 8> identity_mappings {};
 			ShaderPixelInputInfo      ps_info {};
 			std::span<const uint32_t> spirv;
 			Check(ShaderCompileInfoPS(&regs, &sh, ShaderLaneMaskMode::NativeWave, &vs_info,
-			                          &ps_info, &spirv),
+			                          identity_mappings, &ps_info, &spirv),
 			      "pixel program-cache transition failed to compile");
 			const auto expected_set = has_vs_descriptors ? 1u : 0u;
 			Check(ps_info.descriptor_set == expected_set && ps_info.stage.program != nullptr &&
@@ -6537,9 +6633,11 @@ void TestPixelProgramCacheDescriptorSetIdentity() {
 	auto compile_mask_mode = [&](ShaderLaneMaskMode mode) {
 		ShaderVertexInputInfo vs_info {};
 		vs_info.stage.program = std::make_shared<ShaderRecompiler::IR::Program>();
+		const std::array<Prospero::ColorComponentMapping, 8> identity_mappings {};
 		ShaderPixelInputInfo      ps_info {};
 		std::span<const uint32_t> spirv;
-		Check(ShaderCompileInfoPS(&mask_regs, &sh, mode, &vs_info, &ps_info, &spirv),
+		Check(ShaderCompileInfoPS(&mask_regs, &sh, mode, &vs_info, identity_mappings, &ps_info,
+		                          &spirv),
 		      "pixel lane-mask cache transition failed to compile");
 		Check(ps_info.stage.program != nullptr && ps_info.stage.program->lane_mask_mode == mode,
 		      "pixel program cache reused a different lane-mask lowering");
@@ -6713,6 +6811,7 @@ int main() {
 	TestNewShaderRecompilerVertexExportUsesLaneExecMask();
 	TestNewShaderRecompilerPerInvocationMasks();
 	TestNewShaderRecompilerExpPixelOutputs();
+	TestRenderTargetReverseFloat16ExportMapping();
 	TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
 	TestScalarProvenanceRealWideMoveLowering();
 	TestScalarProvenanceRealCarryAndScalarLoads();

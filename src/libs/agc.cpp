@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/objects/label.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -4018,7 +4019,7 @@ int KYTY_SYSV_ABI GraphicsDriverAddEqEvent(LibKernel::EventQueue::KernelEqueue e
 		return LibKernel::KERNEL_ERROR_EBADF;
 	}
 
-	return GraphicsRenderAddEqEvent(eq, id, udata);
+	return Sync::AddEqEvent(eq, id, udata);
 }
 
 int KYTY_SYSV_ABI GraphicsDriverDeleteEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id) {
@@ -4028,7 +4029,7 @@ int KYTY_SYSV_ABI GraphicsDriverDeleteEqEvent(LibKernel::EventQueue::KernelEqueu
 		return LibKernel::KERNEL_ERROR_EBADF;
 	}
 
-	return GraphicsRenderDeleteEqEvent(eq, id);
+	return Sync::DeleteEqEvent(eq, id);
 }
 
 int KYTY_SYSV_ABI GraphicsDriverGetEqEventType(const LibKernel::EventQueue::KernelEvent* ev) {

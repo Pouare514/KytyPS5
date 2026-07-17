@@ -7,6 +7,9 @@
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/utils.h"
@@ -82,10 +85,10 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 	const HW::BlendColor& bclr                                     = ctx->GetBlendColor();
 	uint32_t              color_mask[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	for (uint32_t i = 0; i < color_count; i++) {
-		color_mask[i] =
-		    (colors[i].vulkan_buffer != nullptr
-		         ? render_target_mask_slot(ctx->GetRenderTargetMask(), colors[i].target_slot)
-		         : 0);
+		color_mask[i] = (colors[i].vulkan_buffer != nullptr
+		                     ? colors[i].export_mapping.ApplyMask(render_target_mask_slot(
+		                           ctx->GetRenderTargetMask(), colors[i].target_slot))
+		                     : 0);
 	}
 	const HW::ModeControl& mc = ctx->GetModeControl();
 

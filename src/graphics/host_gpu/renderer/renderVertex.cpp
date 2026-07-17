@@ -1,5 +1,6 @@
+#include "graphics/host_gpu/renderer/renderVertex.h"
+
 #include "common/assert.h"
-#include "graphics/host_gpu/renderer/renderState.h"
 #include "graphics/shader/recompiler/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ShaderIR.h"
 #include "graphics/shader/shader.h"
