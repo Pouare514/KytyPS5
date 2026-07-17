@@ -1385,6 +1385,30 @@ void RuntimeLinker::SaveProgram(Program* program, const std::filesystem::path& e
 	}
 }
 
+static void SimulateGnmDriverDirectMemoryInit() {
+	constexpr size_t k_gnm_size     = 0x10000;
+	constexpr size_t k_gnm_align    = 0x10000;
+	constexpr int    k_memory_type  = 3;
+	constexpr int    k_prot         = 0x13;
+
+	int64_t phys_addr = 0;
+	const auto direct_size =
+	    static_cast<int64_t>(Libs::LibKernel::Memory::KernelGetDirectMemorySize());
+	const auto alloc_result = Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	    0, direct_size, k_gnm_size, k_gnm_align, k_memory_type, &phys_addr);
+	if (alloc_result != 0) {
+		LOGF("SimulateGnmDriverDirectMemoryInit: allocate failed (%d)\n", alloc_result);
+		return;
+	}
+
+	void* vaddr = reinterpret_cast<void*>(0xfe0000000ull);
+	const auto map_result = Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	    &vaddr, k_gnm_size, k_prot, 0, phys_addr, k_gnm_align, "SceGnmDriver");
+	LOGF("SimulateGnmDriverDirectMemoryInit: phys=0x%016" PRIx64 " vaddr=0x%016" PRIx64
+	     " result=%d\n",
+	     static_cast<uint64_t>(phys_addr), reinterpret_cast<uint64_t>(vaddr), map_result);
+}
+
 void RuntimeLinker::Execute() {
 	KYTY_PROFILER_THREAD("Thread_Main");
 
@@ -1411,6 +1435,7 @@ void RuntimeLinker::Execute() {
 	}
 	StartAllModules();
 	EnsureApplicationHeapApi();
+	SimulateGnmDriverDirectMemoryInit();
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
@@ -2094,6 +2119,22 @@ void SynthesizeProgramProcParam(Program* program) {
 	const auto proc_vaddr = program->proc_param_vaddr;
 	const auto synth_size = std::max(program->proc_param_size, PROC_PARAM_SYNTH_SIZE);
 
+	if (program->elf != nullptr) {
+		const auto* ehdr = program->elf->GetEhdr();
+		const auto* phdr = program->elf->GetPhdr();
+		if (ehdr != nullptr && phdr != nullptr) {
+			for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
+				if (phdr[i].p_type == PT_OS_PROCPARAM && phdr[i].p_filesz > 0) {
+					program->elf->LoadSegment(proc_vaddr, phdr[i].p_offset, phdr[i].p_filesz);
+					LOGF("SynthesizeProgramProcParam: reloaded proc_param from ELF (0x%016" PRIx64
+					     " bytes)\n",
+					     phdr[i].p_filesz);
+					break;
+				}
+			}
+		}
+	}
+
 	std::vector<uint8_t> elf_backup(synth_size);
 	std::memcpy(elf_backup.data(), reinterpret_cast<void*>(proc_vaddr), synth_size);
 	const auto* elf_proc = reinterpret_cast<const GuestProcParam*>(elf_backup.data());
@@ -2291,6 +2332,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			program->proc_param_size  = phdr[i].p_memsz;
 			LOGF("proc_param_vaddr = 0x%016" PRIx64 " size = 0x%016" PRIx64 "\n",
 			     program->proc_param_vaddr, program->proc_param_size);
+
+			if (phdr[i].p_filesz > 0) {
+				program->elf->LoadSegment(program->proc_param_vaddr, phdr[i].p_offset,
+				                          phdr[i].p_filesz);
+				LOGF("proc_param loaded from ELF: file_size = 0x%016" PRIx64 "\n", phdr[i].p_filesz);
+			}
 		}
 	}
 

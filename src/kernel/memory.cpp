@@ -74,6 +74,7 @@ static uint64_t g_flexible_program_code_bytes  = 0;
 
 static bool CountsTowardFlexibleProgramQuota(const char* name);
 static bool CountsTowardFlexibleMappingQuota(const char* name);
+static bool CountsFlexibleMappingBytes(const char* name, uint64_t len);
 
 static Graphics::GpuResourceManager& GetGpuResources() {
 	return *Graphics::g_render_ctx->GetGpuResources();
@@ -1940,7 +1941,7 @@ bool FlexibleMemory::Map(uint64_t vaddr, size_t len, int prot, VirtualMemory::Mo
 	if (len == 0) {
 		return false;
 	}
-	if (CountsTowardFlexibleMappingQuota(name) && len > available) {
+	if (CountsFlexibleMappingBytes(name, len) && len > available) {
 		LOGF_COLOR(Log::Color::Red,
 		           "\t flexible memory exhausted: configured = 0x%016" PRIx64
 		           ", allocated = 0x%016" PRIx64 ", available = 0x%016" PRIx64
@@ -1960,7 +1961,7 @@ bool FlexibleMemory::Map(uint64_t vaddr, size_t len, int prot, VirtualMemory::Mo
 	CopyVirtualRangeName(b.name, name);
 
 	m_allocated.push_back(b);
-	if (CountsTowardFlexibleMappingQuota(name)) {
+	if (CountsFlexibleMappingBytes(name, len)) {
 		m_allocated_total += len;
 	}
 
@@ -1992,7 +1993,7 @@ bool FlexibleMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 	};
 
 	auto subtract_mapping_quota = [&](const AllocatedBlock& block, uint64_t unmap_size) {
-		if (CountsTowardFlexibleMappingQuota(block.name)) {
+		if (CountsFlexibleMappingBytes(block.name, unmap_size)) {
 			m_allocated_total -= unmap_size;
 		}
 	};
@@ -2107,6 +2108,23 @@ static bool CountsTowardFlexibleMappingQuota(const char* name) {
 	}
 
 	if (std::strcmp(name, "SceKernelInternalMemory") == 0) {
+		return false;
+	}
+
+	if (std::strcmp(name, "stack") == 0 || std::strcmp(name, "SceKernelPrimaryTcbTls") == 0) {
+		return false;
+	}
+
+	return true;
+}
+
+static bool CountsFlexibleMappingBytes(const char* name, uint64_t len) {
+	if (!CountsTowardFlexibleMappingQuota(name)) {
+		return false;
+	}
+
+	// Anonymous small kernel flex (e.g. event queues) — not counted toward game quota.
+	if (name != nullptr && name[0] == '\0' && len <= 0x40000) {
 		return false;
 	}
 
@@ -4031,7 +4049,7 @@ int KYTY_SYSV_ABI KernelAvailableFlexibleMemorySize(size_t* size) {
 
 	uint64_t flex_mappings = 0;
 	for (const auto& block: g_flexible_memory->GetBlocks()) {
-		if (CountsTowardFlexibleMappingQuota(block.name)) {
+		if (CountsFlexibleMappingBytes(block.name, block.map_size)) {
 			flex_mappings += block.map_size;
 		}
 	}
