@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/objects/label.h"
 #include "graphics/host_gpu/renderer/descriptorCache.h"
 #include "graphics/host_gpu/renderer/framebufferCache.h"
+#include "graphics/host_gpu/renderer/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -59,22 +60,19 @@ bool ResolveHtileClearTarget(const HW::DepthRenderTarget& z, uint64_t descriptor
 	*resolved = {};
 	const bool has_stencil =
 	    z.stencil_info.format != Prospero::GpuEnumValue(Prospero::StencilFormat::kInvalid);
-	const bool depth_format_supported =
-	    z.z_info.format == Prospero::GpuEnumValue(Prospero::DepthFormat::kZ16) ||
-	    z.z_info.format == Prospero::GpuEnumValue(Prospero::DepthFormat::kZ32F);
-	const bool msaa_compat = depth_msaa_single_sample_compatible(z.z_info.num_samples);
-	const bool supported_depth_state =
-	    z.z_info.tile_surface_enable && depth_format_supported &&
-	    !(z.z_info.format == Prospero::GpuEnumValue(Prospero::DepthFormat::kZ16) && has_stencil) &&
-	    z.z_info.tile_mode_index == 0 && (z.z_info.num_samples == 0 || msaa_compat) &&
-	    z.z_info.zrange_precision <= 1 && !z.z_info.expclear_enabled &&
-	    !z.z_info.embedded_sample_locations && !z.z_info.partially_resident &&
-	    z.z_info.num_mip_levels == 0 && z.z_info.plane_compression == 0 &&
-	    z.depth_view.current_mip_level == 0 && z.depth_view.slice_start == 0 &&
-	    z.depth_view.slice_max == 0 && z.depth_info.addr5_swizzle_mask == 0 &&
-	    z.depth_info.array_mode == 0 && z.depth_info.pipe_config == 0 &&
-	    z.depth_info.bank_width == 0 && z.depth_info.bank_height == 0 &&
-	    z.depth_info.macro_tile_aspect == 0 && z.depth_info.num_banks == 0;
+	const auto* depth_policy = FindDepthFormatPolicy(z.z_info.format);
+	const bool  msaa_compat  = depth_msaa_single_sample_compatible(z.z_info.num_samples);
+	const bool  supported_depth_state =
+	    z.z_info.tile_surface_enable && depth_policy != nullptr && z.z_info.tile_mode_index == 0 &&
+	    (z.z_info.num_samples == 0 || msaa_compat) && z.z_info.zrange_precision <= 1 &&
+	    !z.z_info.expclear_enabled && !z.z_info.embedded_sample_locations &&
+	    !z.z_info.partially_resident && z.z_info.num_mip_levels == 0 &&
+	    z.z_info.plane_compression == 0 && z.depth_view.current_mip_level == 0 &&
+	    z.depth_view.slice_start == 0 && z.depth_view.slice_max == 0 &&
+	    z.depth_info.addr5_swizzle_mask == 0 && z.depth_info.array_mode == 0 &&
+	    z.depth_info.pipe_config == 0 && z.depth_info.bank_width == 0 &&
+	    z.depth_info.bank_height == 0 && z.depth_info.macro_tile_aspect == 0 &&
+	    z.depth_info.num_banks == 0;
 	const bool supported_stencil_state =
 	    z.stencil_info.tile_mode_index == 0 && z.stencil_info.tile_split == 0 &&
 	    !z.stencil_info.expclear_enabled &&
@@ -138,10 +136,8 @@ bool ResolveHtileClearTarget(const HW::DepthRenderTarget& z, uint64_t descriptor
 		return false;
 	}
 
-	const bool     z16 = z.z_info.format == Prospero::GpuEnumValue(Prospero::DepthFormat::kZ16);
-	const uint32_t guest_format = Prospero::GpuEnumValue(z16 ? Prospero::BufferFormat::k16UNorm
-	                                                         : Prospero::BufferFormat::k32Float);
-	const uint32_t bytes        = z16 ? 2u : 4u;
+	const uint32_t guest_format = Prospero::GpuEnumValue(depth_policy->guest_format);
+	const uint32_t bytes        = depth_policy->bytes_per_element;
 	const uint32_t pitch = TileGetTexturePitch(guest_format, width, 1,
 	                                           Prospero::GpuEnumValue(Prospero::TileMode::kDepth));
 	if (z.pitch_height_valid && ((static_cast<uint64_t>(z.pitch_div8_minus1) + 1u) * 8u != pitch ||
@@ -149,7 +145,7 @@ bool ResolveHtileClearTarget(const HW::DepthRenderTarget& z, uint64_t descriptor
 	                                 ((static_cast<uint64_t>(height) + 7u) & ~7ull))) {
 		return false;
 	}
-	const uint32_t block_width = z16 ? 256u : 128u;
+	const uint32_t block_width = bytes == 2 ? 256u : 128u;
 	const uint64_t padded_width =
 	    (static_cast<uint64_t>(pitch) + block_width - 1u) & ~(block_width - 1u);
 	const uint64_t padded_height = (static_cast<uint64_t>(height) + 127u) & ~127ull;

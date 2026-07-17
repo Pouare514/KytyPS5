@@ -12,6 +12,46 @@
 
 namespace Libs::Graphics {
 
+template <uint32_t (*Encode)(uint16_t)>
+static void UploadPromotedD16Depth(GraphicContext* ctx, DepthStencilVulkanImage* image,
+                                   const DepthTargetInfo& info, const BufferImageCopySource& source,
+                                   uint32_t base_layer) {
+	const uint64_t slice_size       = info.size / info.layers;
+	const uint64_t texels           = static_cast<uint64_t>(info.pitch) * info.height;
+	const uint64_t host_slice_size  = texels * sizeof(uint32_t);
+	const uint64_t host_upload_size = host_slice_size * info.layers;
+	if (slice_size % sizeof(uint16_t) != 0 || texels > slice_size / sizeof(uint16_t) ||
+	    host_upload_size > UINT32_MAX) {
+		EXIT("Tiler: invalid D16 host-promotion footprint, guest_slice=0x%016" PRIx64
+		     " host_slice=0x%016" PRIx64 " layers=%u\n",
+		     slice_size, host_slice_size, info.layers);
+	}
+	UtilScratchBuffer            host_linear(host_upload_size);
+	std::vector<uint16_t>        guest_linear(slice_size / sizeof(uint16_t));
+	std::vector<BufferImageCopy> regions;
+	regions.reserve(info.layers);
+	for (uint32_t layer = 0; layer < info.layers; layer++) {
+		auto* guest_slice = reinterpret_cast<const uint8_t*>(source.address) + slice_size * layer;
+		TileConvertTiledToLinearDepth(guest_linear.data(), guest_slice, info.guest_format,
+		                              info.width, info.height, info.pitch, slice_size);
+		auto* host_slice = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(host_linear.Data()) +
+		                                               host_slice_size * layer);
+		for (uint64_t texel = 0; texel < texels; texel++) {
+			host_slice[texel] = Encode(guest_linear[texel]);
+		}
+		BufferImageCopy region {};
+		region.offset    = static_cast<uint32_t>(host_slice_size * layer);
+		region.pitch     = info.pitch;
+		region.width     = info.width;
+		region.height    = info.height;
+		region.dst_layer = base_layer + layer;
+		region.aspect    = VK_IMAGE_ASPECT_DEPTH_BIT;
+		regions.push_back(region);
+	}
+	UtilFillImage(ctx, image, host_linear.Data(), host_upload_size, regions,
+	              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+}
+
 void Tiler::DetileImage(GraphicContext* ctx, GpuTextureVulkanImage* image, const ImageInfo& info,
                         const BufferImageCopySource& source, bool refresh, bool storage) const {
 	if (ctx == nullptr || image == nullptr || info.address == 0 || info.size == 0 ||
@@ -53,19 +93,13 @@ void Tiler::DetileImage(GraphicContext* ctx, GpuTextureVulkanImage* image, const
 void Tiler::DetileImage(GraphicContext* ctx, DepthStencilVulkanImage* image,
                         const DepthTargetInfo& info, const BufferImageCopySource& source,
                         bool refresh, uint32_t base_layer) const {
-	const bool d16 =
-	    info.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm) &&
-	    info.format == VK_FORMAT_D16_UNORM && info.bytes_per_element == 2;
-	const bool d32 =
-	    info.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) &&
-	    (info.format == VK_FORMAT_D32_SFLOAT || info.format == VK_FORMAT_D32_SFLOAT_S8_UINT) &&
-	    info.bytes_per_element == 4;
 	if (ctx == nullptr || image == nullptr || info.address == 0 || info.size == 0 ||
 	    info.width == 0 || info.height == 0 || info.pitch < info.width || info.layers == 0 ||
 	    info.size % info.layers != 0 || base_layer > image->layers ||
 	    info.layers > image->layers - base_layer || info.size > UINT32_MAX ||
-	    info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kDepth) || (!d16 && !d32) ||
-	    !source.cpu_current || source.address != info.address || source.size != info.size ||
+	    info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kDepth) ||
+	    !IsSupportedDepthTargetFormat(info) || !source.cpu_current ||
+	    source.address != info.address || source.size != info.size ||
 	    (source.buffer == nullptr && source.offset != 0)) {
 		EXIT("Tiler: unsupported depth detile, ctx=%p image=%p source_buffer=%p "
 		     "source=0x%016" PRIx64 "+0x%016" PRIx64 " offset=0x%016" PRIx64
@@ -79,6 +113,19 @@ void Tiler::DetileImage(GraphicContext* ctx, DepthStencilVulkanImage* image,
 	}
 	if (refresh) {
 		VulkanDeviceWaitIdle(ctx);
+	}
+	if (DepthAspectTransferBytes(info.format) != info.bytes_per_element) {
+		switch (info.format) {
+			case VK_FORMAT_D24_UNORM_S8_UINT:
+				UploadPromotedD16Depth<EncodeD16AsD24>(ctx, image, info, source, base_layer);
+				return;
+			case VK_FORMAT_D32_SFLOAT_S8_UINT:
+				UploadPromotedD16Depth<EncodeD16AsD32>(ctx, image, info, source, base_layer);
+				return;
+			default:
+				EXIT("Tiler: unsupported depth transfer conversion, format=%d guest_bpe=%u\n",
+				     static_cast<int>(info.format), info.bytes_per_element);
+		}
 	}
 	const auto                   slice_size = info.size / info.layers;
 	UtilScratchBuffer            linear(info.size);
@@ -109,11 +156,12 @@ void Tiler::DetileStencil(GraphicContext* ctx, DepthStencilVulkanImage* image,
 	TileSizeAlign htile_size {};
 	TileSizeAlign depth_size {};
 	const auto    stencil_format = Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt);
+	const auto*   policy         = FindGuestDepthFormatPolicy(info.guest_format);
 	const auto    stencil_pitch  = TileGetTexturePitch(
 	    stencil_format, info.width, 1, Prospero::GpuEnumValue(Prospero::TileMode::kDepth));
 	const bool supported_layout =
-	    TileGetDepthSize(info.width, info.height, 0,
-	                     Prospero::GpuEnumValue(Prospero::DepthFormat::kZ32F),
+	    policy != nullptr && IsSupportedDepthTargetFormat(info) &&
+	    TileGetDepthSize(info.width, info.height, 0, Prospero::GpuEnumValue(policy->depth_format),
 	                     Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt),
 	                     info.htile_address != 0, &stencil_size, &htile_size, &depth_size) &&
 	    info.layers != 0 && info.stencil_size % info.layers == 0 &&
@@ -121,9 +169,7 @@ void Tiler::DetileStencil(GraphicContext* ctx, DepthStencilVulkanImage* image,
 	    stencil_pitch != 0;
 	if (ctx == nullptr || image == nullptr || info.address == 0 || info.size == 0 ||
 	    info.stencil_address == 0 || info.stencil_size == 0 || info.width == 0 ||
-	    info.height == 0 || info.format != VK_FORMAT_D32_SFLOAT_S8_UINT ||
-	    info.guest_format != Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) ||
-	    info.bytes_per_element != 4 || base_layer > image->layers ||
+	    info.height == 0 || base_layer > image->layers ||
 	    info.layers > image->layers - base_layer || info.stencil_size > UINT32_MAX ||
 	    info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kDepth) ||
 	    info.stencil_htile_compressed || !supported_layout || !source.cpu_current ||
@@ -187,11 +233,7 @@ void Tiler::TileImage(void* dst, const void* src, const RenderTargetInfo& info) 
 }
 
 void Tiler::TileImage(void* dst, const void* src, const DepthTargetInfo& info) const {
-	const bool supported_format =
-	    (info.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm) &&
-	     info.format == VK_FORMAT_D16_UNORM && info.bytes_per_element == 2) ||
-	    (info.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) &&
-	     info.format == VK_FORMAT_D32_SFLOAT && info.bytes_per_element == 4);
+	const bool supported_format = IsSupportedDepthTargetFormat(info);
 	if (dst == nullptr || src == nullptr || info.address == 0 || info.size == 0 ||
 	    info.stencil_address != 0 || info.stencil_size != 0 || info.width == 0 ||
 	    info.height == 0 || info.pitch < info.width ||

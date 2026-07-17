@@ -8710,8 +8710,8 @@ bool CacheFault(void *opaque, PageFaultAccess access, uint64_t vaddr,
                                  VK_FORMAT_A2R10G10B10_UNORM_PACK32,
                                  DstSel(6, 5, 4, 7));
   } else if (std::strcmp(kind, "sampled-depth-format") == 0) {
-    (void)SelectSampledDepthView(VK_FORMAT_D32_SFLOAT_S8_UINT,
-                                 VK_FORMAT_R16_UNORM, DstSel(4, 4, 4, 4));
+    (void)SelectSampledDepthView(VK_FORMAT_D24_UNORM_S8_UINT,
+                                 VK_FORMAT_R32_SFLOAT, DstSel(4, 4, 4, 4));
   } else if (std::strcmp(kind, "sampled-depth-swizzle") == 0) {
     (void)SelectSampledDepthView(VK_FORMAT_D32_SFLOAT_S8_UINT,
                                  VK_FORMAT_R32_SFLOAT, DstSel(4, 5, 6, 7));
@@ -8806,6 +8806,21 @@ void CheckSampledColorViews() {
                                  DstSel(4, 0, 0, 0)) ==
               VulkanImage::VIEW_R000,
           "D16 depth target did not select its R000 depth-aspect view");
+  Require("SampledColorViews", "D16S8 R001 depth target",
+          SelectSampledDepthView(VK_FORMAT_D16_UNORM_S8_UINT, VK_FORMAT_R16_UNORM,
+                                 DstSel(4, 0, 0, 1)) ==
+              VulkanImage::VIEW_R001,
+          "D16S8 depth target did not select its R001 depth-aspect view");
+  Require("SampledColorViews", "promoted D24S8 R001 depth target",
+          SelectSampledDepthView(VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_R16_UNORM,
+                                 DstSel(4, 0, 0, 1)) ==
+              VulkanImage::VIEW_R001,
+          "D24S8 host fallback did not preserve the guest R16 depth view");
+  Require("SampledColorViews", "promoted D32S8 R001 depth target",
+          SelectSampledDepthView(VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_R16_UNORM,
+                                 DstSel(4, 0, 0, 1)) ==
+              VulkanImage::VIEW_R001,
+          "D32S8 host fallback did not preserve the guest R16 depth view");
   Require("SampledColorViews", "D32S8 R001 depth target",
           SelectSampledDepthView(VK_FORMAT_D32_SFLOAT_S8_UINT,
                                  VK_FORMAT_R32_SFLOAT,
@@ -11094,20 +11109,38 @@ void CheckImageOverlapResolution() {
                                    mismatched_depth) ==
                   DepthOverlap::Unsupported,
           "mipmapped or format-mismatched depth load was admitted");
-  Require("ImageOverlapResolution", "depth transition source",
-          SelectDepthTransitionSource(true, true, false, false, false, true) ==
-                  DepthTransitionSource::None &&
-              SelectDepthTransitionSource(false, true, false, false, false, true) ==
-                  DepthTransitionSource::Native &&
-              SelectDepthTransitionSource(false, false, false, false, false, false) ==
-                  DepthTransitionSource::Guest &&
-              SelectDepthTransitionSource(false, true, true, false, false, false) ==
-                  DepthTransitionSource::Guest &&
-              SelectDepthTransitionSource(false, true, false, true, false, false) ==
-                  DepthTransitionSource::Guest &&
-              SelectDepthTransitionSource(false, true, false, false, true, true) ==
-                  DepthTransitionSource::Guest,
-          "clear, clean-native, or overlapping dirty-buffer depth preservation policy regressed");
+  struct DepthTransitionCase {
+    const char *name;
+    bool clear;
+    bool native;
+    bool sampled_cpu_dirty;
+    bool sampled_buffer_modified;
+    bool buffer_overlap;
+    bool buffer_cpu_dirty;
+    DepthTransitionSource expected;
+  };
+  constexpr DepthTransitionCase transition_cases[] = {
+      {"clear", true, true, false, false, false, true,
+       DepthTransitionSource::None},
+      {"clean native", false, true, false, false, false, true,
+       DepthTransitionSource::Native},
+      {"missing native", false, false, false, false, false, false,
+       DepthTransitionSource::Guest},
+      {"CPU-dirty native", false, true, true, false, false, false,
+       DepthTransitionSource::Guest},
+      {"buffer-modified native", false, true, false, true, false, false,
+       DepthTransitionSource::Guest},
+      {"dirty overlapping buffer", false, true, false, false, true, true,
+       DepthTransitionSource::Guest},
+  };
+  for (const auto &test : transition_cases) {
+    Require("ImageOverlapResolution", test.name,
+            SelectDepthTransitionSource(
+                test.clear, test.native, test.sampled_cpu_dirty,
+                test.sampled_buffer_modified, test.buffer_overlap,
+                test.buffer_cpu_dirty) == test.expected,
+            "depth preservation source changed");
+  }
   depth.depth_load_clear = true;
   depth.stencil_address = sampled.address + 0x6000;
   depth.stencil_size = 0x2000;
@@ -11136,6 +11169,7 @@ void CheckImageOverlapResolution() {
   Require("ImageOverlapResolution", "stencil clear initializes",
           CanLoadStencilAttachment(depth, false),
           "stencil clear did not initialize the attachment");
+  depth.stencil_load_clear = false;
   depth.stencil_htile_compressed = false;
   Require("ImageOverlapResolution", "raw stencil load",
           CanLoadRawStencilPlane(depth),
@@ -11253,6 +11287,122 @@ void CheckDepthTargetFootprints() {
   TileSizeAlign stencil{};
   TileSizeAlign htile{};
   TileSizeAlign depth{};
+  struct AttachmentFormatCase {
+    const char *name;
+    uint32_t depth_format;
+    uint32_t stencil_format;
+    VkFormat expected;
+  };
+  constexpr AttachmentFormatCase attachment_cases[] = {
+      {"Z16", Prospero::GpuEnumValue(Prospero::DepthFormat::kZ16),
+       Prospero::GpuEnumValue(Prospero::StencilFormat::kInvalid),
+       VK_FORMAT_D16_UNORM},
+      {"Z16S8", Prospero::GpuEnumValue(Prospero::DepthFormat::kZ16),
+       Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt),
+       VK_FORMAT_D16_UNORM_S8_UINT},
+      {"Z32", Prospero::GpuEnumValue(Prospero::DepthFormat::kZ32F),
+       Prospero::GpuEnumValue(Prospero::StencilFormat::kInvalid),
+       VK_FORMAT_D32_SFLOAT},
+      {"Z32S8", Prospero::GpuEnumValue(Prospero::DepthFormat::kZ32F),
+       Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt),
+       VK_FORMAT_D32_SFLOAT_S8_UINT},
+      {"invalid depth", 2,
+       Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt),
+       VK_FORMAT_UNDEFINED},
+      {"invalid stencil", Prospero::GpuEnumValue(Prospero::DepthFormat::kZ16),
+       2, VK_FORMAT_UNDEFINED},
+  };
+  for (const auto &test : attachment_cases) {
+    Require("DepthTargetFootprints", test.name,
+            DepthAttachmentFormat(test.depth_format, test.stencil_format) ==
+                test.expected,
+            "PS5 depth/stencil attachment mapping changed");
+  }
+  Require("DepthTargetFootprints", "1920x1080 Z16S8 without HTile",
+          TileGetDepthSize(1920, 1080, 0,
+                           Prospero::GpuEnumValue(Prospero::DepthFormat::kZ16),
+                           Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt), false,
+                           &stencil, &htile, &depth) &&
+              depth.size == 0x480000 && depth.align == 0x10000 &&
+              stencil.size == 0x280000 && stencil.align == 0x10000 && htile.size == 0,
+          "captured Z16S8 footprint disagrees with Prospero block rules");
+  struct TargetFormatCase {
+    const char *name;
+    VkFormat host_format;
+    uint32_t guest_format;
+    uint32_t bytes_per_element;
+    bool stencil;
+    bool supported;
+  };
+  constexpr TargetFormatCase target_cases[] = {
+      {"D16", VK_FORMAT_D16_UNORM,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm), 2, false, true},
+      {"D16S8", VK_FORMAT_D16_UNORM_S8_UINT,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm), 2, true, true},
+      {"D16 via D24S8", VK_FORMAT_D24_UNORM_S8_UINT,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm), 2, true, true},
+      {"D16 via D32S8", VK_FORMAT_D32_SFLOAT_S8_UINT,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm), 2, true, true},
+      {"D32", VK_FORMAT_D32_SFLOAT,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 4, false, true},
+      {"D32S8", VK_FORMAT_D32_SFLOAT_S8_UINT,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 4, true, true},
+      {"D16 plus stencil mismatch", VK_FORMAT_D16_UNORM,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm), 2, true, false},
+      {"fallback without stencil", VK_FORMAT_D24_UNORM_S8_UINT,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm), 2, false, false},
+      {"D32 guest via D24", VK_FORMAT_D24_UNORM_S8_UINT,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), 4, true, false},
+      {"D16 byte mismatch", VK_FORMAT_D16_UNORM,
+       Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm), 4, false, false},
+  };
+  for (const auto &test : target_cases) {
+    DepthTargetInfo target{};
+    target.format = test.host_format;
+    target.guest_format = test.guest_format;
+    target.bytes_per_element = test.bytes_per_element;
+    target.stencil_address = test.stencil ? 0x10000 : 0;
+    target.stencil_size = test.stencil ? 0x10000 : 0;
+    Require("DepthTargetFootprints", test.name,
+            IsSupportedDepthTargetFormat(target) == test.supported,
+            "host/guest depth format policy changed");
+  }
+  struct TransferPlaneCase {
+    const char *name;
+    VkFormat attachment;
+    VkFormat transfer;
+    uint32_t bytes;
+  };
+  constexpr TransferPlaneCase transfer_cases[] = {
+      {"D16S8 transfer", VK_FORMAT_D16_UNORM_S8_UINT, VK_FORMAT_D16_UNORM, 2},
+      {"D24S8 transfer", VK_FORMAT_D24_UNORM_S8_UINT,
+       VK_FORMAT_X8_D24_UNORM_PACK32, 4},
+      {"D32S8 transfer", VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D32_SFLOAT, 4},
+      {"invalid transfer", VK_FORMAT_R16_UNORM, VK_FORMAT_UNDEFINED, 0},
+  };
+  for (const auto &test : transfer_cases) {
+    Require("DepthTargetFootprints", test.name,
+            DepthAspectTransferFormat(test.attachment) == test.transfer &&
+                DepthAspectTransferBytes(test.attachment) == test.bytes,
+            "combined depth transfer-plane layout changed");
+  }
+  struct PromotionCase {
+    const char *name;
+    uint16_t source;
+    uint32_t d24;
+    uint32_t d32;
+  };
+  constexpr PromotionCase promotion_cases[] = {
+      {"zero", 0, 0, 0},
+      {"midpoint", 0x8000, 0x00800080, 0x3f000080},
+      {"maximum", 0xffff, 0x00ffffff, 0x3f800000},
+  };
+  for (const auto &test : promotion_cases) {
+    Require("DepthTargetFootprints", test.name,
+            EncodeD16AsD24(test.source) == test.d24 &&
+                EncodeD16AsD32(test.source) == test.d32,
+            "D16 host promotion changed the represented depth value");
+  }
   Require("DepthTargetFootprints", "640x360 Z32S8 without HTile",
           TileGetDepthSize(640, 360, 0, Prospero::GpuEnumValue(Prospero::DepthFormat::kZ32F),
                            Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt), false,
@@ -11396,6 +11546,18 @@ void CheckHtileClearTargetResolution() {
               resolved.address == derived_z16.htile_data_base_addr &&
               resolved.size == htile_size.size,
           "extent-derived Z16 depth-only HTile target was rejected");
+
+  auto derived_z16s8 = derived;
+  derived_z16s8.z_info.format = Prospero::GpuEnumValue(Prospero::DepthFormat::kZ16);
+  Require("HtileClearTargetResolution", "derived Z16S8 target",
+          TileGetDepthSize(960, 540, 0, derived_z16s8.z_info.format,
+                           derived_z16s8.stencil_info.format, true, &stencil_size,
+                           &htile_size, &depth_size) &&
+              stencil_size.size != 0 && stencil_size.align == 0x10000 &&
+              ResolveHtileClearTarget(derived_z16s8, htile_size.size, &resolved) &&
+              resolved.address == derived_z16s8.htile_data_base_addr &&
+              resolved.size == htile_size.size,
+          "extent-derived Z16S8 HTile target was rejected");
   std::printf("[host]    %-32s ok\n", "HtileClearTargetResolution");
 }
 

@@ -1109,10 +1109,9 @@ DepthStencilVulkanImage* CreateDepthTarget(GraphicContext* ctx, const DepthTarge
 	create.format        = info.format;
 	create.tiling        = VK_IMAGE_TILING_OPTIMAL;
 	create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	create.usage       = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-	                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-	create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-	create.samples     = VK_SAMPLE_COUNT_1_BIT;
+	create.usage         = DepthTargetImageUsage();
+	create.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+	create.samples       = VK_SAMPLE_COUNT_1_BIT;
 	VkImageFormatProperties properties {};
 	if (vkGetPhysicalDeviceImageFormatProperties(ctx->physical_device, info.format,
 	                                             VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
@@ -2299,12 +2298,7 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 	      (has_stencil && PageOverlaps(info.stencil_address, info.stencil_size, info.htile_address,
 	                                   info.htile_size)))) ||
 	    (info.stencil_htile_compressed && (!has_stencil || !has_htile)) ||
-	    !(info.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm)
-	          ? !has_stencil && info.format == VK_FORMAT_D16_UNORM && info.bytes_per_element == 2
-	          : info.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) &&
-	                info.bytes_per_element == 4 &&
-	                info.format ==
-	                    (has_stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT))) {
+	    !IsSupportedDepthTargetFormat(info)) {
 		EXIT("TextureCache: unsupported depth target, command=%p ctx=%p depth=0x%016" PRIx64
 		     "+0x%016" PRIx64 " stencil=0x%016" PRIx64 "+0x%016" PRIx64 " htile=0x%016" PRIx64
 		     "+0x%016" PRIx64 " extent=%ux%u pitch=%u tile=%u format=%d guest_format=%u bpe=%u\n",
@@ -2449,8 +2443,14 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 	}
 	RequireRetirementIsolation(retire, "depth target", info.address, info.size);
 	RetireImages(retire, native_depth_source.get());
-	if (!CanLoadStencilAttachment(info, native_depth_source != nullptr &&
-	                                        native_depth_source->stencil_initialized)) {
+	const bool coherent_guest_stencil =
+	    has_stencil &&
+	    IsCoherentGuestImageSource(stencil_source, info.stencil_address, info.stencil_size);
+	// Native expansion must preserve old layers. Guest data initializes only a wholly new image.
+	const bool stencil_contents_available = native_depth_source != nullptr
+	                                            ? native_depth_source->stencil_initialized
+	                                            : coherent_guest_stencil;
+	if (!CanLoadStencilAttachment(info, stencil_contents_available)) {
 		EXIT("TextureCache: new stencil target requires a clear before stencil access, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     info.stencil_address, info.stencil_size);
