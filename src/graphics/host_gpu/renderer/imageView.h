@@ -3,21 +3,22 @@
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/imageInfo.h"
 #include "graphics/shader/recompiler/ShaderIR.h"
 #include "graphics/shader/shader.h"
 
 namespace Libs::Graphics {
 
 [[nodiscard]] inline bool IsSupportedStorageSwizzle(uint32_t format, uint32_t swizzle) noexcept {
-	const bool single_channel = format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm) ||
-	                            format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) ||
-	                            format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UInt) ||
-	                            format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) ||
-	                            format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16Float) ||
-	                            format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
+	const bool single_channel =
+	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm) ||
+	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) ||
+	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UInt) ||
+	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) ||
+	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16Float) ||
+	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
 	return swizzle == DstSel(4, 5, 6, 7) ||
-	       (single_channel &&
-	        (swizzle == DstSel(4, 0, 0, 0) || swizzle == DstSel(4, 0, 0, 1))) ||
+	       (single_channel && (swizzle == DstSel(4, 0, 0, 0) || swizzle == DstSel(4, 0, 0, 1))) ||
 	       (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm) &&
 	        (swizzle == DstSel(4, 5, 6, 1) || swizzle == DstSel(6, 5, 4, 7))) ||
 	       (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32Float) &&
@@ -83,6 +84,10 @@ namespace Libs::Graphics {
 			default: break;
 		}
 	}
+	if (image_format == VK_FORMAT_R16G16B16A16_SFLOAT && view_format == image_format &&
+	    swizzle == DstSel(7, 6, 5, 4)) {
+		return VulkanImage::VIEW_ABGR;
+	}
 	if (IsBgraToRgbaSampledView(image_format, view_format) && swizzle == DstSel(6, 5, 4, 7)) {
 		return VulkanImage::VIEW_BGRA_TO_RGBA;
 	}
@@ -91,11 +96,7 @@ namespace Libs::Graphics {
 
 [[nodiscard]] inline int SelectSampledDepthView(VkFormat image_format, VkFormat view_format,
                                                 uint32_t swizzle) noexcept {
-	const bool d16 = image_format == VK_FORMAT_D16_UNORM && view_format == VK_FORMAT_R16_UNORM;
-	const bool d32 =
-	    (image_format == VK_FORMAT_D32_SFLOAT || image_format == VK_FORMAT_D32_SFLOAT_S8_UINT) &&
-	    view_format == VK_FORMAT_R32_SFLOAT;
-	if (d16 || d32) {
+	if (IsSupportedSampledDepthFormat(image_format, view_format)) {
 		switch (swizzle) {
 			case DstSel(4, 4, 4, 4): return VulkanImage::VIEW_DEPTH_TEXTURE;
 			case DstSel(4, 0, 0, 0): return VulkanImage::VIEW_R000;
@@ -117,12 +118,10 @@ IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resou
 
 [[nodiscard]] inline int SelectStorageColorView(VkFormat image_format, VkFormat view_format,
                                                 uint32_t swizzle) noexcept {
-	const bool single_channel = view_format == VK_FORMAT_R8_UNORM ||
-	                            view_format == VK_FORMAT_R8_UINT ||
-	                            view_format == VK_FORMAT_R16_UINT ||
-	                            view_format == VK_FORMAT_R32_UINT ||
-	                            view_format == VK_FORMAT_R16_SFLOAT ||
-	                            view_format == VK_FORMAT_R32_SFLOAT;
+	const bool single_channel =
+	    view_format == VK_FORMAT_R8_UNORM || view_format == VK_FORMAT_R8_UINT ||
+	    view_format == VK_FORMAT_R16_UINT || view_format == VK_FORMAT_R32_UINT ||
+	    view_format == VK_FORMAT_R16_SFLOAT || view_format == VK_FORMAT_R32_SFLOAT;
 	const bool swizzle_ok =
 	    swizzle == DstSel(4, 5, 6, 7) ||
 	    (single_channel && (swizzle == DstSel(4, 0, 0, 0) || swizzle == DstSel(4, 0, 0, 1))) ||

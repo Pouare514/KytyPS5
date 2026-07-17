@@ -791,10 +791,11 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo* regs,
 	return true;
 }
 
-static void ShaderGetStaticInputInfoPS(const HW::PixelShaderInfo*   regs,
-                                       const HW::ShaderRegisters*   sh,
-                                       const ShaderVertexInputInfo* vs_info,
-                                       ShaderPixelInputInfo*        ps_info) {
+static void ShaderGetStaticInputInfoPS(
+    const HW::PixelShaderInfo* regs, const HW::ShaderRegisters* sh,
+    const ShaderVertexInputInfo* vs_info,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+    ShaderPixelInputInfo* ps_info) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(vs_info == nullptr);
@@ -834,6 +835,9 @@ static void ShaderGetStaticInputInfoPS(const HW::PixelShaderInfo*   regs,
 
 	for (int i = 0; i < 8; i++) {
 		ps_info->target_output_mode[i] = sh->target_output_mode[i];
+		ps_info->target_export_mapping[i] =
+		    sh->target_output_mode[i] != 0 ? target_export_mapping[i]
+		                                   : Prospero::ColorComponentMapping {};
 	}
 	ps_info->mrt_output_mask = 0;
 }
@@ -1105,11 +1109,12 @@ bool ShaderCompileInfoVS(const HW::VertexShaderInfo* regs, const HW::ShaderRegis
 
 bool ShaderCompileInfoPS(const HW::PixelShaderInfo* regs, const HW::ShaderRegisters* sh,
                          ShaderLaneMaskMode lane_mask_mode, const ShaderVertexInputInfo* vs_info,
+                         std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
                          ShaderPixelInputInfo* ps_info, std::span<const uint32_t>* spirv) {
 	EXIT_IF(spirv == nullptr);
 	*spirv = {};
 
-	ShaderGetStaticInputInfoPS(regs, sh, vs_info, ps_info);
+	ShaderGetStaticInputInfoPS(regs, sh, vs_info, target_export_mapping, ps_info);
 	const auto shader_hash =
 	    regs->ps_regs.chksum != 0 ? regs->ps_regs.chksum : regs->ps_regs.data_addr;
 	const auto program_id = ShaderGetIdPS(regs, ps_info, false);
@@ -1631,6 +1636,14 @@ ShaderId ShaderGetIdPS(const HW::PixelShaderInfo* regs, const ShaderPixelInputIn
 
 	for (auto mode: input_info->target_output_mode) {
 		ret.ids.push_back(mode);
+	}
+	for (uint32_t base = 0; base < input_info->target_export_mapping.size(); base += 4u) {
+		uint32_t packed = 0;
+		for (uint32_t i = 0; i < 4u; i++) {
+			packed |= static_cast<uint32_t>(input_info->target_export_mapping[base + i].packed)
+			          << (i * 8u);
+		}
+		ret.ids.push_back(packed);
 	}
 	ret.ids.push_back(input_info->mrt_output_mask);
 

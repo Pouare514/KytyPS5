@@ -133,7 +133,7 @@ private:
 	                                uint64_t address, uint64_t size) const;
 	void RetireImages(const std::vector<CachedImage*>& retire,
 	                  const CachedImage*               native_image_source = nullptr);
-	void SynchronizeRenderTargetToBufferLocked(CachedImage& cached);
+	void SynchronizeColorImageToBufferLocked(CachedImage& cached);
 
 	Common::Mutex                             m_dummy_mutex;
 	std::array<VulkanImage*, 4>               m_dummy_sampled_textures {};

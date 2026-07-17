@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/utils.h"
 
@@ -47,8 +48,9 @@ enum class TextureUploadDestination { MipLevels, MipAtlas };
 enum class TextureUploadSliceLayout { MipChainPerSlice, MipLevelPerSlice };
 
 struct RenderTargetFormatInfo {
-	VkFormat format            = VK_FORMAT_UNDEFINED;
-	uint32_t bytes_per_element = 0;
+	VkFormat                        format            = VK_FORMAT_UNDEFINED;
+	uint32_t                        bytes_per_element = 0;
+	Prospero::ColorComponentMapping export_mapping;
 };
 
 struct TextureUploadLayout {

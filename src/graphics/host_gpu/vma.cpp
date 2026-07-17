@@ -99,9 +99,8 @@ void VulkanLogMemoryBudget(GraphicContext* ctx) {
 		return;
 	}
 
-	VkPhysicalDeviceMemoryProperties properties {};
-	vkGetPhysicalDeviceMemoryProperties(ctx->physical_device, &properties);
-	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	const auto& properties = ctx->GetPhysicalDeviceMemoryProperties();
+	VmaBudget   budgets[VK_MAX_MEMORY_HEAPS] {};
 	vmaGetHeapBudgets(ctx->allocator, budgets);
 	for (uint32_t i = 0; i < properties.memoryHeapCount; i++) {
 		LOGF("VMA heap %u: usage=%" PRIu64 ", budget=%" PRIu64 ", allocation=%" PRIu64
@@ -118,9 +117,8 @@ bool VulkanAllocate(GraphicContext* ctx, VulkanMemory* memory) {
 	        memory->allocation != nullptr || ctx->allocator == nullptr ||
 	        memory->requirements.size == 0);
 
-	VkPhysicalDeviceMemoryProperties properties {};
-	vkGetPhysicalDeviceMemoryProperties(ctx->physical_device, &properties);
-	uint32_t index = 0;
+	const auto& properties = ctx->GetPhysicalDeviceMemoryProperties();
+	uint32_t    index      = 0;
 	for (; index < properties.memoryTypeCount; index++) {
 		if ((memory->requirements.memoryTypeBits & (uint32_t {1} << index)) != 0 &&
 		    (properties.memoryTypes[index].propertyFlags & memory->property) == memory->property) {

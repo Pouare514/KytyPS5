@@ -4,7 +4,6 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/streamBuffer.h"
-#include "kernel/eventQueue.h"
 
 #include <memory>
 #include <vector>
@@ -38,6 +37,19 @@ class BufferCache;
 struct HtileClearTarget {
 	uint64_t address = 0;
 	uint64_t size    = 0;
+};
+
+enum class CommandBufferDebugOp : uint32_t {
+	DispatchDirect,
+	DrawIndex,
+	DrawIndexAuto,
+	EopWrite,
+	EopInterrupt,
+	EopWriteBack,
+	EopFlip,
+	EopWriteBackFlip,
+	EopOnlyFlip,
+	Unknown,
 };
 
 class FenceResourceRetainer {
@@ -131,10 +143,6 @@ void RenderDispatchDirect(uint64_t submit_id, CommandBuffer* buffer, HW::Context
 void GraphicsRenderInit();
 void GraphicsRenderCreateContext();
 
-[[nodiscard]] bool     GraphicsScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency,
-                                                   uint64_t* value);
-[[nodiscard]] uint64_t GraphicsRenderReadReferenceClock();
-
 [[nodiscard]] bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
                                             ShaderBufferResource* descriptor,
@@ -142,61 +150,9 @@ void GraphicsRenderCreateContext();
 [[nodiscard]] bool ResolveHtileClearTarget(const HW::DepthRenderTarget& target,
                                            uint64_t descriptor_size, HtileClearTarget* resolved);
 
-void     GraphicsRenderWriteAtEndOfPipe64(uint64_t submit_id, CommandBuffer* buffer,
-                                          uint64_t* dst_gpu_addr, uint64_t value);
-void     GraphicsRenderWriteAtEndOfPipeClockCounter(uint64_t submit_id, CommandBuffer* buffer,
-                                                    uint64_t* dst_gpu_addr, uint64_t value);
-void     GraphicsRenderWriteAtEndOfPipeClockCounterWithWriteBack(uint64_t       submit_id,
-                                                                 CommandBuffer* buffer,
-                                                                 uint64_t*      dst_gpu_addr,
-                                                                 uint64_t       value);
-void     GraphicsRenderWriteAtEndOfPipe32(uint64_t submit_id, CommandBuffer* buffer,
-                                          uint32_t* dst_gpu_addr, uint32_t value);
-void     GraphicsRenderWriteAtEndOfPipeGds32(uint64_t submit_id, CommandBuffer* buffer,
-                                             uint32_t* dst_gpu_addr, uint32_t dw_offset,
-                                             uint32_t dw_num);
-uint64_t GraphicsRenderPrepareDisplayBufferFlip(CommandBuffer* buffer, int handle, int index,
-                                                int flip_mode, int64_t flip_arg);
-void     GraphicsRenderWriteAtEndOfPipeWithInterruptWriteBackFlip32(
-    uint64_t submit_id, CommandBuffer* buffer, uint32_t* dst_gpu_addr, uint32_t value, int handle,
-    int index, int flip_mode, int64_t flip_arg, uint64_t request_id);
-void GraphicsRenderWriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer* buffer,
-                                              uint32_t* dst_gpu_addr, uint32_t value, int handle,
-                                              int index, int flip_mode, int64_t flip_arg,
-                                              uint64_t request_id);
-void GraphicsRenderWriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer* buffer, int handle,
-                                            int index, int flip_mode, int64_t flip_arg,
-                                            uint64_t request_id);
-void GraphicsRenderWriteAtEndOfPipeWithWriteBack64(uint64_t submit_id, CommandBuffer* buffer,
-                                                   uint64_t* dst_gpu_addr, uint64_t value);
-void GraphicsRenderWriteAtEndOfPipeWithWriteBack32(uint64_t submit_id, CommandBuffer* buffer,
-                                                   uint32_t* dst_gpu_addr, uint32_t value);
-void GraphicsRenderWriteAtEndOfPipeWithInterruptWriteBack64(uint64_t       submit_id,
-                                                            CommandBuffer* buffer,
-                                                            uint64_t* dst_gpu_addr, uint64_t value,
-                                                            uint32_t context_id = 0);
-void GraphicsRenderWriteAtEndOfPipeWithInterruptWriteBack32(uint64_t       submit_id,
-                                                            CommandBuffer* buffer,
-                                                            uint32_t* dst_gpu_addr, uint32_t value,
-                                                            uint32_t context_id = 0);
-void GraphicsRenderWriteAtEndOfPipeWithInterrupt64(uint64_t submit_id, CommandBuffer* buffer,
-                                                   uint64_t* dst_gpu_addr, uint64_t value,
-                                                   uint32_t context_id = 0);
-void GraphicsRenderWriteAtEndOfPipeWithInterrupt32(uint64_t submit_id, CommandBuffer* buffer,
-                                                   uint32_t* dst_gpu_addr, uint32_t value,
-                                                   uint32_t context_id = 0);
 void GraphicsRenderMemoryBarrier(CommandBuffer* buffer);
 void GraphicsRenderTextureBarrier(CommandBuffer* buffer, uint64_t vaddr, uint64_t size);
 void GraphicsRenderDepthStencilBarrier(CommandBuffer* buffer, uint64_t vaddr, uint64_t size);
-void GraphicsRenderDeleteBuffers();
-void GraphicsRenderTriggerEopEventAtEndOfPipe(CommandBuffer* buffer, uint32_t context_id);
-
-int  GraphicsRenderAddEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id, void* udata);
-int  GraphicsRenderDeleteEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id);
-void GraphicsRenderTriggerAgcUserInterrupt();
-void GraphicsRenderTriggerEopEvent(uint32_t context_id);
-
-void GraphicsRenderReadGds(uint32_t* dst, uint32_t dw_offset, uint32_t dw_size);
 
 } // namespace Libs::Graphics
 

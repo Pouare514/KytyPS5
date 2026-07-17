@@ -15,12 +15,13 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/objects/textureCommon.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/descriptorCache.h"
 #include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/renderState.h"
+#include "graphics/host_gpu/renderer/renderTargetBarriers.h"
 #include "graphics/host_gpu/renderer/shaderResourceBarrier.h"
 #include "graphics/host_gpu/utils.h"
 #include "graphics/host_gpu/vma.h"
@@ -275,18 +276,6 @@ ResolveTargetTextureView(const ShaderRecompiler::IR::ImageResource& resource,
 			           : TargetTextureViewInfo {};
 		default: return {};
 	}
-}
-
-static bool IsSupportedSampledDepthFormat(VkFormat image_format, uint32_t guest_format,
-                                          VkFormat view_format) {
-	const bool d16 = image_format == VK_FORMAT_D16_UNORM &&
-	                 guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm) &&
-	                 view_format == VK_FORMAT_R16_UNORM;
-	const bool d32 =
-	    (image_format == VK_FORMAT_D32_SFLOAT || image_format == VK_FORMAT_D32_SFLOAT_S8_UINT) &&
-	    guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) &&
-	    view_format == VK_FORMAT_R32_SFLOAT;
-	return d16 || d32;
 }
 
 bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor,

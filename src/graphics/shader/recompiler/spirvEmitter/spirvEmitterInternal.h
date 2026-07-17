@@ -137,6 +137,7 @@ enum : uint32_t {
 	OpArrayLength                  = 68,
 	OpDecorate                     = 71,
 	OpMemberDecorate               = 72,
+	OpVectorShuffle                = 79,
 	OpCompositeConstruct           = 80,
 	OpCompositeExtract             = 81,
 	OpSampledImage                 = 86,

@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/renderTargetBarriers.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
@@ -13,7 +15,6 @@
 #include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/renderState.h"
 #include "graphics/host_gpu/utils.h"
 #include "graphics/presentation/displayBuffer.h"
 

@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderTargetBarriers.h"
 #include "graphics/host_gpu/renderer/resourceMutex.h"
 #include "graphics/host_gpu/utils.h"
 #include "graphics/shader/shader.h"
@@ -55,23 +56,15 @@ private:
 	TrackingSpinLock& m_mutex;
 };
 
-bool Overlaps(uint64_t left, uint64_t left_size, uint64_t right, uint64_t right_size) {
-	return left < right + right_size && right < left + left_size;
-}
-
-bool PageOverlaps(uint64_t left, uint64_t left_size, uint64_t right, uint64_t right_size) {
-	return ImagePageRangesOverlap(left, left_size, right, right_size);
-}
-
 enum class ImageRangeOverlap : uint8_t { None, PageOnly, Bytes };
 
 ImageRangeOverlap ClassifyImageRangeOverlap(uint64_t left, uint64_t left_size, uint64_t right,
                                             uint64_t right_size) {
-	if (Overlaps(left, left_size, right, right_size)) {
+	if (ImageRangeOverlaps(left, left_size, right, right_size)) {
 		return ImageRangeOverlap::Bytes;
 	}
-	return PageOverlaps(left, left_size, right, right_size) ? ImageRangeOverlap::PageOnly
-	                                                        : ImageRangeOverlap::None;
+	return ImagePageRangesOverlap(left, left_size, right, right_size) ? ImageRangeOverlap::PageOnly
+	                                                                  : ImageRangeOverlap::None;
 }
 
 } // namespace
@@ -175,8 +168,8 @@ struct TextureCache::CachedImage {
 	}
 	[[nodiscard]] bool OverlapsRange(uint64_t address, uint64_t size, bool page) const {
 		for (uint32_t i = 0; i < RangeCount(); i++) {
-			if (page ? PageOverlaps(address, size, Address(i), Size(i))
-			         : Overlaps(address, size, Address(i), Size(i))) {
+			if (page ? ImagePageRangesOverlap(address, size, Address(i), Size(i))
+			         : ImageRangeOverlaps(address, size, Address(i), Size(i))) {
 				return true;
 			}
 		}
@@ -416,8 +409,9 @@ struct TextureCache::ReadbackWorker {
 		                                   Prospero::NumBytesPerElement(cached.info.format))
 		                             : MakeColorImageTransferInfo(cached.target);
 		const bool linear  = info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-		const bool tiled =
-		    target && info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+		const bool tiled_target = target && IsTiledRenderTarget(cached.target);
+		const bool tiled_storage =
+		    storage && info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
 		bool single_layer_storage = false;
 		if (storage) {
 			switch (static_cast<Prospero::ImageType>(cached.info.type)) {
@@ -429,41 +423,26 @@ struct TextureCache::ReadbackWorker {
 			}
 		}
 		const bool basic_storage =
-		    !storage || (single_layer_storage && cached.info.base_level == 0 &&
-		                 cached.info.levels == 1 && cached.info.base_array == 0 && linear);
+		    !storage ||
+		    (single_layer_storage && cached.info.base_level == 0 && cached.info.levels == 1 &&
+		     cached.info.base_array == 0 && (linear || tiled_storage));
 		const auto layers = target ? cached.target.layers : 1u;
-		const auto rows   = static_cast<uint64_t>(info.height - 1);
-		if ((!linear && !tiled) || !basic_storage || info.address == 0 || info.size == 0 ||
-		    info.width == 0 || info.height == 0 || info.levels != 1 || info.pitch < info.width ||
-		    info.bytes_per_element == 0 || layers == 0 || info.size > UINT32_MAX ||
-		    info.size % layers != 0 || cached.image->layers != layers ||
-		    rows > (UINT64_MAX - info.width) / info.pitch) {
+		if ((!linear && !tiled_target && !tiled_storage) || !basic_storage || info.levels != 1 ||
+		    info.size > UINT32_MAX) {
 			EXIT("TextureCache: unsupported color-image readback layout, addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " extent=%ux%u pitch=%u bpe=%u levels=%u tile=%u kind=%u\n",
 			     info.address, info.size, info.width, info.height, info.pitch,
 			     info.bytes_per_element, info.levels, info.tile_mode,
 			     static_cast<uint32_t>(cached.kind));
 		}
-		const auto linear_elements = rows * info.pitch + info.width;
-		if (linear_elements > UINT64_MAX / info.bytes_per_element) {
-			EXIT("TextureCache: color-image readback size overflow\n");
-		}
-		const auto linear_size    = linear_elements * info.bytes_per_element;
 		const auto slice_size     = info.size / layers;
 		const bool meta_overlap   = cache.HasMetaOverlapLocked(info.address, info.size);
 		const bool buffer_overlap = cache.m_buffer_cache.HasPageOverlap(info.address, info.size);
-		if (linear_size > slice_size || cached.image->format != info.format ||
-		    cached.image->extent.width != info.width ||
-		    cached.image->extent.height != info.height ||
-		    (tiled && !IsSupportedRenderTargetElementSize(info.bytes_per_element)) ||
-		    meta_overlap || buffer_overlap) {
+		if (meta_overlap || buffer_overlap) {
 			EXIT("TextureCache: color-image readback storage is unsupported, addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 " linear=0x%016" PRIx64
-			     " format=%d/%d extent=%ux%u/%ux%u bpe=%u tiled=%d meta=%d kind=%u\n",
-			     info.address, info.size, linear_size, static_cast<int>(cached.image->format),
-			     static_cast<int>(info.format), cached.image->extent.width,
-			     cached.image->extent.height, info.width, info.height, info.bytes_per_element,
-			     tiled, meta_overlap, static_cast<uint32_t>(cached.kind));
+			     " size=0x%016" PRIx64 " meta=%d buffer=%d kind=%u\n",
+			     info.address, info.size, meta_overlap, buffer_overlap,
+			     static_cast<uint32_t>(cached.kind));
 		}
 		download.resize(info.size);
 		std::fill(download.begin(), download.end(), 0);
@@ -471,9 +450,20 @@ struct TextureCache::ReadbackWorker {
 		    MakeLayeredImageBufferCopies(layers, slice_size, info.pitch, info.width, info.height);
 		UtilFillBuffer(cached.ctx, download.data(), info.size, regions, cached.image,
 		               cached.image->layout);
-		if (tiled) {
+		if (tiled_target || tiled_storage) {
 			guest.resize(info.size);
-			cache.m_tiler.TileImage(guest.data(), download.data(), cached.target);
+			const RenderTargetInfo layout =
+			    target ? cached.target : RenderTargetInfo {info.address,
+			                                               info.size,
+			                                               info.format,
+			                                               info.width,
+			                                               info.height,
+			                                               info.pitch,
+			                                               info.bytes_per_element,
+			                                               info.tile_mode,
+			                                               info.levels,
+			                                               1};
+			cache.m_tiler.TileImage(guest.data(), download.data(), layout);
 			Libs::LibKernel::Memory::WriteBacking(info.address, guest.data(), info.size);
 		} else {
 			Libs::LibKernel::Memory::WriteBacking(info.address, download.data(), info.size);
@@ -619,7 +609,8 @@ void TextureCache::RetireImages(const std::vector<CachedImage*>& retire,
 		}
 		const bool sampled      = (*it)->kind == CachedImage::Kind::Texture;
 		const bool storage      = (*it)->kind == CachedImage::Kind::StorageTexture;
-		const bool target       = (*it)->kind == CachedImage::Kind::RenderTarget;
+		const bool target       = (*it)->kind == CachedImage::Kind::RenderTarget ||
+		                          (*it)->kind == CachedImage::Kind::DepthTarget;
 		const bool native_image = it->get() == native_image_source;
 		if (native_image) {
 			bool source_valid = (*it)->gpu_modified && !(*it)->buffer_modified;
@@ -813,8 +804,7 @@ TextureImageCreateParams MakeImageParams(const ImageInfo& info, bool storage) {
 }
 
 bool FormatSupportsStorage(GraphicContext* ctx, VkFormat format) {
-	VkFormatProperties properties {};
-	vkGetPhysicalDeviceFormatProperties(ctx->physical_device, format, &properties);
+	const auto properties = ctx->GetFormatProperties(format);
 	return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
 }
 
@@ -846,9 +836,8 @@ VkImageUsageFlags RenderTargetUsage(GraphicContext* ctx, VkFormat format,
 		usage |= VK_IMAGE_USAGE_STORAGE_BIT;
 	}
 	VkImageFormatProperties properties {};
-	if (vkGetPhysicalDeviceImageFormatProperties(ctx->physical_device, format, VK_IMAGE_TYPE_2D,
-	                                             VK_IMAGE_TILING_OPTIMAL, usage, flags,
-	                                             &properties) != VK_SUCCESS) {
+	if (ctx->GetImageFormatProperties(format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage,
+	                                  flags, &properties) != VK_SUCCESS) {
 		EXIT("TextureCache: render-target format does not support required usage, format=%d "
 		     "usage=0x%x\n",
 		     static_cast<int>(format), usage);
@@ -986,14 +975,16 @@ void UploadRenderTargetLayers(GraphicContext* ctx, RenderTextureVulkanImage* ima
 	}
 	const auto slice_size  = info.size / info.layers;
 	const auto upload_size = slice_size * layer_count;
-	if (info.levels > 1 || info.layers > 1) {
+	const bool standard64  = IsSupportedStandard64RenderTarget(info);
+	if (standard64 || info.levels > 1 || info.layers > 1) {
 		const auto format = RenderTargetTransferFormat(info.bytes_per_element);
 		auto layout = TextureCalcUploadLayout(format, info.width, info.height, info.levels,
 		                                      layer_count, info.pitch, info.tile_mode, upload_size,
 		                                      false, false, false, "TextureCache render target");
-		const bool tiled =
+		const bool render_target_tiled =
 		    info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
-		if ((tiled && !layout.fmt_tiled_render_target) || layout.pitch != info.pitch) {
+		if (!standard64 && ((render_target_tiled && !layout.fmt_tiled_render_target) ||
+		                    layout.pitch != info.pitch)) {
 			EXIT("TextureCache: unsupported render-target mip upload layout, pitch=%u/%u tile=%u\n",
 			     info.pitch, layout.pitch, info.tile_mode);
 		}
@@ -1120,14 +1111,12 @@ DepthStencilVulkanImage* CreateDepthTarget(GraphicContext* ctx, const DepthTarge
 	create.format        = info.format;
 	create.tiling        = VK_IMAGE_TILING_OPTIMAL;
 	create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	create.usage       = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-	                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-	create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-	create.samples     = VK_SAMPLE_COUNT_1_BIT;
+	create.usage         = DepthTargetImageUsage();
+	create.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+	create.samples       = VK_SAMPLE_COUNT_1_BIT;
 	VkImageFormatProperties properties {};
-	if (vkGetPhysicalDeviceImageFormatProperties(ctx->physical_device, info.format,
-	                                             VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
-	                                             create.usage, 0, &properties) != VK_SUCCESS) {
+	if (ctx->GetImageFormatProperties(info.format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+	                                  create.usage, 0, &properties) != VK_SUCCESS) {
 		EXIT("TextureCache: depth format does not support required usage, format=%d usage=0x%x\n",
 		     static_cast<int>(info.format), create.usage);
 	}
@@ -1449,6 +1438,10 @@ VkImageView TextureCache::GetRenderTargetSampledView(GraphicContext*           c
 			components = {VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_R,
 			              VK_COMPONENT_SWIZZLE_A};
 			break;
+		case VulkanImage::VIEW_ABGR:
+			components = {VK_COMPONENT_SWIZZLE_A, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_G,
+			              VK_COMPONENT_SWIZZLE_R};
+			break;
 		default:
 			EXIT("TextureCache: unsupported render-target sampled view variant: %d\n", variant);
 	}
@@ -1690,6 +1683,37 @@ void TextureCache::RetireSampledTargetAliases(GraphicContext* ctx, const ImageIn
 				     cached->ctx == ctx, cached->gpu_modified, cached->buffer_modified);
 		}
 	}
+	for (const auto& cached: m_images) {
+		if (cached->kind != CachedImage::Kind::DepthTarget) {
+			continue;
+		}
+		const auto overlap = ClassifyImageRangeOverlap(requested.address, requested.size,
+		                                               cached->depth.address, cached->depth.size);
+		if (overlap == ImageRangeOverlap::None) {
+			continue;
+		}
+		const auto delta = cached->depth.address >= requested.address
+		                       ? cached->depth.address - requested.address
+		                       : UINT64_MAX;
+		const bool contained =
+		    delta <= requested.size && cached->depth.size <= requested.size - delta;
+		const bool supported = cached->ctx == ctx && !cached->buffer_modified &&
+		                       cached->depth.stencil_address == 0 &&
+		                       cached->depth.stencil_size == 0 && cached->depth.layers == 1 &&
+		                       (overlap == ImageRangeOverlap::PageOnly || contained);
+		if (!supported) {
+			EXIT("TextureCache: unsupported sampled/depth-target alias, sampled=0x%016" PRIx64
+			     "+0x%016" PRIx64 " depth=0x%016" PRIx64 "+0x%016" PRIx64
+			     " overlap=%u contained=%d same_context=%d gpu=%d buffer=%d stencil=0x%016" PRIx64
+			     "+0x%016" PRIx64 " layers=%u\n",
+			     requested.address, requested.size, cached->depth.address, cached->depth.size,
+			     static_cast<uint32_t>(overlap), contained, cached->ctx == ctx,
+			     cached->gpu_modified, cached->buffer_modified, cached->depth.stencil_address,
+			     cached->depth.stencil_size, cached->depth.layers);
+		}
+		wait_idle |= cached->gpu_modified;
+		retire.push_back(cached.get());
+	}
 	if (retire.empty()) {
 		return;
 	}
@@ -1701,10 +1725,50 @@ void TextureCache::RetireSampledTargetAliases(GraphicContext* ctx, const ImageIn
 		if (!cached->gpu_modified) {
 			continue;
 		}
-		const auto transfer = m_readback->DownloadColorImage(*cached);
+		const auto transfer = cached->kind == CachedImage::Kind::DepthTarget
+		                          ? m_readback->DownloadDepthTarget(*cached)
+		                          : m_readback->DownloadColorImage(*cached);
 		m_memory_tracker.ForEachDownloadRange<true>(transfer.address, transfer.size,
 		                                            [](uint64_t, uint64_t) noexcept {});
 		cached->gpu_modified = false;
+	}
+	std::vector<uint64_t> retire_depth_metadata;
+	for (auto* cached: retire) {
+		if (cached->kind != CachedImage::Kind::DepthTarget || cached->depth.htile_address == 0) {
+			continue;
+		}
+		const bool retained_owner =
+		    std::any_of(m_images.begin(), m_images.end(), [&](const auto& other) {
+			    return std::find(retire.begin(), retire.end(), other.get()) == retire.end() &&
+			           other->kind == CachedImage::Kind::DepthTarget &&
+			           other->depth.htile_address == cached->depth.htile_address &&
+			           other->depth.htile_size == cached->depth.htile_size;
+		    });
+		if (!retained_owner &&
+		    std::find(retire_depth_metadata.begin(), retire_depth_metadata.end(),
+		              cached->depth.htile_address) == retire_depth_metadata.end()) {
+			retire_depth_metadata.push_back(cached->depth.htile_address);
+		}
+	}
+	for (const auto address: retire_depth_metadata) {
+		auto metadata = m_surface_metas.find(address);
+		auto owner    = std::find_if(retire.begin(), retire.end(), [&](const auto* cached) {
+			return cached->kind == CachedImage::Kind::DepthTarget &&
+			       cached->depth.htile_address == address;
+		});
+		if (metadata == m_surface_metas.end() || owner == retire.end() ||
+		    metadata->second.size != (*owner)->depth.htile_size) {
+			EXIT(
+			    "TextureCache: retiring depth target has invalid HTile metadata, addr=0x%016" PRIx64
+			    " size=0x%016" PRIx64 "\n",
+			    address, owner != retire.end() ? (*owner)->depth.htile_size : 0);
+		}
+		if (metadata->second.gpu_modified) {
+			m_metadata_tracker.ForEachDownloadRange<true>(metadata->first, metadata->second.size,
+			                                              [](uint64_t, uint64_t) noexcept {});
+		}
+		m_metadata_tracker.UntrackMemory(metadata->first, metadata->second.size);
+		m_surface_metas.erase(metadata);
 	}
 	RetireImages(retire);
 }
@@ -1792,7 +1856,8 @@ VulkanImage* TextureCache::FindTexture(CommandBuffer* command, GraphicContext* c
 	if (command == nullptr || ctx == nullptr || info.address == 0 || info.size == 0 ||
 	    info.address >= TRACKER_ADDRESS_SIZE || info.size > TRACKER_ADDRESS_SIZE - info.address ||
 	    info.width == 0 || info.height == 0 || info.depth == 0 || info.levels == 0 ||
-	    info.view_levels == 0 || info.base_level + info.view_levels > info.levels) {
+	    info.levels >= 16 || info.view_levels == 0 ||
+	    info.base_level + info.view_levels > info.levels) {
 		EXIT("TextureCache: invalid sampled-image request, command=%p ctx=%p addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 " extent=%ux%ux%u levels=%u\n",
 		     static_cast<const void*>(command), static_cast<const void*>(ctx), info.address,
@@ -1920,9 +1985,13 @@ VulkanImage* TextureCache::FindTexture(CommandBuffer* command, GraphicContext* c
 			if (!cached->OverlapsRange(info.address, info.size, true)) {
 				continue;
 			}
-			EXIT("TextureCache: sampled image shares pages with GPU target, addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 " target_kind=%u\n",
-			     info.address, info.size, static_cast<uint32_t>(cached->kind));
+			EXIT("TextureCache: sampled image overlaps GPU target, requested=0x%016" PRIx64
+			     "+0x%016" PRIx64 " target=0x%016" PRIx64 "+0x%016" PRIx64
+			     " target_kind=%u requested_info={format=%u extent=%ux%ux%u pitch=%u levels=%u"
+			     " tile=%u type=%u}\n",
+			     info.address, info.size, cached->Address(), cached->Size(),
+			     static_cast<uint32_t>(cached->kind), info.format, info.width, info.height,
+			     info.depth, info.pitch, info.levels, info.tile, info.type);
 		}
 		const auto overlap =
 		    ClassifySampledOverlap(info, cached->info, cached->gpu_modified, cached->ctx == ctx);
@@ -2082,13 +2151,15 @@ StorageTextureVulkanImage* TextureCache::FindStorageTexture(CommandBuffer*   com
 RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*          command,
                                                          GraphicContext*         ctx,
                                                          const RenderTargetInfo& info) {
+	const bool standard64 = IsSupportedStandard64RenderTarget(info);
 	if (command == nullptr || ctx == nullptr || info.address == 0 || info.size == 0 ||
 	    info.address >= TRACKER_ADDRESS_SIZE || info.size > TRACKER_ADDRESS_SIZE - info.address ||
 	    info.format == VK_FORMAT_UNDEFINED || info.width == 0 || info.height == 0 ||
 	    info.pitch < info.width || info.bytes_per_element == 0 || info.levels == 0 ||
 	    info.levels > 16 || info.layers == 0 || info.size % info.layers != 0 ||
 	    (info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kLinear) &&
-	     info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget))) {
+	     info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
+	     !standard64)) {
 		EXIT("TextureCache: invalid render-target request, ctx=%p addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 " extent=%ux%u pitch=%u bpe=%u tile=%u format=%d\n",
 		     static_cast<const void*>(ctx), info.address, info.size, info.width, info.height,
@@ -2106,6 +2177,19 @@ RenderTextureVulkanImage* TextureCache::FindRenderTarget(CommandBuffer*         
 			     " expected=0x%08x extent=%ux%u pitch=%u bpe=%u levels=%u tile=%u\n",
 			     info.size, layout.size, info.width, info.height, info.pitch,
 			     info.bytes_per_element, info.levels, info.tile_mode);
+		}
+	}
+	if (standard64) {
+		const auto format = RenderTargetTransferFormat(info.bytes_per_element);
+		const auto expected_pitch =
+		    TileGetTexturePitch(format, info.width, info.levels, info.tile_mode);
+		TileSizeAlign layout {};
+		TileGetTextureSize(format, info.width, info.height, expected_pitch, info.levels,
+		                   info.tile_mode, &layout, nullptr, nullptr);
+		if (expected_pitch != info.pitch || layout.align != 65536 || layout.size != info.size) {
+			EXIT("TextureCache: invalid Standard64KB render-target layout,"
+			     " size=0x%016" PRIx64 " expected=0x%08x align=0x%08x pitch=%u/%u\n",
+			     info.size, layout.size, layout.align, info.pitch, expected_pitch);
 		}
 	}
 	const auto rows = static_cast<uint64_t>(info.height - 1);
@@ -2294,28 +2378,25 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 	    info.address >= TRACKER_ADDRESS_SIZE || info.size > TRACKER_ADDRESS_SIZE - info.address ||
 	    (info.address & 0xffffu) != 0 || info.width == 0 || info.height == 0 ||
 	    info.pitch < info.width || info.layers == 0 || info.size % info.layers != 0 ||
+	    info.size > UINT32_MAX || info.stencil_size > UINT32_MAX ||
 	    info.tile_mode != Prospero::GpuEnumValue(Prospero::TileMode::kDepth) ||
 	    (has_stencil &&
 	     (info.stencil_address == 0 || info.stencil_size == 0 ||
 	      info.stencil_size % info.layers != 0 || info.stencil_address >= TRACKER_ADDRESS_SIZE ||
 	      info.stencil_size > TRACKER_ADDRESS_SIZE - info.stencil_address ||
 	      (info.stencil_address & 0xffffu) != 0 ||
-	      PageOverlaps(info.address, info.size, info.stencil_address, info.stencil_size))) ||
+	      ImagePageRangesOverlap(info.address, info.size, info.stencil_address,
+	                             info.stencil_size))) ||
 	    ((info.htile_address == 0) != (info.htile_size == 0)) ||
 	    (has_htile &&
 	     (info.htile_size % info.layers != 0 || info.htile_address >= TRACKER_ADDRESS_SIZE ||
 	      info.htile_size > TRACKER_ADDRESS_SIZE - info.htile_address ||
 	      (info.htile_address & 0x7fffu) != 0 ||
-	      PageOverlaps(info.address, info.size, info.htile_address, info.htile_size) ||
-	      (has_stencil && PageOverlaps(info.stencil_address, info.stencil_size, info.htile_address,
-	                                   info.htile_size)))) ||
+	      ImagePageRangesOverlap(info.address, info.size, info.htile_address, info.htile_size) ||
+	      (has_stencil && ImagePageRangesOverlap(info.stencil_address, info.stencil_size,
+	                                             info.htile_address, info.htile_size)))) ||
 	    (info.stencil_htile_compressed && (!has_stencil || !has_htile)) ||
-	    !(info.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm)
-	          ? !has_stencil && info.format == VK_FORMAT_D16_UNORM && info.bytes_per_element == 2
-	          : info.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) &&
-	                info.bytes_per_element == 4 &&
-	                info.format ==
-	                    (has_stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT))) {
+	    !IsSupportedDepthTargetFormat(info)) {
 		EXIT("TextureCache: unsupported depth target, command=%p ctx=%p depth=0x%016" PRIx64
 		     "+0x%016" PRIx64 " stencil=0x%016" PRIx64 "+0x%016" PRIx64 " htile=0x%016" PRIx64
 		     "+0x%016" PRIx64 " extent=%ux%u pitch=%u tile=%u format=%d guest_format=%u bpe=%u\n",
@@ -2480,6 +2561,17 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 			     info.stencil_address, info.stencil_size);
 		}
+	const bool coherent_guest_stencil =
+	    has_stencil &&
+	    IsCoherentGuestImageSource(stencil_source, info.stencil_address, info.stencil_size);
+	// Native expansion must preserve old layers. Guest data initializes only a wholly new image.
+	const bool stencil_contents_available = native_depth_source != nullptr
+	                                            ? native_depth_source->stencil_initialized
+	                                            : coherent_guest_stencil;
+	if (!CanLoadStencilAttachment(info, stencil_contents_available)) {
+		EXIT("TextureCache: new stencil target requires a clear before stencil access, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     info.stencil_address, info.stencil_size);
 	}
 	auto cached                 = std::make_shared<CachedImage>();
 	cached->kind                = CachedImage::Kind::DepthTarget;
@@ -2602,7 +2694,8 @@ TextureCache::RegisterVideoOutSurfaces(GraphicContext*                  ctx,
 	}
 	for (size_t i = 0; i < infos.size(); i++) {
 		for (size_t j = i + 1; j < infos.size(); j++) {
-			if (PageOverlaps(infos[i].address, infos[i].size, infos[j].address, infos[j].size)) {
+			if (ImagePageRangesOverlap(infos[i].address, infos[i].size, infos[j].address,
+			                           infos[j].size)) {
 				EXIT("TextureCache: video-out surfaces share pages, first=%zu second=%zu\n", i, j);
 			}
 		}
@@ -3074,8 +3167,11 @@ void TextureCache::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
 	bool                 found            = false;
 	for (const auto& cached: m_images) {
 		for (uint32_t range = 0; range < cached->RangeCount(); range++) {
+			// CPU-current depth targets use the same tracked guest refresh path as sampled and
+			// color images. GPU-owned targets and metadata aliases remain unsupported below.
 			const bool host_refreshable = (cached->kind == CachedImage::Kind::Texture ||
-			                               cached->kind == CachedImage::Kind::RenderTarget) &&
+			                               cached->kind == CachedImage::Kind::RenderTarget ||
+			                               cached->kind == CachedImage::Kind::DepthTarget) &&
 			                              !cached->buffer_modified;
 			switch (ClassifyHostWriteOverlap(vaddr, size, cached->Address(range),
 			                                 cached->Size(range), host_refreshable,
@@ -3104,52 +3200,58 @@ void TextureCache::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
 	MarkSampledAliasesCpuDirtyLocked(vaddr, size);
 }
 
-void TextureCache::SynchronizeRenderTargetToBufferLocked(CachedImage& cached) {
-	const auto& target = cached.target;
-	const bool  linear = target.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-	const bool  tiled =
-	    target.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
-	const auto    rows = static_cast<uint64_t>(target.height - 1);
+void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached) {
+	const bool       render_target = cached.kind == CachedImage::Kind::RenderTarget;
+	const bool       video_out     = cached.kind == CachedImage::Kind::VideoOut;
+	RenderTargetInfo target        = cached.target;
+	if (video_out) {
+		const auto& info         = cached.video_out;
+		target.address           = info.address;
+		target.size              = info.size;
+		target.format            = info.format;
+		target.width             = info.width;
+		target.height            = info.height;
+		target.pitch             = info.pitch;
+		target.bytes_per_element = info.bytes_per_element;
+		target.tile_mode         = info.tile_mode;
+	}
+	const bool    linear = target.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
+	const bool    tiled  = IsTiledRenderTarget(target);
 	TileSizeAlign exact {};
-	const bool    single_slice = TileGetRenderTargetSize(target.width, target.height, target.pitch,
-	                                                     target.bytes_per_element, &exact);
-	const bool    layered_size = target.layers != 0 && single_slice &&
-	                             exact.size <= UINT64_MAX / target.layers &&
-	                             exact.size * target.layers == target.size;
-	const bool    exact_tiled  = tiled && exact.align == 65536 && layered_size;
-	const bool    valid_cache  = cached.kind == CachedImage::Kind::RenderTarget &&
-	                             cached.gpu_modified && !cached.buffer_modified &&
-	                             cached.ctx != nullptr && cached.image != nullptr;
-	const bool    valid_target =
-	    target.address != 0 && target.size != 0 && target.width != 0 && target.height != 0 &&
-	    target.pitch >= target.width && target.bytes_per_element != 0 && target.layers != 0 &&
-	    target.size % target.layers == 0 && target.size <= UINT32_MAX && target.levels == 1 &&
-	    rows <= (UINT64_MAX - target.width) / target.pitch;
-	const bool valid_image = cached.image != nullptr && cached.image->layers == target.layers;
-	if (!valid_cache || !valid_target || (!linear && !exact_tiled) || !valid_image) {
-		EXIT("TextureCache: unsupported render-target buffer synchronization, "
+	bool          single_slice = false;
+	if (IsSupportedStandard64RenderTarget(target)) {
+		exact        = {static_cast<uint32_t>(target.size), 65536};
+		single_slice = true;
+	} else {
+		single_slice = TileGetRenderTargetSize(target.width, target.height, target.pitch,
+		                                       target.bytes_per_element, &exact);
+	}
+	const bool layered_size =
+	    single_slice && static_cast<uint64_t>(exact.size) * target.layers == target.size;
+	const bool exact_tiled = tiled && exact.align == 65536 && layered_size;
+	const bool valid_kind  = render_target || (video_out && cached.video_out.compression ==
+	                                                            VideoOutCompression::Uncompressed);
+	if (!valid_kind || !cached.gpu_modified || cached.buffer_modified || target.levels != 1 ||
+	    target.size > UINT32_MAX || (!linear && !exact_tiled) ||
+	    HasMetaOverlapLocked(target.address, target.size)) {
+		EXIT("TextureCache: unsupported color-image buffer synchronization, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " extent=%ux%u pitch=%u bpe=%u levels=%u layers=%u/%u tile=%u"
-		     " gpu_modified=%d buffer_modified=%d\n",
+		     " extent=%ux%u pitch=%u bpe=%u levels=%u layers=%u tile=%u"
+		     " kind=%u compression=%u gpu_modified=%d buffer_modified=%d\n",
 		     target.address, target.size, target.width, target.height, target.pitch,
-		     target.bytes_per_element, target.levels, target.layers,
-		     cached.image == nullptr ? 0 : cached.image->layers, target.tile_mode,
+		     target.bytes_per_element, target.levels, target.layers, target.tile_mode,
+		     static_cast<uint32_t>(cached.kind),
+		     video_out ? static_cast<uint32_t>(cached.video_out.compression) : 0,
 		     cached.gpu_modified, cached.buffer_modified);
 	}
-	const auto linear_elements = rows * target.pitch + target.width;
-	if (linear_elements > UINT64_MAX / target.bytes_per_element) {
-		EXIT("TextureCache: render-target buffer synchronization size overflow\n");
-	}
-	const auto linear_size = linear_elements * target.bytes_per_element;
-	const auto slice_size  = target.size / target.layers;
-	if (linear_size > slice_size || cached.image->format != target.format ||
-	    cached.image->extent.width != target.width ||
+	const auto slice_size = target.size / target.layers;
+	if (cached.image->format != target.format || cached.image->extent.width != target.width ||
 	    cached.image->extent.height != target.height ||
 	    (tiled && !IsSupportedRenderTargetElementSize(target.bytes_per_element)) ||
 	    HasMetaOverlapLocked(target.address, target.size)) {
-		EXIT("TextureCache: render-target buffer synchronization storage mismatch, "
+		EXIT("TextureCache: color-image buffer synchronization storage mismatch, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " linear=0x%016" PRIx64 "\n",
-		     target.address, target.size, linear_size);
+		     target.address, target.size);
 	}
 
 	// This is the CPU Tiler backend for the image-to-buffer synchronization seam.
@@ -3174,9 +3276,6 @@ void TextureCache::SynchronizeRenderTargetToBufferLocked(CachedImage& cached) {
 	}
 	m_memory_tracker.ForEachDownloadRange<true>(target.address, target.size,
 	                                            [](uint64_t, uint64_t) noexcept {});
-	if (m_memory_tracker.IsRegionGpuModified(target.address, target.size)) {
-		EXIT("TextureCache: render-target buffer synchronization retained GPU ownership\n");
-	}
 	m_buffer_cache.PublishImageBacking(target.address, target.size);
 	cached.gpu_modified    = false;
 	cached.buffer_modified = true;
@@ -3237,7 +3336,10 @@ bool TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
 		case BufferImageWrite::InvalidateTexture:
 		case BufferImageWrite::InvalidateVideoOut: cached.buffer_modified = true; return true;
 		case BufferImageWrite::SynchronizeRenderTarget:
-			SynchronizeRenderTargetToBufferLocked(cached);
+			SynchronizeColorImageToBufferLocked(cached);
+			return true;
+		case BufferImageWrite::SynchronizeVideoOut:
+			SynchronizeColorImageToBufferLocked(cached);
 			return true;
 		case BufferImageWrite::None:
 		case BufferImageWrite::Unsupported:
@@ -3291,7 +3393,7 @@ RenderTextureVulkanImage* TextureCache::FindRenderTargetByRange(CommandBuffer* c
 	std::shared_ptr<CachedImage> found;
 	for (auto& cached: m_images) {
 		if (cached->kind != CachedImage::Kind::RenderTarget ||
-		    !Overlaps(vaddr, size, cached->Address(), cached->Size())) {
+		    !ImageRangeOverlaps(vaddr, size, cached->Address(), cached->Size())) {
 			continue;
 		}
 		const auto slice_size =
@@ -3421,7 +3523,8 @@ void TextureCache::RegisterMeta(uint64_t vaddr, uint64_t size, uint32_t layers) 
 		range_size -= existing->second.size;
 	}
 	for (const auto& [address, meta]: m_surface_metas) {
-		if (address != vaddr && PageOverlaps(range_vaddr, range_size, address, meta.size)) {
+		if (address != vaddr &&
+		    ImagePageRangesOverlap(range_vaddr, range_size, address, meta.size)) {
 			LOGF("TextureCache: registering overlapping metadata views, requested=0x%016" PRIx64
 			     "+0x%016" PRIx64 " existing=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
 			     range_vaddr, range_size, address, meta.size);
@@ -3493,7 +3596,7 @@ bool TextureCache::HasMetaRangeOverlap(uint64_t vaddr, uint64_t size) {
 	}
 	FaultSafeTextureLock lock(this, m_lock);
 	return std::any_of(m_surface_metas.begin(), m_surface_metas.end(), [&](const auto& entry) {
-		return Overlaps(vaddr, size, entry.first, entry.second.size);
+		return ImageRangeOverlaps(vaddr, size, entry.first, entry.second.size);
 	});
 }
 
@@ -3506,7 +3609,7 @@ bool TextureCache::HasMetaOverlap(uint64_t vaddr, uint64_t size) {
 	}
 	FaultSafeTextureLock lock(this, m_lock);
 	for (const auto& [address, meta]: m_surface_metas) {
-		if (PageOverlaps(vaddr, size, address, meta.size)) {
+		if (ImagePageRangesOverlap(vaddr, size, address, meta.size)) {
 			return true;
 		}
 	}
@@ -3522,7 +3625,7 @@ bool TextureCache::IsMetaGpuModified(uint64_t vaddr, uint64_t size) {
 	}
 	FaultSafeTextureLock lock(this, m_lock);
 	for (const auto& [address, meta]: m_surface_metas) {
-		if (Overlaps(vaddr, size, address, meta.size) &&
+		if (ImageRangeOverlaps(vaddr, size, address, meta.size) &&
 		    m_metadata_tracker.IsRegionGpuModified(vaddr, size)) {
 			return true;
 		}
@@ -3532,7 +3635,7 @@ bool TextureCache::IsMetaGpuModified(uint64_t vaddr, uint64_t size) {
 
 bool TextureCache::HasMetaOverlapLocked(uint64_t vaddr, uint64_t size) const {
 	for (const auto& [address, meta]: m_surface_metas) {
-		if (PageOverlaps(vaddr, size, address, meta.size)) {
+		if (ImagePageRangesOverlap(vaddr, size, address, meta.size)) {
 			return true;
 		}
 	}
@@ -3700,7 +3803,7 @@ void TextureCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	FaultSafeTextureLock lock(this, m_lock);
 	const auto           end = vaddr + size;
 	for (const auto& [address, meta]: m_surface_metas) {
-		if (PageOverlaps(vaddr, size, address, meta.size) &&
+		if (ImagePageRangesOverlap(vaddr, size, address, meta.size) &&
 		    (vaddr > address || end < address + meta.size)) {
 			EXIT("TextureCache: partial metadata unmap is unsupported, unmap=0x%016" PRIx64
 			     "+0x%016" PRIx64 " metadata=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
@@ -3709,7 +3812,7 @@ void TextureCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	}
 	for (const auto& cached: m_images) {
 		for (uint32_t i = 0; i < cached->RangeCount(); i++) {
-			if (PageOverlaps(vaddr, size, cached->Address(i), cached->Size(i)) &&
+			if (ImagePageRangesOverlap(vaddr, size, cached->Address(i), cached->Size(i)) &&
 			    (vaddr > cached->Address(i) || end < cached->Address(i) + cached->Size(i))) {
 				EXIT("TextureCache: partial image unmap is unsupported, unmap=0x%016" PRIx64
 				     "+0x%016" PRIx64 " image=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
@@ -3763,7 +3866,7 @@ void TextureCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	std::vector<ImageRetirementRange> metadata_ranges;
 	metadata_ranges.reserve(m_surface_metas.size());
 	for (const auto& [address, meta]: m_surface_metas) {
-		const bool retiring = Overlaps(vaddr, size, address, meta.size) ||
+		const bool retiring = ImageRangeOverlaps(vaddr, size, address, meta.size) ||
 		                      std::find(retire_depth_metadata.begin(), retire_depth_metadata.end(),
 		                                address) != retire_depth_metadata.end();
 		metadata_ranges.push_back({address, meta.size, retiring});
@@ -3808,7 +3911,8 @@ void TextureCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	for (auto it = m_surface_metas.begin(); it != m_surface_metas.end();) {
-		const bool allocation_unmapped = Overlaps(vaddr, size, it->first, it->second.size);
+		const bool allocation_unmapped =
+		    ImageRangeOverlaps(vaddr, size, it->first, it->second.size);
 		const bool depth_owner_retired =
 		    std::find(retire_depth_metadata.begin(), retire_depth_metadata.end(), it->first) !=
 		    retire_depth_metadata.end();

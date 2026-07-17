@@ -1,3 +1,5 @@
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
@@ -10,10 +12,10 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/objects/textureCommon.h"
 #include "graphics/host_gpu/renderer/descriptorCache.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/renderState.h"
 #include "graphics/host_gpu/utils.h"
 #include "graphics/presentation/displayBuffer.h"
 
@@ -285,7 +287,8 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 		mask = 0x0f;
 	}
 
-	r->target_slot = rt_slot;
+	r->target_slot    = rt_slot;
+	r->export_mapping = {};
 
 	if (rt.base.addr == 0 || mask == 0) {
 		if (graphics_debug_dump_enabled()) {
@@ -372,9 +375,12 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	uint32_t pitch  = 0;
 	uint64_t size   = 0;
 	bool     tile   = false;
+	const bool standard64 =
+	    rt.attrib3.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB);
 
 	switch (rt.attrib3.tile_mode) {
 		case Prospero::GpuEnumValue(Prospero::TileMode::kLinear):
+		case Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB):
 		case Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget):
 			tile = !RenderIsColorTileModeLinear(rt.attrib3.tile_mode);
 			break;
@@ -390,10 +396,32 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 	if (bytes_per_element == 0) {
 		EXIT("render-target format has no valid element size\n");
 	}
+	if (standard64 &&
+	    (rt.attrib3.dimension != 1 || rt.attrib3.depth != 0 || levels != 1 ||
+	     rt.view.current_mip_level != 0 ||
+	     view.base_layer != 0 || view.image_layers != 1 || rt.attrib.num_samples != 0 ||
+	     rt.attrib.num_fragments != 0 || bytes_per_element != 4 ||
+	     rt.pitch.pitch_div8_minus1 != 0 || (rt.base.addr & 0xffffu) != 0 ||
+	     rt.info.fmask_compression_enable || rt.info.fmask_data_compression_disable ||
+	     rt.info.fmask_one_frag_mode || rt.info.cmask_fast_clear_enable ||
+	     rt.info.dcc_compression_enable || rt.info.cmask_is_linear != 0 ||
+	     rt.info.cmask_addr_type != 0 || rt.info.alt_tile_mode || rt.cmask.addr != 0 ||
+	     rt.fmask.addr != 0 || rt.dcc_addr.addr != 0 || rt.dcc.data_write_on_dcc_clear_to_reg)) {
+		EXIT("unsupported Standard64KB render target: addr=0x%016" PRIx64
+		     " dimension=%u depth=%u levels=%u layer=%u/%u samples=%u fragments=%u bpe=%u"
+		     " cmask=0x%016" PRIx64 " fmask=0x%016" PRIx64 " dcc=0x%016" PRIx64 "\n",
+		     rt.base.addr, rt.attrib3.dimension, rt.attrib3.depth, levels, view.base_layer,
+		     view.image_layers,
+		     rt.attrib.num_samples, rt.attrib.num_fragments, bytes_per_element, rt.cmask.addr,
+		     rt.fmask.addr, rt.dcc_addr.addr);
+	}
 	if (rt.pitch.pitch_div8_minus1 != 0) {
 		pitch = (rt.pitch.pitch_div8_minus1 + 1u) << 3u;
 	} else if (tile) {
-		pitch = TileGetRenderTargetPitch(width, bytes_per_element);
+		pitch = standard64
+		            ? TileGetTexturePitch(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float),
+		                                  width, levels, rt.attrib3.tile_mode)
+		            : TileGetRenderTargetPitch(width, bytes_per_element);
 		if (pitch == 0) {
 			EXIT("unsupported render-target pitch: width=%u bytes=%u\n", width, bytes_per_element);
 		}
@@ -403,10 +431,18 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 
 	if (tile) {
 		TileSizeAlign layout {};
-		const bool    valid_layout =
-		    levels == 1 ? TileGetRenderTargetSize(width, height, pitch, bytes_per_element, &layout)
-		                : TileGetRenderTargetMipLayout(width, height, pitch, bytes_per_element,
-		                                               levels, &layout, nullptr, nullptr);
+		bool          valid_layout = false;
+		if (standard64) {
+			TileGetTextureSize(Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), width,
+			                   height, pitch, levels, rt.attrib3.tile_mode, &layout, nullptr, nullptr);
+			valid_layout = layout.size != 0 && layout.align == 65536;
+		} else {
+			valid_layout =
+			    levels == 1
+			        ? TileGetRenderTargetSize(width, height, pitch, bytes_per_element, &layout)
+			        : TileGetRenderTargetMipLayout(width, height, pitch, bytes_per_element, levels,
+			                                       &layout, nullptr, nullptr);
+		}
 		if (!valid_layout) {
 			EXIT("unsupported render-target layout: %ux%u pitch=%u bytes=%u levels=%u\n", width,
 			     height, pitch, bytes_per_element, levels);
@@ -429,7 +465,14 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 		EXIT("render-target backing range is invalid\n");
 	}
 
-	auto video_image       = Presentation::DisplayBufferFind(rt.base.addr, true);
+	auto video_image = Presentation::DisplayBufferFind(rt.base.addr, true);
+	if (video_image.image != nullptr &&
+	    !IsSupportedDisplayRenderTargetTileMode(rt.attrib3.tile_mode)) {
+		EXIT("unsupported display render-target tile mode: tile=%u expected=%u addr=0x%010" PRIx64
+		     " backing_size=0x%016" PRIx64 " video_size=0x%016" PRIx64 "\n",
+		     rt.attrib3.tile_mode, Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget),
+		     rt.base.addr, backing_size, video_image.size);
+	}
 	bool render_to_texture = view.base_layer != 0 || video_image.image == nullptr;
 	if (!render_to_texture && (levels != 1 || rt.view.current_mip_level != 0)) {
 		EXIT("mipmapped display render targets are unsupported\n");
@@ -479,6 +522,7 @@ void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer* buffer, const H
 		r->extent         = view_extent;
 		r->base_mip_level = rt.view.current_mip_level;
 		r->buffer_size    = backing_size;
+		r->export_mapping = rt_format.export_mapping;
 	} else {
 		const auto layout = static_cast<Prospero::ChannelLayout>(rt.info.format);
 		const auto type   = static_cast<Prospero::ChannelType>(rt.info.channel_type);
