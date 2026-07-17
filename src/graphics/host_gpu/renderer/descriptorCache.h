@@ -9,6 +9,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <map>
+#include <span>
 #include <unordered_map>
 #include <vector>
 #include <vulkan/vulkan_core.h>
@@ -110,8 +111,9 @@ const char*        storage_usage_name(ShaderStorageUsage usage);
 VkImageAspectFlags DepthStencilAspectMask(VkFormat format);
 std::vector<ShaderAddressWriteRange>
 BindDescriptors(uint64_t submit_id, CommandBuffer* buffer, VkPipelineBindPoint pipeline_bind_point,
-                VkPipelineLayout layout, const ShaderStageRuntime& runtime,
-                VkShaderStageFlags vk_stage, DescriptorCache::Stage stage);
+                VkPipelineLayout layout, std::span<const VkPushConstantRange> push_constant_ranges,
+                const ShaderStageRuntime& runtime, VkShaderStageFlags vk_stage,
+                DescriptorCache::Stage stage);
 
 } // namespace Libs::Graphics
 

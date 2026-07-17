@@ -33,8 +33,9 @@ public:
 	KYTY_CLASS_NO_COPY(PipelineCache);
 
 	struct Pipeline {
-		VkPipelineLayout pipeline_layout = nullptr;
-		VkPipeline       pipeline        = nullptr;
+		VkPipelineLayout                   pipeline_layout = nullptr;
+		VkPipeline                         pipeline        = nullptr;
+		std::vector<VkPushConstantRange>   push_constant_ranges;
 	};
 
 	struct GraphicsPipeline: Pipeline {

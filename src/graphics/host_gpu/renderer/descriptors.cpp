@@ -35,6 +35,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <span>
 #include <vulkan/vk_enum_string_helper.h>
 
 #ifdef min
@@ -622,10 +623,30 @@ static BufferView NativeUpload(CommandBuffer* command_buffer, std::span<const ui
 	return result;
 }
 
+static bool PushConstantRangesOverlap(uint32_t a_offset, uint32_t a_size, uint32_t b_offset,
+                                      uint32_t b_size) {
+	const auto a_end = static_cast<uint64_t>(a_offset) + a_size;
+	const auto b_end = static_cast<uint64_t>(b_offset) + b_size;
+	return a_offset < b_end && b_offset < a_end;
+}
+
+static VkShaderStageFlags ResolvePushConstantStageFlags(
+    std::span<const VkPushConstantRange> ranges, uint32_t offset, uint32_t size,
+    VkShaderStageFlags fallback) {
+	VkShaderStageFlags stage_flags = 0;
+	for (const auto& range: ranges) {
+		if (PushConstantRangesOverlap(range.offset, range.size, offset, size)) {
+			stage_flags |= range.stageFlags;
+		}
+	}
+	return stage_flags != 0 ? stage_flags : fallback;
+}
+
 std::vector<ShaderAddressWriteRange>
 BindDescriptors(uint64_t submit_id, CommandBuffer* buffer, VkPipelineBindPoint pipeline_bind_point,
-                VkPipelineLayout layout, const ShaderStageRuntime& runtime,
-                VkShaderStageFlags vk_stage, DescriptorCache::Stage stage) {
+                VkPipelineLayout layout, std::span<const VkPushConstantRange> push_constant_ranges,
+                const ShaderStageRuntime& runtime, VkShaderStageFlags vk_stage,
+                DescriptorCache::Stage stage) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer == nullptr || !runtime);
 	const auto& program  = *runtime.program;
@@ -735,7 +756,10 @@ BindDescriptors(uint64_t submit_id, CommandBuffer* buffer, VkPipelineBindPoint p
 	}
 	if (program.bindings.push_constant_size != 0) {
 		EXIT_IF(program.bindings.push_constant_size != user_data.size() * sizeof(uint32_t));
-		vkCmdPushConstants(vk_buffer, layout, vk_stage, program.bindings.push_constant_offset,
+		const auto push_stages = ResolvePushConstantStageFlags(
+		    push_constant_ranges, program.bindings.push_constant_offset,
+		    program.bindings.push_constant_size, vk_stage);
+		vkCmdPushConstants(vk_buffer, layout, push_stages, program.bindings.push_constant_offset,
 		                   program.bindings.push_constant_size, user_data.data());
 	}
 	return address_writes;

@@ -959,7 +959,8 @@ static void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer* buffer, HW::C
 		}
 		const auto vs_address_writes = BindDescriptors(
 		    submit_id, buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline_layout,
-		    state->vs_input_info.stage, VK_SHADER_STAGE_VERTEX_BIT, DescriptorCache::Stage::Vertex);
+		    pipeline->push_constant_ranges, state->vs_input_info.stage, VK_SHADER_STAGE_VERTEX_BIT,
+		    DescriptorCache::Stage::Vertex);
 
 		std::vector<ShaderAddressWriteRange> ps_address_writes;
 		if (state->ps_active) {
@@ -969,8 +970,9 @@ static void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer* buffer, HW::C
 			}
 			ps_address_writes =
 			    BindDescriptors(submit_id, buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-			                    pipeline->pipeline_layout, state->ps_input_info.stage,
-			                    VK_SHADER_STAGE_FRAGMENT_BIT, DescriptorCache::Stage::Pixel);
+			                    pipeline->pipeline_layout, pipeline->push_constant_ranges,
+			                    state->ps_input_info.stage, VK_SHADER_STAGE_FRAGMENT_BIT,
+			                    DescriptorCache::Stage::Pixel);
 		}
 		if (buffer->GetRecordingGeneration() != recording_generation) {
 			continue;

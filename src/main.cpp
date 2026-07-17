@@ -7,6 +7,7 @@
 #include "common/platform/sysDbg.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/vulkanLayerWorkaround.h"
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
@@ -233,6 +234,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 int main(int argc, char* argv[]) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Common::DisableMedalVulkanLayer();
+#endif
+
 	auto& slist = *SubsystemsList::Instance();
 
 	slist.SetArgs(argc, argv);

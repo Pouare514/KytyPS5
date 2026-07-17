@@ -555,7 +555,8 @@ void RenderDispatchDirect(uint64_t submit_id, CommandBuffer* buffer, HW::Context
 
 		const auto address_writes = BindDescriptors(
 		    submit_id, buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline_layout,
-		    input_info.stage, VK_SHADER_STAGE_COMPUTE_BIT, DescriptorCache::Stage::Compute);
+		    pipeline->push_constant_ranges, input_info.stage, VK_SHADER_STAGE_COMPUTE_BIT,
+		    DescriptorCache::Stage::Compute);
 		if (buffer->GetRecordingGeneration() != recording_generation) {
 			continue;
 		}

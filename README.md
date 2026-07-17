@@ -166,10 +166,14 @@ debugging options.
 #### Crash at startup with `loader_get_json: Failed to open JSON file ... medal-vulkan64.json`
 
 This happens when a third-party Vulkan layer (commonly [Medal](https://medal.tv/)) is registered in
-Windows but its manifest JSON file is missing, often after an update or partial uninstall. With
-Vulkan validation layers enabled, the loader reports this as a general error.
+Windows but its manifest JSON file is missing, often after an update or partial uninstall. Orphaned
+registry entries can remain even after Medal is removed.
 
-**Option A — Disable Vulkan validation** (fastest):
+**Automatic fix (kyty_emulator):** the emulator sets `VK_LOADER_LAYERS_DISABLE` to include
+`VK_LAYER_MEDAL_capture` and `VK_LAYER_MEDAL_HOOK` at startup. Medal stays enabled for other
+applications; only this process skips the broken layers.
+
+**Option A — Disable Vulkan validation** (fastest if issues persist):
 
 In the launcher, uncheck **Enable Vulkan validation layers**, or run:
 
@@ -181,14 +185,15 @@ In the launcher, uncheck **Enable Vulkan validation layers**, or run:
 
 Reinstall or update Medal, disable Vulkan capture in Medal settings, or uninstall Medal if unused.
 
-**Option C — Disable the Medal layer via environment variable**:
-
-Check the startup log for the exact layer name (`Vulkan available layer: ...`), then:
+**Option C — Manual layer disable** (only if automatic disable is insufficient):
 
 ```powershell
-$env:VK_LOADER_LAYERS_DISABLE = "VK_LAYER_MEDAL_capture"
+$env:VK_LOADER_LAYERS_DISABLE = "VK_LAYER_MEDAL_capture,VK_LAYER_MEDAL_HOOK"
 .\build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
 ```
+
+**Registry cleanup:** if Medal errors still appear, remove stale keys under
+`HKCU\Software\Khronos\Vulkan\ImplicitLayers` that point to `%LocalAppData%\Medal\`.
 
 Recent builds log general loader errors without exiting, but disabling the broken layer or
 validation avoids the noise entirely.

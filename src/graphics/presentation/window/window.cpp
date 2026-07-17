@@ -897,13 +897,15 @@ void GameProcessEvent(WindowGame* game, double time_s) {
 }
 
 void GameMainLoop(WindowGame* game, void* data) {
-	bool need_exit = false;
+	bool need_exit   = false;
+	bool init_failed = false;
 
 	Common::Timer timer;
 	timer.Start();
 
 	if (!GameInit(game, timer, data)) {
-		need_exit = true;
+		need_exit   = true;
+		init_failed = true;
 	}
 
 	for (;;) {
@@ -946,6 +948,16 @@ void GameMainLoop(WindowGame* game, void* data) {
 			if (!need_exit) {
 				GameShowWindow(game, timer);
 			}
+		}
+	}
+
+	if (need_exit) {
+		if (init_failed) {
+			LOGF("GameMainLoop: exit during init\n");
+		} else if (game->m_game_need_exit) {
+			LOGF("GameMainLoop: exit requested (window/guest)\n");
+		} else {
+			LOGF("GameMainLoop: exit requested (render/update failure)\n");
 		}
 	}
 

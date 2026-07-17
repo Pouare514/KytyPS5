@@ -129,9 +129,16 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 
 	connect(&m_process,
 	        static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
-	        [this](int /*exitCode*/, QProcess::ExitStatus /*exitStatus*/) {
+	        [this](int exitCode, QProcess::ExitStatus exitStatus) {
 		        if (m_running_item != nullptr) {
 			        m_running_item->SetRunning(false);
+		        }
+		        if (exitCode != 0 && m_main_dialog != nullptr) {
+			        const auto status =
+			            exitStatus == QProcess::CrashExit ? tr("crash") : tr("error");
+			        QMessageBox::warning(
+			            m_main_dialog, tr("Emulator exited"),
+			            tr("kyty_emulator exited with code %1 (%2).").arg(exitCode).arg(status));
 		        }
 		        Update();
 	        });

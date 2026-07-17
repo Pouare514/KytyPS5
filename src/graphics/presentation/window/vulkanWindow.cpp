@@ -700,10 +700,8 @@ static VkDevice VulkanCreateDevice(VkPhysicalDevice physical_device, VkSurfaceKH
 	create_info.flags                = 0;
 	create_info.pQueueCreateInfos    = queue_create_info.data();
 	create_info.queueCreateInfoCount = queue_create_info_num;
-	create_info.enabledLayerCount =
-	    (r->enable_validation_layers ? static_cast<uint32_t>(r->required_layers.size()) : 0);
-	create_info.ppEnabledLayerNames =
-	    (r->enable_validation_layers ? r->required_layers.data() : nullptr);
+	create_info.enabledLayerCount   = 0;
+	create_info.ppEnabledLayerNames = nullptr;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;

@@ -390,6 +390,40 @@ static VkBlendOp GetBlendOp(uint32_t op) {
 	return VK_BLEND_OP_ADD;
 }
 
+static bool PushConstantRangesOverlap(uint32_t a_offset, uint32_t a_size, uint32_t b_offset,
+                                      uint32_t b_size) {
+	const auto a_end = static_cast<uint64_t>(a_offset) + a_size;
+	const auto b_end = static_cast<uint64_t>(b_offset) + b_size;
+	return a_offset < b_end && b_offset < a_end;
+}
+
+static void AddOrMergePushConstantRange(VkPushConstantRange* ranges, uint32_t* count,
+                                        VkShaderStageFlags stage, uint32_t offset, uint32_t size) {
+	EXIT_IF(ranges == nullptr);
+	EXIT_IF(count == nullptr);
+
+	for (uint32_t i = 0; i < *count; i++) {
+		if (!PushConstantRangesOverlap(ranges[i].offset, ranges[i].size, offset, size)) {
+			continue;
+		}
+
+		const uint32_t merged_offset =
+		    std::min(ranges[i].offset, offset);
+		const uint32_t merged_end = static_cast<uint32_t>(std::max(
+		    static_cast<uint64_t>(ranges[i].offset) + ranges[i].size,
+		    static_cast<uint64_t>(offset) + size));
+		ranges[i].stageFlags |= stage;
+		ranges[i].offset = merged_offset;
+		ranges[i].size   = merged_end - merged_offset;
+		return;
+	}
+
+	ranges[*count].stageFlags = stage;
+	ranges[*count].offset     = offset;
+	ranges[*count].size       = size;
+	(*count)++;
+}
+
 static void CreateLayout(VkDescriptorSetLayout* set_layouts, uint32_t* set_layouts_num,
                          VkPushConstantRange* push_constant_info, uint32_t* push_constant_info_num,
                          const ShaderRecompiler::IR::Program& program, VkShaderStageFlags vk_stage,
@@ -403,12 +437,8 @@ static void CreateLayout(VkDescriptorSetLayout* set_layouts, uint32_t* set_layou
 	const bool  need_descriptor = !bindings.descriptors.empty();
 
 	if (bindings.push_constant_size != 0) {
-		auto index = *push_constant_info_num;
-
-		push_constant_info[index].stageFlags = vk_stage;
-		push_constant_info[index].offset     = bindings.push_constant_offset;
-		push_constant_info[index].size       = bindings.push_constant_size;
-		(*push_constant_info_num)++;
+		AddOrMergePushConstantRange(push_constant_info, push_constant_info_num, vk_stage,
+		                            bindings.push_constant_offset, bindings.push_constant_size);
 	}
 
 	if (need_descriptor) {
@@ -862,6 +892,9 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, VkRenderP
 
 	EXIT_NOT_IMPLEMENTED(pipeline->pipeline_layout == nullptr);
 
+	pipeline->push_constant_ranges.assign(push_constant_info,
+	                                      push_constant_info + push_constant_info_num);
+
 	VkPipelineDepthStencilStateCreateInfo depth_stencil_info {};
 	depth_stencil_info.sType           = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
 	depth_stencil_info.pNext           = nullptr;
@@ -1026,6 +1059,9 @@ void CreatePipelineInternal(PipelineCache::ComputePipeline* pipeline,
 	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
 
 	EXIT_NOT_IMPLEMENTED(pipeline->pipeline_layout == nullptr);
+
+	pipeline->push_constant_ranges.assign(push_constant_info,
+	                                      push_constant_info + push_constant_info_num);
 
 	VkComputePipelineCreateInfo info {};
 	info.sType              = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
