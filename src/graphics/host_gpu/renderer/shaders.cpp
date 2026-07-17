@@ -925,15 +925,28 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, VkRenderP
 	    VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
 	    VK_DYNAMIC_STATE_COLOR_WRITE_ENABLE_EXT,
 	};
-	const auto dynamic_states_count =
-	    static_cast<uint32_t>(sizeof(dynamic_states) / sizeof(dynamic_states[0]));
+	const VkDynamicState depth_only_dynamic_states[] = {
+	    VK_DYNAMIC_STATE_VIEWPORT,
+	    VK_DYNAMIC_STATE_SCISSOR,
+	    VK_DYNAMIC_STATE_LINE_WIDTH,
+	    VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+	    VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+	    VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+	};
+	const auto* dynamic_states_ptr =
+	    static_params.color_count > 0 ? dynamic_states : depth_only_dynamic_states;
+	const auto dynamic_states_count = static_params.color_count > 0
+	                                      ? static_cast<uint32_t>(sizeof(dynamic_states) /
+	                                                              sizeof(dynamic_states[0]))
+	                                      : static_cast<uint32_t>(sizeof(depth_only_dynamic_states) /
+	                                                              sizeof(depth_only_dynamic_states[0]));
 
 	VkPipelineDynamicStateCreateInfo dynamic_state {};
 	dynamic_state.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
 	dynamic_state.pNext             = nullptr;
 	dynamic_state.flags             = 0;
 	dynamic_state.dynamicStateCount = dynamic_states_count;
-	dynamic_state.pDynamicStates    = dynamic_states;
+	dynamic_state.pDynamicStates    = dynamic_states_ptr;
 
 	VkGraphicsPipelineCreateInfo pipeline_info {};
 	pipeline_info.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;

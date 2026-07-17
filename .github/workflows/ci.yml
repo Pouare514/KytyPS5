@@ -85,3 +85,52 @@ jobs:
         env:
           VULKAN_SDK: ${{ env.VULKAN_SDK }}
         run: ctest --output-on-failure --parallel
+
+      - name: RDNA2 ISA coverage report
+        run: |
+          python tools/generate_rdna2_tables.py
+          python tools/check_coverage.py
+
+      - name: Build shader recompiler tests
+        env:
+          VULKAN_SDK: ${{ env.VULKAN_SDK }}
+        run: |
+          cmake --build build/ci --target shader_cfg_tests shader_recompiler_compute_tests --parallel
+
+      - name: Run shader_cfg_tests
+        working-directory: build/ci
+        env:
+          VULKAN_SDK: ${{ env.VULKAN_SDK }}
+        run: ctest -R shader_cfg_tests --output-on-failure
+
+      - name: Run shader_recompiler_compute_tests
+        working-directory: build/ci
+        env:
+          VULKAN_SDK: ${{ env.VULKAN_SDK }}
+        run: ctest -R shader_recompiler_compute_tests --output-on-failure
+
+  gpu-shader-tests:
+    runs-on: windows-latest
+    continue-on-error: true
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: ${{ env.VULKAN_SDK_VERSION }}
+          cache: true
+
+      - name: Build and run GPU shader tests
+        env:
+          VULKAN_SDK: ${{ env.VULKAN_SDK }}
+        run: |
+          scripts\build-windows.cmd
+          cd build\windows
+          ctest -R shader_recompiler_compute_tests --output-on-failure

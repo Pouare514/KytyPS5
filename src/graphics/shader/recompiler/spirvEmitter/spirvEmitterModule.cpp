@@ -516,6 +516,9 @@ void EmitHeaderAndTypes(EmitterState* state) {
 		state->builder.AddCapability({CapabilityComputeDerivativeGroupQuadsKHR});
 		state->builder.AddExtension("SPV_KHR_compute_shader_derivatives");
 	}
+	if (state->uses_shader_atomic_float) {
+		state->builder.AddExtension("SPV_EXT_shader_atomic_float");
+	}
 	state->builder.AddExtInstImport(state->glsl_std450, "GLSL.std.450");
 	state->builder.AddMemoryModel({AddressingModelLogical, MemoryModelGLSL450});
 	state->builder.AddEntryPoint(ExecutionModelForStage(state->stage), state->main_func, "main",
@@ -745,7 +748,8 @@ void EmitHeaderAndTypes(EmitterState* state) {
 		const auto component = i >= 3u ? state->uint_type : state->float_type;
 		const auto dimension = view == ImageViewKind::Dim3D ? Dim3D : Dim2D;
 		const auto arrayed   = view == ImageViewKind::Dim2DArray ? 1u : 0u;
-		state->builder.AddType({OpTypeImage, image.image_type, component, dimension, 0, arrayed, 0,
+		const auto ms        = image.multisampled ? 1u : 0u;
+		state->builder.AddType({OpTypeImage, image.image_type, component, dimension, 0, arrayed, ms,
 		                        1, ImageFormatUnknown});
 		state->builder.AddType({OpTypeSampledImage, image.sampled_image_type, image.image_type});
 		state->builder.AddType(

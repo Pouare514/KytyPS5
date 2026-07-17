@@ -533,6 +533,9 @@ enum class Opcode {
 	STtraceData,
 	SInstPrefetch,
 	SEndpgm,
+#define RDNA2_EXTRA_OPCODE(name) name,
+#include "graphics/shader/recompiler/generated/Rdna2ExtraOpcodes.inc"
+#undef RDNA2_EXTRA_OPCODE
 	Exp
 };
 

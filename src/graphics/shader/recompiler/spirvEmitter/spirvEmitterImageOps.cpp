@@ -23,6 +23,13 @@ uint32_t ConstantImageGatherHorizontalOffsets(EmitterState* state) {
 	return value;
 }
 
+bool SampledImageIsMultisampled(const EmitterState& state, const IR::MemoryInfo& mem,
+                                uint32_t pc) {
+	const bool integer = mem.kind == IR::ResourceKind::ImageUint;
+	const auto view    = SampledImageViewKind(state, mem, pc);
+	return state.sampled_images[SampledImageIndex(integer, view)].multisampled;
+}
+
 uint32_t LoadStorageImageDescriptorAtIndex(EmitterState* state, uint32_t resource,
                                            uint32_t array_index, bool uint_image,
                                            ImageViewKind view) {
@@ -145,10 +152,17 @@ void EmitImageLoad(EmitterState* state, const IR::Instruction& inst) {
 	const bool integer = inst.memory.kind == IR::ResourceKind::ImageUint;
 
 	const auto color = state->builder.AllocateId();
-	state->builder.AddFunction(
-	    {OpImageFetch, integer ? state->vec4_uint_type : state->vec4_float_type, color, image,
-	     EmitImageLoadCoordU32(state, inst, view), ImageOperandsLodMask,
-	     EmitImageMipLodU32(state, inst, inst.src[0], view)});
+	const auto coord = EmitImageLoadCoordU32(state, inst, view);
+	const auto lod   = EmitImageMipLodU32(state, inst, inst.src[0], view);
+	if (SampledImageIsMultisampled(*state, inst.memory, inst.pc)) {
+		state->builder.AddFunction(
+		    {OpImageFetch, integer ? state->vec4_uint_type : state->vec4_float_type, color, image,
+		     coord, ImageOperandsLodMask | ImageOperandsSampleMask, lod, ConstantU32(state, 0)});
+	} else {
+		state->builder.AddFunction(
+		    {OpImageFetch, integer ? state->vec4_uint_type : state->vec4_float_type, color, image,
+		     coord, ImageOperandsLodMask, lod});
+	}
 
 	const auto dmask     = inst.memory.dmask != 0 ? inst.memory.dmask : 1u;
 	uint32_t   dst_index = 0;
@@ -165,6 +179,97 @@ void EmitImageLoad(EmitterState* state, const IR::Instruction& inst) {
 			state->builder.AddFunction({OpBitcast, state->uint_type, bits, component});
 		}
 		EmitStoreU32(state, OffsetRegisterOperand(inst.dst, dst_index++), bits);
+	}
+}
+
+void EmitImageLoadPck(EmitterState* state, const IR::Instruction& inst) {
+	const auto view    = SampledImageViewKind(*state, inst.memory, inst.pc);
+	const auto image   = LoadSampledImageDescriptor(state, inst.memory, inst.pc, view);
+	const bool integer = inst.memory.kind == IR::ResourceKind::ImageUint;
+
+	const auto color = state->builder.AllocateId();
+	const auto coord = EmitImageLoadCoordU32(state, inst, view);
+	const auto lod   = EmitImageMipLodU32(state, inst, inst.src[0], view);
+	if (SampledImageIsMultisampled(*state, inst.memory, inst.pc)) {
+		state->builder.AddFunction(
+		    {OpImageFetch, integer ? state->vec4_uint_type : state->vec4_float_type, color, image,
+		     coord, ImageOperandsLodMask | ImageOperandsSampleMask, lod, ConstantU32(state, 0)});
+	} else {
+		state->builder.AddFunction(
+		    {OpImageFetch, integer ? state->vec4_uint_type : state->vec4_float_type, color, image,
+		     coord, ImageOperandsLodMask, lod});
+	}
+
+	const auto dmask     = inst.memory.dmask != 0 ? inst.memory.dmask : 1u;
+	uint32_t   dst_index = 0;
+	for (uint32_t component_index = 0; component_index < 4u; component_index++) {
+		if (((dmask >> component_index) & 1u) == 0) {
+			continue;
+		}
+		const auto component = state->builder.AllocateId();
+		state->builder.AddFunction({OpCompositeExtract,
+		                            integer ? state->uint_type : state->float_type, component,
+		                            color, component_index});
+		if (integer) {
+			EmitStoreU32(state, OffsetRegisterOperand(inst.dst, dst_index++), component);
+			continue;
+		}
+		const auto bits = state->builder.AllocateId();
+		state->builder.AddFunction({OpBitcast, state->uint_type, bits, component});
+		if (inst.memory.image_pck_signed && component_index == 0) {
+			const auto signed_raw = state->builder.AllocateId();
+			const auto narrowed   = state->builder.AllocateId();
+			state->builder.AddFunction({OpBitcast, state->int_type, signed_raw, bits});
+			state->builder.AddFunction(
+			    {OpBitFieldSExtract, state->int_type, narrowed, signed_raw, ConstantU32(state, 0),
+			     ConstantU32(state, 8)});
+			state->builder.AddFunction({OpBitcast, state->uint_type, bits, narrowed});
+		}
+		EmitStoreU32(state, OffsetRegisterOperand(inst.dst, dst_index++), bits);
+	}
+}
+
+void EmitImageMsaaLoad(EmitterState* state, const IR::Instruction& inst) {
+	const auto view    = SampledImageViewKind(*state, inst.memory, inst.pc);
+	const auto image   = LoadSampledImageDescriptor(state, inst.memory, inst.pc, view);
+	const bool integer = inst.memory.kind == IR::ResourceKind::ImageUint;
+
+	const auto coord  = EmitImageLoadCoordU32(state, inst, view);
+	const auto sample = inst.memory.image_address_components > 2u
+	                        ? EmitImageAddressValueLoad(state, inst, inst.src[0], 2)
+	                        : ConstantU32(state, 0);
+
+	const auto color = state->builder.AllocateId();
+	state->builder.AddFunction({OpImageFetch, integer ? state->vec4_uint_type : state->vec4_float_type,
+	                            color, image, coord, ImageOperandsSampleMask, sample});
+
+	const auto dmask     = inst.memory.dmask != 0 ? inst.memory.dmask : 1u;
+	uint32_t   dst_index = 0;
+	for (uint32_t component_index = 0; component_index < 4u; component_index++) {
+		if (((dmask >> component_index) & 1u) == 0) {
+			continue;
+		}
+		const auto component = state->builder.AllocateId();
+		state->builder.AddFunction({OpCompositeExtract,
+		                            integer ? state->uint_type : state->float_type, component,
+		                            color, component_index});
+		const auto bits = integer ? component : state->builder.AllocateId();
+		if (!integer) {
+			state->builder.AddFunction({OpBitcast, state->uint_type, bits, component});
+		}
+		EmitStoreU32(state, OffsetRegisterOperand(inst.dst, dst_index++), bits);
+	}
+}
+
+void EmitImageBvhIntersectRay(EmitterState* state, const IR::Instruction& inst) {
+	// BVH intersection requires host ray-tracing resources; emit a deterministic stub until RT is wired.
+	const auto dmask = inst.memory.dmask != 0 ? inst.memory.dmask : 1u;
+	uint32_t   dst_index = 0;
+	for (uint32_t component_index = 0; component_index < 4u; component_index++) {
+		if (((dmask >> component_index) & 1u) == 0) {
+			continue;
+		}
+		EmitStoreU32(state, OffsetRegisterOperand(inst.dst, dst_index++), ConstantU32(state, 0));
 	}
 }
 

@@ -49,6 +49,7 @@ enum class Opcode {
 	IMadI24U32,
 	UMadU24U32,
 	UMadU64U32,
+	IMadI64I32,
 	SadU32,
 	IAdd3U32,
 	IMulI24U32,
@@ -291,6 +292,8 @@ enum class Opcode {
 	FMinF32,
 	FMaxF32,
 	FMadF32,
+	DivScaleF32,
+	DivScaleF64,
 	Dot2AccF32F16,
 	FMin3F32,
 	FMax3F32,
@@ -319,6 +322,12 @@ enum class Opcode {
 	AtomicAndU32,
 	AtomicOrU32,
 	AtomicXorU32,
+	AtomicIncU32,
+	AtomicDecU32,
+	AtomicFMinF32,
+	AtomicFMaxF32,
+	AtomicFcmpswapF32,
+	AtomicCsubU32,
 	FlatLoadUbyte,
 	FlatLoadSbyte,
 	FlatLoadUshort,
@@ -345,7 +354,16 @@ enum class Opcode {
 	ImageGetResinfo,
 	ImageGetLod,
 	ImageLoad,
+	ImageLoadPck,
+	ImageLoadPckSgn,
+	ImageLoadMipPck,
+	ImageLoadMipPckSgn,
+	ImageMsaaLoad,
+	ImageBvhIntersectRay,
+	ImageBvh64IntersectRay,
 	ImageStore,
+	ImageStorePck,
+	ImageStoreMipPck,
 	ImageSample,
 	ImageGather4,
 	LoadInputF32,
@@ -436,6 +454,10 @@ struct MemoryInfo {
 	bool     slc             = false;
 	bool     idxen           = false;
 	bool     offen           = false;
+	bool     memory_addtid   = false;
+	bool     image_pck_signed = false;
+	bool     image_msaa      = false;
+	bool     load_d16_hi     = false;
 
 	bool operator==(const MemoryInfo& other) const = default;
 };

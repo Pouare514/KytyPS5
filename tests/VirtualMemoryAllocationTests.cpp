@@ -1189,6 +1189,48 @@ void TestProgramMemoryRegistrationAndProtection() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestReserveFixedAfterGpuUnmapSub64K() {
+	const char* test = "ReserveFixedAfterGpuUnmapSub64K";
+
+	constexpr uint64_t arena_base      = 0x1000000000ull;
+	constexpr uint64_t reserve_len       = SceKernelPageSize * 12;
+	constexpr uint64_t sub64k_offset     = 0xC000;
+	constexpr uint64_t mapped_vaddr      = arena_base + sub64k_offset;
+
+	void* arena = reinterpret_cast<void*>(arena_base);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&arena, reserve_len, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange(arena)");
+	Check(test, reinterpret_cast<uint64_t>(arena) == arena_base, "arena address moved");
+
+	void* fixed = reinterpret_cast<void*>(mapped_vaddr);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &fixed, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "sub64k_replace"),
+	        "KernelMapNamedFlexibleMemory(sub64k MAP_FIXED)");
+	Check(test, reinterpret_cast<uint64_t>(fixed) == mapped_vaddr,
+	      "MAP_FIXED flexible mapping moved");
+
+	ExpectRange(test, Query(test, mapped_vaddr), mapped_vaddr, mapped_vaddr + SceKernelPageSize,
+	            SceKernelProtCpuRw, 1, 0, 0, 1, "sub64k_replace");
+
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(
+	            &fixed, SceKernelPageSize, SceKernelMapFixed, SceKernelPageSize),
+	        "KernelReserveVirtualRange(MAP_FIXED replace)");
+	Check(test, reinterpret_cast<uint64_t>(fixed) == mapped_vaddr,
+	      "MAP_FIXED reserve moved");
+
+	ExpectRange(test, Query(test, mapped_vaddr), arena_base, arena_base + reserve_len, 0, 0, 0, 0,
+	            0);
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(arena_base, reserve_len),
+	        "KernelMunmap(arena cleanup)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 } // namespace
 
 int main() {
@@ -1198,6 +1240,7 @@ int main() {
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
 	RunTest(TestReserveMapFixedAndNoOverwrite);
+	RunTest(TestReserveFixedAfterGpuUnmapSub64K);
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);

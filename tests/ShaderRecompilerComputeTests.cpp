@@ -4,6 +4,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/objects/textureCommon.h"
@@ -13,11 +14,13 @@
 #include "graphics/host_gpu/renderer/image.h"
 #include "graphics/host_gpu/renderer/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderState.h"
 #include "graphics/host_gpu/renderer/resourceMutex.h"
 #include "graphics/host_gpu/renderer/tiler.h"
 #include "graphics/host_gpu/renderer/textureCache.h"
 #include "graphics/host_gpu/utils.h"
+#include "graphics/host_gpu/vma.h"
 #include "graphics/shader/recompiler/BindingLayout.h"
 #include "graphics/shader/recompiler/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -498,6 +501,7 @@ struct TestCase {
   std::vector<std::vector<u32>> sampled_image_rgba_mips;
   VkFormat sampled_image_format = VK_FORMAT_R32G32B32A32_SFLOAT;
   u32 sampled_image_dwords_per_pixel = 4;
+  u32 sampled_image_samples = 1;
   std::vector<u32> storage_image_rgba;
   std::vector<u32> expected_storage_image_rgba;
   VkFormat storage_image_format = VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -525,6 +529,10 @@ struct SkippedCase {
   const char *name = "";
   const char *reason = "";
 };
+
+std::vector<u32> MakeRgbaImage(u32 width, u32 height, u32 value);
+void SetRgbaPixel(std::vector<u32> *image, u32 width, u32 x, u32 y, u32 r,
+                  u32 g, u32 b, u32 a);
 
 struct GraphicsCase {
   const char *name = "";
@@ -847,11 +855,29 @@ std::vector<u32> MakePassthroughVertexSpirv() {
 
 class VulkanHarness {
 public:
-  VulkanHarness() { Init(); }
+  VulkanHarness() = default;
   ~VulkanHarness() { Destroy(); }
 
   VulkanHarness(const VulkanHarness &) = delete;
   VulkanHarness &operator=(const VulkanHarness &) = delete;
+
+  [[nodiscard]] bool IsReady() const { return m_device != VK_NULL_HANDLE; }
+
+  bool TryInit() {
+    if (IsReady()) {
+      return true;
+    }
+    if (m_tried_init) {
+      return false;
+    }
+    m_tried_init = true;
+    return Init();
+  }
+
+  void RequireReady(const char *stage) const {
+    Require("VulkanHarness", stage, IsReady(),
+            "Vulkan device is not initialized");
+  }
 
   struct Buffer {
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -873,6 +899,34 @@ public:
   };
 
   [[nodiscard]] VkDevice Device() const { return m_device; }
+
+  [[nodiscard]] GraphicContext *GetGraphicContext() {
+    return m_gctx_ready ? &m_gctx : nullptr;
+  }
+
+  bool PopulateGraphicContext(GraphicContext *ctx) const {
+    if (!IsReady() || ctx == nullptr) {
+      return false;
+    }
+    ctx->instance = m_instance;
+    ctx->physical_device = m_physical_device;
+    ctx->device = m_device;
+    vkGetPhysicalDeviceProperties(m_physical_device,
+                                  &ctx->physical_device_properties);
+    for (const int queue :
+         {GraphicContext::QUEUE_GFX, GraphicContext::QUEUE_UTIL}) {
+      ctx->queues[queue].family = m_queue_family;
+      ctx->queues[queue].index = 0;
+      ctx->queues[queue].vk_queue = m_queue;
+    }
+    return VulkanCreateAllocator(ctx);
+  }
+
+  void ReleaseGraphicContext(GraphicContext *ctx) const {
+    if (ctx != nullptr && ctx->allocator != nullptr) {
+      VulkanDestroyAllocator(ctx);
+    }
+  }
 
   void CheckMutableStorageSrgbView() {
     constexpr const char *name = "StorageTextureMutableSrgbView";
@@ -1108,13 +1162,13 @@ public:
   Image CreateImage2D(const char *shader_name, u32 width, u32 height,
                       VkFormat format, VkImageUsageFlags usage,
                       const std::vector<u32> &initial, u32 dwords_per_pixel,
-                      VkImageLayout final_layout) {
+                      VkImageLayout final_layout, u32 samples = 1) {
     std::vector<std::vector<u32>> mips;
     if (!initial.empty()) {
       mips.push_back(initial);
     }
     return CreateImage2DMips(shader_name, width, height, format, usage, mips,
-                             dwords_per_pixel, final_layout);
+                             dwords_per_pixel, final_layout, samples);
   }
 
   static u32 MipExtent(u32 value, u32 level) {
@@ -1133,7 +1187,8 @@ public:
   Image CreateImage2DMips(const char *shader_name, u32 width, u32 height,
                           VkFormat format, VkImageUsageFlags usage,
                           const std::vector<std::vector<u32>> &initial_mips,
-                          u32 dwords_per_pixel, VkImageLayout final_layout) {
+                          u32 dwords_per_pixel, VkImageLayout final_layout,
+                          u32 samples = 1) {
     Image ret;
     ret.format = format;
     ret.width = width;
@@ -1150,7 +1205,9 @@ public:
     image_info.extent.depth = 1;
     image_info.mipLevels = ret.mip_levels;
     image_info.arrayLayers = 1;
-    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.samples = samples == 4u   ? VK_SAMPLE_COUNT_4_BIT
+                         : samples == 2u ? VK_SAMPLE_COUNT_2_BIT
+                                         : VK_SAMPLE_COUNT_1_BIT;
     image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
     image_info.usage = usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -1976,7 +2033,45 @@ public:
   }
 
 private:
-  void Init() {
+  static int ScorePhysicalDeviceType(VkPhysicalDeviceType type) {
+    switch (type) {
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+      return 3;
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+      return 2;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+      return 1;
+    default:
+      return 0;
+    }
+  }
+
+  static bool FindGraphicsComputeQueueFamily(VkPhysicalDevice physical,
+                                             u32 *queue_family) {
+    u32 queue_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, nullptr);
+    std::vector<VkQueueFamilyProperties> queues(queue_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count,
+                                             queues.data());
+    for (u32 i = 0; i < queue_count; i++) {
+      if ((queues[i].queueFlags &
+           (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) ==
+          (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) {
+        *queue_family = i;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool SupportsStorageImageWithoutFormat(VkPhysicalDevice physical) {
+    VkPhysicalDeviceFeatures available_features{};
+    vkGetPhysicalDeviceFeatures(physical, &available_features);
+    return available_features.shaderStorageImageWriteWithoutFormat == VK_TRUE &&
+           available_features.shaderStorageImageReadWithoutFormat == VK_TRUE;
+  }
+
+  bool Init() {
     VkApplicationInfo app{};
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.pApplicationName = "ShaderRecompilerComputeTests";
@@ -1985,54 +2080,60 @@ private:
     VkInstanceCreateInfo instance_info{};
     instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instance_info.pApplicationInfo = &app;
-    RequireVk("VulkanHarness", "dispatch",
-              vkCreateInstance(&instance_info, nullptr, &m_instance),
-              "vkCreateInstance");
+    if (vkCreateInstance(&instance_info, nullptr, &m_instance) != VK_SUCCESS) {
+      std::fprintf(stderr,
+                   "ShaderRecompilerComputeTests: VulkanHarness failed to "
+                   "create instance\n");
+      return false;
+    }
 
     u32 physical_count = 0;
-    RequireVk("VulkanHarness", "dispatch",
-              vkEnumeratePhysicalDevices(m_instance, &physical_count, nullptr),
-              "vkEnumeratePhysicalDevices");
-    Require("VulkanHarness", "dispatch", physical_count != 0,
-            "no Vulkan physical devices");
+    if (vkEnumeratePhysicalDevices(m_instance, &physical_count, nullptr) !=
+            VK_SUCCESS ||
+        physical_count == 0) {
+      std::fprintf(stderr,
+                   "ShaderRecompilerComputeTests: VulkanHarness found no "
+                   "physical devices\n");
+      Destroy();
+      return false;
+    }
     std::vector<VkPhysicalDevice> physical_devices(physical_count);
-    RequireVk("VulkanHarness", "dispatch",
-              vkEnumeratePhysicalDevices(m_instance, &physical_count,
-                                         physical_devices.data()),
-              "vkEnumeratePhysicalDevices");
+    if (vkEnumeratePhysicalDevices(m_instance, &physical_count,
+                                   physical_devices.data()) != VK_SUCCESS) {
+      std::fprintf(stderr,
+                   "ShaderRecompilerComputeTests: VulkanHarness failed to "
+                   "enumerate physical devices\n");
+      Destroy();
+      return false;
+    }
 
+    int best_score = -1;
     for (auto physical : physical_devices) {
-      u32 queue_count = 0;
-      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count, nullptr);
-      std::vector<VkQueueFamilyProperties> queues(queue_count);
-      vkGetPhysicalDeviceQueueFamilyProperties(physical, &queue_count,
-                                               queues.data());
-      for (u32 i = 0; i < queue_count; i++) {
-        if ((queues[i].queueFlags &
-             (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) ==
-            (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) {
-          m_physical_device = physical;
-          m_queue_family = i;
-          break;
-        }
+      if (!SupportsStorageImageWithoutFormat(physical)) {
+        continue;
       }
-      if (m_physical_device != VK_NULL_HANDLE) {
-        break;
+      u32 queue_family = 0;
+      if (!FindGraphicsComputeQueueFamily(physical, &queue_family)) {
+        continue;
+      }
+      VkPhysicalDeviceProperties properties{};
+      vkGetPhysicalDeviceProperties(physical, &properties);
+      const int score = ScorePhysicalDeviceType(properties.deviceType);
+      if (score > best_score) {
+        best_score = score;
+        m_physical_device = physical;
+        m_queue_family = queue_family;
       }
     }
-    Require("VulkanHarness", "dispatch", m_physical_device != VK_NULL_HANDLE,
-            "no Vulkan graphics+compute queue family");
+    if (m_physical_device == VK_NULL_HANDLE) {
+      std::fprintf(stderr,
+                   "ShaderRecompilerComputeTests: VulkanHarness found no "
+                   "device with shaderStorageImageRead/WriteWithoutFormat\n");
+      Destroy();
+      return false;
+    }
     vkGetPhysicalDeviceMemoryProperties(m_physical_device,
                                         &m_memory_properties);
-
-    VkPhysicalDeviceFeatures available_features{};
-    vkGetPhysicalDeviceFeatures(m_physical_device, &available_features);
-    Require("VulkanHarness", "dispatch",
-            available_features.shaderStorageImageWriteWithoutFormat == VK_TRUE,
-            "shaderStorageImageWriteWithoutFormat is not supported");
-    Require("VulkanHarness", "dispatch",
-            available_features.shaderStorageImageReadWithoutFormat == VK_TRUE,
-            "shaderStorageImageReadWithoutFormat is not supported");
 
     float priority = 1.0f;
     VkDeviceQueueCreateInfo queue_info{};
@@ -2041,31 +2142,66 @@ private:
     queue_info.queueCount = 1;
     queue_info.pQueuePriorities = &priority;
 
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float_features{};
+    atomic_float_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+    atomic_float_features.shaderBufferFloat32Atomics = VK_TRUE;
+    atomic_float_features.shaderSharedFloat32Atomics = VK_TRUE;
+
+    VkPhysicalDeviceFeatures2 device_features2{};
+    device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    device_features2.pNext = &atomic_float_features;
+    device_features2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+    device_features2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
+
+    const char *device_extensions[] = {"VK_EXT_shader_atomic_float"};
+
     VkDeviceCreateInfo device_info{};
     device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
-    VkPhysicalDeviceFeatures device_features{};
-    device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
-    device_features.shaderStorageImageReadWithoutFormat = VK_TRUE;
-    device_info.pEnabledFeatures = &device_features;
-    RequireVk(
-        "VulkanHarness", "dispatch",
-        vkCreateDevice(m_physical_device, &device_info, nullptr, &m_device),
-        "vkCreateDevice");
+    device_info.pNext = &device_features2;
+    device_info.enabledExtensionCount = 1;
+    device_info.ppEnabledExtensionNames = device_extensions;
+    if (vkCreateDevice(m_physical_device, &device_info, nullptr, &m_device) !=
+        VK_SUCCESS) {
+      std::fprintf(stderr,
+                   "ShaderRecompilerComputeTests: VulkanHarness failed to "
+                   "create device\n");
+      Destroy();
+      return false;
+    }
     vkGetDeviceQueue(m_device, m_queue_family, 0, &m_queue);
 
     VkCommandPoolCreateInfo pool_info{};
     pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pool_info.queueFamilyIndex = m_queue_family;
     pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    RequireVk(
-        "VulkanHarness", "dispatch",
-        vkCreateCommandPool(m_device, &pool_info, nullptr, &m_command_pool),
-        "vkCreateCommandPool");
+    if (vkCreateCommandPool(m_device, &pool_info, nullptr, &m_command_pool) !=
+        VK_SUCCESS) {
+      std::fprintf(stderr,
+                   "ShaderRecompilerComputeTests: VulkanHarness failed to "
+                   "create command pool\n");
+      Destroy();
+      return false;
+    }
+    if (!PopulateGraphicContext(&m_gctx)) {
+      std::fprintf(stderr,
+                   "ShaderRecompilerComputeTests: VulkanHarness failed to "
+                   "create VMA allocator\n");
+      Destroy();
+      return false;
+    }
+    m_gctx_ready = true;
+    return true;
   }
 
   void Destroy() {
+    if (m_gctx_ready) {
+      ReleaseGraphicContext(&m_gctx);
+      m_gctx = {};
+      m_gctx_ready = false;
+    }
     if (m_device != VK_NULL_HANDLE) {
       vkDeviceWaitIdle(m_device);
       if (m_command_pool != VK_NULL_HANDLE) {
@@ -2302,6 +2438,9 @@ private:
   VkQueue m_queue = VK_NULL_HANDLE;
   VkCommandPool m_command_pool = VK_NULL_HANDLE;
   u32 m_queue_family = 0;
+  bool m_tried_init = false;
+  bool m_gctx_ready = false;
+  GraphicContext m_gctx{};
   VkPhysicalDeviceMemoryProperties m_memory_properties{};
 };
 
@@ -2391,13 +2530,13 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
           test.name, test.image_width, test.image_height,
           VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT,
           test.sampled_image_rgba_mips, 4,
-          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, test.sampled_image_samples);
     } else {
       sampled_image = vulkan->CreateImage2D(
           test.name, test.image_width, test.image_height,
           test.sampled_image_format, VK_IMAGE_USAGE_SAMPLED_BIT,
           test.sampled_image_rgba, test.sampled_image_dwords_per_pixel,
-          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, test.sampled_image_samples);
     }
   }
   if (needs_storage_image) {
@@ -2455,6 +2594,11 @@ void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
   auto actual = vulkan->RenderFragment(test, compiled);
   CompareGraphicsWords(test, actual);
   std::printf("[graphics] %-31s ok\n", test.name);
+}
+
+void RunGraphicsCaseCompileOnly(const GraphicsCase &test) {
+  (void)CompileFragmentCase(test);
+  std::printf("[graphics] %-31s ok (compile-only)\n", test.name);
 }
 
 enum class CoverageClass {
@@ -4039,8 +4183,8 @@ TestCase VectorVop3BCarryOutWritesSgprMask() {
   test.name = "VectorVop3BCarryOutWritesSgprMask";
   test.code = code;
   test.expected = std::vector<u32>(12, 0x0fu);
-  test.opcodes = {O::VMovB32,    O::VAddI32,          O::VSubI32,
-                  O::VSubrevI32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::VMovB32,    O::VAddCoU32,        O::VSubCoU32,
+                  O::VSubrevCoU32, O::BufferStoreDword, O::SEndpgm};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -4071,8 +4215,8 @@ TestCase VectorVop3BCarryOutUsesEncodedSdst() {
   test.name = "VectorVop3BCarryOutUsesEncodedSdst";
   test.code = code;
   test.expected = std::vector<u32>(12, 0x0fu);
-  test.opcodes = {O::VMovB32,    O::VAddI32,          O::VSubI32,
-                  O::VSubrevI32, O::BufferStoreDword, O::SEndpgm};
+  test.opcodes = {O::VMovB32,    O::VAddCoU32,        O::VSubCoU32,
+                  O::VSubrevCoU32, O::BufferStoreDword, O::SEndpgm};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -4111,7 +4255,7 @@ TestCase VectorVop3BSubCoU32UsesRdna2Opcode310() {
   test.code = code;
   test.expected = {0xffffffffu, 0, 0xfffffffeu, 0x80000001u, 9, 9, 9, 9};
   test.opcodes = {O::VMovB32, O::VCmpEqU32,        O::VCndmaskB32,
-                  O::VSubI32, O::BufferStoreDword, O::SEndpgm};
+                  O::VSubCoU32, O::BufferStoreDword, O::SEndpgm};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -4532,6 +4676,32 @@ TestCase VectorDppQuadPermuteReverse() {
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorDpp8RowShiftLeft() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 10);
+  code.push_back(EncodeVop2(0x25, 2, 250, 1));
+  code.push_back(EncodeVop2Dpp(0, 0x101));
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDpp8RowShiftLeft";
+  test.code = code;
+  test.expected = {11, 12, 13, 14, 15, 16, 17, 10};
+  test.opcodes = {O::VMovB32, O::VAddNcU32, O::VLshlrevB32, O::BufferStoreDword,
+                  O::SEndpgm};
+  test.compute_info.threads_num[0] = 8;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.required_spirv = {"OpGroupNonUniformShuffle"};
   return test;
 }
 
@@ -6864,6 +7034,339 @@ TestCase FlatStoreVariants() {
   return test;
 }
 
+TestCase FlatAtomicIncDecVariants() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeFlat0(0x3c, 0, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 0, 20));
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeFlat0(0x3d, 0, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 1, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendEnd(&code);
+
+  TestCase test{"FlatAtomicIncDecVariants",
+                code,
+                {10u, 0},
+                {10u, 11u},
+                {O::VMovB32, O::BufferAtomicInc, O::BufferAtomicDec,
+                 O::BufferStoreDword, O::SEndpgm}};
+  test.flat_memory_base = 0;
+  return test;
+}
+
+TestCase FlatLoadShortD16Variant() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeFlat0(0x24, 0, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test{"FlatLoadShortD16Variant",
+                code,
+                {0x0000bbccu, 0},
+                {0x0000bbccu},
+                {O::VMovB32, O::FlatLoadShortD16, O::BufferStoreDword, O::SEndpgm}};
+  test.flat_memory_base = 0;
+  return test;
+}
+
+TestCase GlobalAtomicIncVariant() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeFlat0(0x3c, 2, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test{"GlobalAtomicIncVariant",
+                code,
+                {5u, 0},
+                {5u},
+                {O::VMovB32, O::BufferAtomicInc, O::BufferStoreDword, O::SEndpgm}};
+  test.flat_memory_base = 0;
+  return test;
+}
+
+TestCase VectorVop3BDivScaleF32() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 1, 0x3f800000u);
+  AppendVMovLiteral(&code, 2, 0x3f800000u);
+  AppendVMovLiteral(&code, 3, 0x3f800000u);
+  AppendVop3(&code, 0x16du, 10, Vgpr(1), Vgpr(2), Vgpr(3));
+  AppendStoreVgpr(&code, 10, 0);
+  AppendEnd(&code);
+
+  return {"VectorVop3BDivScaleF32",
+          code,
+          {},
+          {0x3f800000u},
+          {O::VMovB32, O::VDivScaleF32, O::BufferStoreDword, O::SEndpgm}};
+}
+
+TestCase VectorVop3BMadI64I32() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 1, 0xffffffffu);
+  AppendVMovU32(&code, 2, 2);
+  AppendVMovU32(&code, 4, 2);
+  AppendVMovLiteral(&code, 5, 0xffffffffu);
+  AppendVop3B(&code, 0x177u, 10, 20, Vgpr(1), Vgpr(2), Vgpr(4));
+  AppendStoreVgpr(&code, 10, 0);
+  AppendStoreVgpr(&code, 11, 1);
+  AppendStoreSgprPair(&code, 20, 2);
+  AppendEnd(&code);
+
+  return {"VectorVop3BMadI64I32",
+          code,
+          {},
+          {0x00000000u, 0xffffffffu, 0x00000001u, 0x00000000u},
+          {O::VMovB32, O::VMadI64I32, O::BufferStoreDword, O::SEndpgm}};
+}
+
+TestCase ImageLoadPckAndMsaaVariants() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovU32(&code, 21, 0);
+  code.push_back(EncodeMimg0(0x02, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  code.push_back(EncodeMimg0(0x80, 0x1));
+  code.push_back(EncodeMimg1(1, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendEnd(&code);
+
+  auto image = MakeRgbaImage(4, 4, 0x3f800000u);
+
+  TestCase test;
+  test.name = "ImageLoadPckAndMsaaVariants";
+  test.code = code;
+  test.expected = {0x3f800000u, 0x3f800000u};
+  test.opcodes = {O::VMovB32, O::ImageLoadPck, O::ImageMsaaLoad,
+                  O::BufferStoreDword, O::SEndpgm};
+  test.sampled_image_rgba = image;
+  test.image_width = 4;
+  test.image_height = 4;
+  test.sampled_image_samples = 4;
+  return test;
+}
+
+TestCase ImageBvhIntersectRayDecodeStub() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeMimg0(0xe6, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageBvhIntersectRayDecodeStub";
+  test.code = code;
+  test.expected = {0u};
+  test.opcodes = {O::VMovB32, O::ImageBvhIntersectRay, O::BufferStoreDword,
+                  O::SEndpgm};
+  test.sampled_image_rgba = MakeRgbaImage(4, 4, 0);
+  test.image_width = 4;
+  test.image_height = 4;
+  return test;
+}
+
+TestCase FlatAtomicFminFmax() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovLiteral(&code, 0, 0x40a00000u);
+  code.push_back(EncodeFlat0(0x3f, 0, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 0, 20));
+  AppendVMovLiteral(&code, 1, 0x40800000u);
+  code.push_back(EncodeFlat0(0x40, 0, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 1, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendEnd(&code);
+
+  TestCase test{"FlatAtomicFminFmax",
+                code,
+                {0x40a00000u, 0},
+                {0x40a00000u, 0x40800000u},
+                {O::VMovB32, O::BufferAtomicFmin, O::BufferAtomicFmax,
+                 O::BufferStoreDword, O::SEndpgm}};
+  test.flat_memory_base = 0;
+  return test;
+}
+
+TestCase GlobalAtomicIncX2() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeFlat0(0x5c, 2, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test{"GlobalAtomicIncX2",
+                code,
+                {5u, 0u},
+                {6u},
+                {O::VMovB32, O::BufferAtomicIncX2, O::BufferStoreDword, O::SEndpgm}};
+  test.flat_memory_base = 0;
+  return test;
+}
+
+TestCase BufferAtomicCsub() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovU32(&code, 0, 3);
+  AppendBufferStoreOpcode(&code, 0x34, 0, 20, true);
+  AppendStoreVgpr(&code, 0, 1);
+  AppendEnd(&code);
+
+  TestCase test{"BufferAtomicCsub",
+                 code,
+                 {10u, 0},
+                 {7u, 10u},
+                 {O::VMovB32, O::BufferAtomicCsub, O::BufferStoreDword, O::SEndpgm}};
+  return test;
+}
+
+TestCase VectorVop3BDivScaleF64() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 1, 0x3f800000u);
+  AppendVMovLiteral(&code, 2, 0x3f800000u);
+  AppendVMovLiteral(&code, 3, 0x3f800000u);
+  AppendVop3(&code, 0x16eu, 10, Vgpr(1), Vgpr(2), Vgpr(3));
+  AppendStoreVgpr(&code, 10, 0);
+  AppendEnd(&code);
+
+  return {"VectorVop3BDivScaleF64",
+          code,
+          {},
+          {0x3f800000u},
+          {O::VMovB32, O::VDivScaleF64, O::BufferStoreDword, O::SEndpgm}};
+}
+
+TestCase FlatLoadUbyteD16() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeFlat0(0x20, 0, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test{"FlatLoadUbyteD16",
+                code,
+                {0x0000cdabu, 0},
+                {0x000000abu},
+                {O::VMovB32, O::FlatLoadUbyteD16, O::BufferStoreDword, O::SEndpgm}};
+  test.flat_memory_base = 0;
+  return test;
+}
+
+TestCase GlobalLoadDwordAddtid() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeFlat0(0x16, 2, 0));
+  code.push_back(EncodeFlat1(0, 0x7d, 0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "GlobalLoadDwordAddtid";
+  test.code = code;
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.expected = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.opcodes = {O::VMovB32, O::FlatLoadDwordAddtid, O::BufferStoreDword, O::SEndpgm};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.flat_memory_base = 0;
+  return test;
+}
+
+TestCase ImageGather4Basic() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovLiteral(&code, 21, 0x3f000000u);
+  AppendVMovLiteral(&code, 22, 0x3f200000u);
+  AppendVMovLiteral(&code, 23, 0x3ec00000u);
+  code.push_back(EncodeMimg0(0x40, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  code.push_back(EncodeMimg0(0x41, 0x1));
+  code.push_back(EncodeMimg1(4, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageGather4Basic";
+  test.code = code;
+  test.opcodes = {O::VMovB32, O::ImageGather4, O::ImageGather4Cl, O::SEndpgm};
+  test.required_spirv = {"OpImageGather"};
+  return test;
+}
+
+TestCase VectorVop3AddF32AbsNegOmod() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 1, 0x3f800000u);
+  AppendVMovLiteral(&code, 2, 0xc0000000u);
+  AppendVop3(&code, 0x103u, 10, Vgpr(1), Vgpr(2), 0, 0x2u, 0, false, 1u, 0);
+  AppendStoreVgpr(&code, 10, 0);
+  AppendEnd(&code);
+
+  return {"VectorVop3AddF32AbsNegOmod",
+          code,
+          {},
+          {0x40c00000u},
+          {O::VMovB32, O::VAddF32, O::BufferStoreDword, O::SEndpgm}};
+}
+
+TestCase VectorVop2AddF32Sdwa() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x00010002u);
+  AppendVMovLiteral(&code, 1, 0x00030004u);
+  code.push_back(EncodeVop2(0x03, 2, Vgpr(0), Vgpr(1)));
+  code.push_back(EncodeVop2Sdwa(0));
+  AppendStoreVgpr(&code, 2, 0);
+  AppendEnd(&code);
+
+  return {"VectorVop2AddF32Sdwa",
+          code,
+          {},
+          {0x00040006u},
+          {O::VMovB32, O::VAddF32, O::BufferStoreDword, O::SEndpgm}};
+}
+
 TestCase DsReadWriteVariants() {
   using O = ShaderOpcode;
 
@@ -7266,7 +7769,7 @@ TestCase ImageLoadVariants() {
   }
   AppendEnd(&code);
 
-  auto image = MakeRgbaImage(4, 4);
+  auto image = MakeRgbaImage(4, 4, 0);
   SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
                0x40800000u);
 
@@ -7471,7 +7974,7 @@ TestCase ImageLoadA16UintCoordsOnGpu() {
   }
   AppendEnd(&code);
 
-  auto image = MakeRgbaImage(4, 4);
+  auto image = MakeRgbaImage(4, 4, 0);
   SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
                0x40800000u);
 
@@ -7561,7 +8064,7 @@ TestCase ImageSampleAndGather() {
   }
   AppendEnd(&code);
 
-  auto image = MakeRgbaImage(4, 4);
+  auto image = MakeRgbaImage(4, 4, 0);
   for (u32 y = 0; y < 4u; y++) {
     for (u32 x = 0; x < 4u; x++) {
       SetRgbaPixel(&image, 4, x, y, 0x3f800000u, 0, 0, 0);
@@ -7606,7 +8109,7 @@ TestCase ImageSampleA16SamplerCoordsOnGpu() {
   }
   AppendEnd(&code);
 
-  auto image = MakeRgbaImage(4, 4);
+  auto image = MakeRgbaImage(4, 4, 0);
   SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
                0x40800000u);
 
@@ -7636,7 +8139,6 @@ TestCase ImageSampleOpcodeAliasUsesNormalCoords() {
   test.opcodes = {O::VMovB32, O::ImageSample, O::SEndpgm};
   test.required_spirv = {"OpImageSampleExplicitLod"};
   test.forbidden_spirv = {"UnpackHalf2x16"};
-  test.compile_only = true;
   return test;
 }
 
@@ -7654,7 +8156,7 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   }
   AppendEnd(&code);
 
-  auto image = MakeRgbaImage(4, 4);
+  auto image = MakeRgbaImage(4, 4, 0);
   SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
                0x40800000u);
 
@@ -7684,7 +8186,6 @@ TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   test.code = code;
   test.opcodes = {O::VMovB32, O::ImageSample, O::SEndpgm};
   test.required_spirv = {"OpImageSampleDrefExplicitLod", "UnpackHalf2x16"};
-  test.compile_only = true;
   return test;
 }
 
@@ -7722,7 +8223,6 @@ TestCase ImageGatherCompareOpcodes() {
   test.opcodes = {O::VMovB32,        O::ImageGather4C,    O::ImageGather4CLz,
                   O::ImageGather4CO, O::ImageGather4CLzO, O::SEndpgm};
   test.required_spirv = {"OpImageDrefGather", "OpBitFieldSExtract"};
-  test.compile_only = true;
   return test;
 }
 
@@ -7942,7 +8442,6 @@ TestCase ComputeTgSizeSgprUsesWaveMetadata() {
   test.compute_info.workgroup_register = 0;
   test.compute_info.tg_size_en = true;
   test.has_compute_info = true;
-  test.compile_only = true;
   test.required_spirv = {"OpUDiv", "OpShiftLeftLogical", "2147483648"};
   return test;
 }
@@ -8338,6 +8837,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3BCarryOutUsesEncodedSdst);
   AddCase(VectorVop3BSubCoU32UsesRdna2Opcode310);
   AddCase(VectorMadU64U32UnsignedCarryOut);
+  AddCase(VectorVop3BDivScaleF32);
+  AddCase(VectorVop3BDivScaleF64);
+  AddCase(VectorVop3BMadI64I32);
+  AddCase(VectorVop3AddF32AbsNegOmod);
+  AddCase(VectorVop2AddF32Sdwa);
   AddCase(VectorLaneAndPackedOps);
   AddCase(CvtPkU8F32PacksSelectedByte);
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
@@ -8351,6 +8855,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);
   AddCase(VectorDppQuadPermuteReverse);
+  AddCase(VectorDpp8RowShiftLeft);
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
   AddCase(Vop3LdexpSourceModifier);
@@ -8435,6 +8940,13 @@ std::vector<TestCase> MakeCases() {
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
   AddCase(FlatStoreVariants);
+  AddCase(FlatAtomicIncDecVariants);
+  AddCase(FlatAtomicFminFmax);
+  AddCase(FlatLoadShortD16Variant);
+  AddCase(FlatLoadUbyteD16);
+  AddCase(GlobalAtomicIncVariant);
+  AddCase(GlobalAtomicIncX2);
+  AddCase(GlobalLoadDwordAddtid);
   AddCase(DsReadWriteVariants);
   AddCase(DsAppendConsumeUsesEncodedLdsSelector);
   AddCase(DsAppendUsesEncodedGdsSelector);
@@ -8446,8 +8958,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsFloatMinMaxUsesSeparateCompareOperand);
   AddCase(DsSwizzleInvalidSourceLaneZero);
   AddCase(BufferAtomicVariants);
+  AddCase(BufferAtomicCsub);
   AddCase(BufferAtomicGlc0DoesNotReturnOldValue);
   AddCase(ImageLoadVariants);
+  AddCase(ImageLoadPckAndMsaaVariants);
+  AddCase(ImageBvhIntersectRayDecodeStub);
   AddCase(ImageLoadR32UintUsesIntegerSampledImage);
   AddCase(ImageLoadMipUsesVaddr2Lod2D);
   AddCase(ImageLoadMipNsaUsesSelectedAddressVgprs);
@@ -8460,6 +8975,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
   AddCase(ImageGatherCompareOpcodes);
+  AddCase(ImageGather4Basic);
   AddCase(ImageStoreVariants);
   AddCase(ImageStoreRgbOneUsesInverseSwizzle);
   AddCase(ImageStoreBgraUsesInverseSwizzle);
@@ -11129,6 +11645,29 @@ void CheckImageOverlapResolution() {
   Require("ImageOverlapResolution", "uninitialized stencil access",
           !CanLoadStencilAttachment(depth, false),
           "uninitialized stencil access was silently admitted");
+  BufferImageCopySource coherent_stencil{};
+  coherent_stencil.address = depth.stencil_address;
+  coherent_stencil.size = depth.stencil_size;
+  coherent_stencil.cpu_current = true;
+  Require("ImageOverlapResolution", "guest coherent stencil without init",
+          CanLoadStencilAttachment(
+              depth, coherent_stencil.cpu_current &&
+                         coherent_stencil.address == depth.stencil_address &&
+                         coherent_stencil.size == depth.stencil_size),
+          "coherent guest stencil was rejected before detile load");
+  BufferImageCopySource incoherent_stencil = coherent_stencil;
+  incoherent_stencil.cpu_current = false;
+  Require("ImageOverlapResolution", "incoherent stencil without init",
+          !CanLoadStencilAttachment(
+              depth, incoherent_stencil.cpu_current &&
+                         incoherent_stencil.address == depth.stencil_address &&
+                         incoherent_stencil.size == depth.stencil_size),
+          "incoherent guest stencil without init was silently admitted");
+  DepthTargetInfo fallback_clear = depth;
+  fallback_clear.stencil_load_clear = true;
+  Require("ImageOverlapResolution", "implicit stencil clear policy",
+          CanLoadStencilAttachment(fallback_clear, false),
+          "implicit stencil clear did not satisfy load policy");
   Require("ImageOverlapResolution", "initialized stencil load",
           CanLoadStencilAttachment(depth, true),
           "initialized stencil contents could not be loaded");
@@ -11247,6 +11786,90 @@ void CheckStencilAttachmentAccess() {
           !stencil_face_accesses_attachment(state, dynamic),
           "fully masked stencil write was classified as access");
   std::printf("[host]    %-32s ok\n", "StencilAttachmentAccess");
+}
+
+void CheckStencilFirstBindWithoutClear(VulkanHarness *vulkan) {
+  constexpr const char *name = "StencilFirstBindWithoutClear";
+  if (vulkan == nullptr || !vulkan->IsReady()) {
+    std::printf("[skip]    %-32s no Vulkan device\n", name);
+    return;
+  }
+  GraphicContext *ctx = vulkan->GetGraphicContext();
+  Require(name, "context", ctx != nullptr && ctx->allocator != nullptr,
+          "VulkanHarness GraphicContext is not initialized");
+  if (g_render_ctx == nullptr) {
+    GraphicsRenderInit();
+  }
+  g_render_ctx->SetGraphicCtx(ctx);
+
+  constexpr uint32_t width = 64;
+  constexpr uint32_t height = 64;
+  TileSizeAlign stencil_layout{};
+  TileSizeAlign htile_layout{};
+  TileSizeAlign depth_layout{};
+  Require(name, "layout",
+          TileGetDepthSize(width, height, 0,
+                           Prospero::GpuEnumValue(Prospero::DepthFormat::kZ32F),
+                           Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt),
+                           false, &stencil_layout, &htile_layout, &depth_layout),
+          "depth/stencil layout was rejected");
+  const auto pitch = TileGetTexturePitch(
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float), width, 1,
+      Prospero::GpuEnumValue(Prospero::TileMode::kDepth));
+  constexpr uint64_t base = 0x0000000200100000ull;
+  const uint64_t depth_addr = base;
+  const uint64_t stencil_addr =
+      (base + depth_layout.size + stencil_layout.align - 1) &
+      ~(static_cast<uint64_t>(stencil_layout.align) - 1ull);
+  const uint64_t map_end = stencil_addr + stencil_layout.size;
+  const uint64_t map_size =
+      (map_end - base + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1ull);
+  auto *memory = static_cast<uint8_t *>(VirtualAlloc(
+      reinterpret_cast<void *>(base), map_size, MEM_RESERVE | MEM_COMMIT,
+      PAGE_READWRITE));
+  Require(name, "allocation", memory == reinterpret_cast<void *>(base),
+          "fixed VirtualAlloc failed");
+  std::memset(memory, 0, static_cast<size_t>(map_size));
+
+  ResourceMutex resource_mutex;
+  PageManager page_manager(CacheFault, nullptr);
+  BufferCache buffer_cache(page_manager, resource_mutex);
+  TextureCache texture_cache(page_manager, buffer_cache, resource_mutex);
+  buffer_cache.SetTextureCache(texture_cache);
+  page_manager.OnGpuMap(depth_addr, depth_layout.size);
+  page_manager.OnGpuMap(stencil_addr, stencil_layout.size);
+
+  DepthTargetInfo info{};
+  info.address = depth_addr;
+  info.size = depth_layout.size;
+  info.stencil_address = stencil_addr;
+  info.stencil_size = stencil_layout.size;
+  info.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+  info.guest_format = Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
+  info.width = width;
+  info.height = height;
+  info.pitch = pitch;
+  info.bytes_per_element = 4;
+  info.tile_mode = Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
+  info.depth_load_clear = true;
+  info.stencil_load_clear = false;
+  info.stencil_access = true;
+
+  {
+    CommandBuffer command(GraphicContext::QUEUE_GFX);
+    auto *image = texture_cache.FindDepthTarget(&command, ctx, info);
+    Require(name, "bind",
+            image != nullptr && image->format == VK_FORMAT_D32_SFLOAT_S8_UINT &&
+                image->extent.width == width && image->extent.height == height,
+            "first stencil bind without explicit clear failed");
+  }
+
+  texture_cache.UnmapMemory(depth_addr, depth_layout.size);
+  texture_cache.UnmapMemory(stencil_addr, stencil_layout.size);
+  page_manager.OnGpuUnmap(depth_addr, depth_layout.size);
+  page_manager.OnGpuUnmap(stencil_addr, stencil_layout.size);
+  VirtualFree(reinterpret_cast<void *>(base), 0, MEM_RELEASE);
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 void CheckDepthTargetFootprints() {
@@ -11567,6 +12190,13 @@ int main(int argc, char **argv) {
     return 0;
   }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--stencil-first-bind-only") == 0) {
+    VulkanHarness vulkan;
+    Require("VulkanHarness", "dispatch", vulkan.TryInit(),
+            "no device with shaderStorageImageRead/WriteWithoutFormat");
+    CheckStencilFirstBindWithoutClear(&vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
     CheckImageOverlapResolution();
     return 0;
@@ -11600,6 +12230,8 @@ int main(int argc, char **argv) {
     CheckSampledColorViews();
     CheckBasicStorageTextureDescriptor();
     VulkanHarness vulkan;
+    Require("VulkanHarness", "dispatch", vulkan.TryInit(),
+            "no device with shaderStorageImageRead/WriteWithoutFormat");
     vulkan.CheckMutableRenderTargetBgraStorageView();
     RunCase(&vulkan, ImageStoreBgraUsesInverseSwizzle());
     return 0;
@@ -11609,12 +12241,16 @@ int main(int argc, char **argv) {
     CheckBasicStorageTextureDescriptor();
     CheckStorageTextureGpuOwnedRebindState();
     VulkanHarness vulkan;
+    Require("VulkanHarness", "dispatch", vulkan.TryInit(),
+            "no device with shaderStorageImageRead/WriteWithoutFormat");
     RunCase(&vulkan, ImageStoreYzwxUsesInverseSwizzle());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-sampled-only") == 0) {
     CheckStorageTextureSampledReuse();
     VulkanHarness vulkan;
+    Require("VulkanHarness", "dispatch", vulkan.TryInit(),
+            "no device with shaderStorageImageRead/WriteWithoutFormat");
     vulkan.CheckMutableStorageSrgbView();
     return 0;
   }
@@ -11678,19 +12314,43 @@ int main(int argc, char **argv) {
   CheckEmbeddedFetchLaneSpill();
   CheckPs5GameExampleImageClearRuntimeShape();
   VulkanHarness vulkan;
-  vulkan.CheckMutableStorageSrgbView();
-  vulkan.CheckMutableRenderTargetBgraStorageView();
+  const bool gpu_ready = vulkan.TryInit();
+  if (gpu_ready) {
+    if (g_render_ctx == nullptr) {
+      GraphicsRenderInit();
+    }
+    if (vulkan.GetGraphicContext() != nullptr) {
+      g_render_ctx->SetGraphicCtx(vulkan.GetGraphicContext());
+    }
+    vulkan.CheckMutableStorageSrgbView();
+    vulkan.CheckMutableRenderTargetBgraStorageView();
+    CheckStencilFirstBindWithoutClear(&vulkan);
+  } else {
+    std::fprintf(stderr,
+                 "[skip] Vulkan GPU: no device with storage-image-without-format; "
+                 "running compile-only shader cases\n");
+  }
   const auto tests = MakeCases();
   const auto graphics_tests = MakeGraphicsCases();
   CheckOpcodeCoverage(tests, graphics_tests);
   for (const auto &test : tests) {
-    RunCase(&vulkan, test);
+    if (gpu_ready) {
+      RunCase(&vulkan, test);
+      continue;
+    }
+    TestCase compile_only_test = test;
+    compile_only_test.compile_only = true;
+    RunCase(nullptr, compile_only_test);
   }
   for (const auto &test : MakeSkippedCases()) {
     std::printf("[skip]    %-32s %s\n", test.name, test.reason);
   }
   for (const auto &test : graphics_tests) {
-    RunGraphicsCase(&vulkan, test);
+    if (gpu_ready) {
+      RunGraphicsCase(&vulkan, test);
+    } else {
+      RunGraphicsCaseCompileOnly(test);
+    }
   }
   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
   return 0;

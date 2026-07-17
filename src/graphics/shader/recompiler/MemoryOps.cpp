@@ -21,7 +21,8 @@ constexpr MemoryOpcodeInfo SMEM_OPS[] = {
     {0x02u, Opcode::SLoadDwordx4, 4, 32},       {0x03u, Opcode::SLoadDwordx8, 8, 32},
     {0x04u, Opcode::SLoadDwordx16, 16, 32},     {0x08u, Opcode::SBufferLoadDword, 1, 32},
     {0x09u, Opcode::SBufferLoadDwordx2, 2, 32}, {0x0au, Opcode::SBufferLoadDwordx4, 4, 32},
-    {0x0bu, Opcode::SBufferLoadDwordx8, 8, 32}, {0x0cu, Opcode::SBufferLoadDwordx16, 16, 32},
+    {0x0bu, Opcode::SBufferLoadDwordx8, 8, 32},     {0x0cu, Opcode::SBufferLoadDwordx16, 16, 32},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraSMEM.inc"
 };
 
 constexpr MemoryOpcodeInfo MUBUF_OPS[] = {
@@ -57,6 +58,7 @@ constexpr MemoryOpcodeInfo MUBUF_OPS[] = {
     {0x39u, Opcode::BufferAtomicAnd, 1, 32},
     {0x3au, Opcode::BufferAtomicOr, 1, 32},
     {0x3bu, Opcode::BufferAtomicXor, 1, 32},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraMubufOps.inc"
 };
 
 constexpr MemoryOpcodeInfo MTBUF_OPS[] = {
@@ -68,6 +70,7 @@ constexpr MemoryOpcodeInfo MTBUF_OPS[] = {
     {0x05u, Opcode::TBufferStoreFormatXy, 2, 32, false, true, true},
     {0x06u, Opcode::TBufferStoreFormatXyz, 3, 32, false, true, true},
     {0x07u, Opcode::TBufferStoreFormatXyzw, 4, 32, false, true, true},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraMTBUF.inc"
 };
 
 constexpr MemoryOpcodeInfo FLAT_OPS[] = {
@@ -78,6 +81,12 @@ constexpr MemoryOpcodeInfo FLAT_OPS[] = {
     {0x18u, Opcode::FlatStoreByte, 1, 8},     {0x1au, Opcode::FlatStoreShort, 1, 16},
     {0x1cu, Opcode::FlatStoreDword, 1, 32},   {0x1du, Opcode::FlatStoreDwordx2, 2, 32},
     {0x1eu, Opcode::FlatStoreDwordx4, 4, 32}, {0x1fu, Opcode::FlatStoreDwordx3, 3, 32},
+    {0x30u, Opcode::BufferAtomicSwap, 1, 32}, {0x32u, Opcode::BufferAtomicAdd, 1, 32},
+    {0x33u, Opcode::BufferAtomicSub, 1, 32},  {0x35u, Opcode::BufferAtomicSMin, 1, 32},
+    {0x36u, Opcode::BufferAtomicUMin, 1, 32}, {0x37u, Opcode::BufferAtomicSMax, 1, 32},
+    {0x38u, Opcode::BufferAtomicUMax, 1, 32}, {0x39u, Opcode::BufferAtomicAnd, 1, 32},
+    {0x3au, Opcode::BufferAtomicOr, 1, 32},   {0x3bu, Opcode::BufferAtomicXor, 1, 32},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraMemoryOps.inc"
 };
 
 constexpr MemoryOpcodeInfo DS_OPS[] = {
@@ -105,6 +114,7 @@ constexpr MemoryOpcodeInfo DS_OPS[] = {
     {0xb0u, Opcode::DsWriteAddtidB32, 1, 32},   {0xb1u, Opcode::DsReadAddtidB32, 1, 32},
     {0xdeu, Opcode::DsWriteB96, 3, 32},         {0xdfu, Opcode::DsWriteB128, 4, 32},
     {0xfeu, Opcode::DsReadB96, 3, 32},          {0xffu, Opcode::DsReadB128, 4, 32},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraDS.inc"
 };
 
 const MemoryOpcodeInfo* LookupMemoryOpcode(const MemoryOpcodeInfo* ops, uint32_t count,
@@ -213,7 +223,97 @@ bool IsFlatStoreOpcode(Opcode opcode) {
 	}
 }
 
+bool IsFlatAtomicOpcode(Opcode opcode) {
+	switch (opcode) {
+		case Opcode::BufferAtomicSwap:
+		case Opcode::BufferAtomicAdd:
+		case Opcode::BufferAtomicSub:
+		case Opcode::BufferAtomicSMin:
+		case Opcode::BufferAtomicUMin:
+		case Opcode::BufferAtomicSMax:
+		case Opcode::BufferAtomicUMax:
+		case Opcode::BufferAtomicAnd:
+		case Opcode::BufferAtomicOr:
+		case Opcode::BufferAtomicXor:
+		case Opcode::BufferAtomicInc:
+		case Opcode::BufferAtomicDec:
+		case Opcode::BufferAtomicIncX2:
+		case Opcode::BufferAtomicDecX2:
+		case Opcode::BufferAtomicFmin:
+		case Opcode::BufferAtomicFmax:
+		case Opcode::BufferAtomicFminX2:
+		case Opcode::BufferAtomicFmaxX2:
+		case Opcode::BufferAtomicCsub:
+		case Opcode::BufferAtomicFcmpswap:
+		case Opcode::BufferAtomicFcmpswapX2: return true;
+		default: return false;
+	}
+}
+
 } // namespace
+
+bool DecodeFlatMemory(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                      Instruction* inst, std::string* error, uint32_t default_segment) {
+	if (word_index + 1u >= code.size()) {
+		if (error != nullptr) {
+			*error = fmt::format("truncated FLAT instruction at pc 0x{:08x}", pc);
+		}
+		return false;
+	}
+
+	const uint32_t word0  = code[word_index];
+	const uint32_t word1  = code[word_index + 1u];
+	const uint32_t offset = word0 & 0xfffu;
+	const uint32_t lds    = (word0 >> 13u) & 1u;
+	const uint32_t seg    = (word0 >> 14u) & 0x3u;
+	const uint32_t opcode = (word0 >> 18u) & 0x7fu;
+	const uint32_t vdst   = (word1 >> 24u) & 0xffu;
+	const uint32_t saddr  = (word1 >> 16u) & 0x7fu;
+	const uint32_t data   = (word1 >> 8u) & 0xffu;
+	const uint32_t addr   = word1 & 0xffu;
+	const uint32_t segment = seg != 0u ? seg : default_segment;
+
+	inst->pc             = pc;
+	inst->word           = word0;
+	inst->word_count     = 2;
+	inst->offset         = segment == 0u ? (offset & 0x7ffu) : SignExtendU32(offset, 12u);
+	inst->glc            = ((word0 >> 16u) & 1u) != 0;
+	inst->slc            = ((word0 >> 17u) & 1u) != 0;
+	inst->family         = Family::FLAT;
+	inst->opcode_id      = opcode;
+	inst->memory_segment = segment;
+	const auto* info =
+	    LookupMemoryOpcode(FLAT_OPS, static_cast<uint32_t>(std::size(FLAT_OPS)), opcode);
+	ApplyMemoryInfo(inst, info);
+	SetRawWords(inst, code, word_index, 2);
+
+	if (lds != 0u) {
+		SetUnsupported(inst, Family::FLAT, opcode, "FLAT LDS transfer is not implemented");
+		return true;
+	}
+	if (segment == 3u) {
+		SetUnsupported(inst, Family::FLAT, opcode, "reserved FLAT segment");
+		return true;
+	}
+	if (inst->opcode == Opcode::Unsupported) {
+		MarkMemoryUnsupported(inst, Family::FLAT, opcode, "FLAT opcode is not implemented");
+		return true;
+	}
+
+	const bool is_store  = IsFlatStoreOpcode(inst->opcode);
+	const bool is_atomic = IsFlatAtomicOpcode(inst->opcode);
+	DecodeVectorGpr(is_store || is_atomic ? data : vdst, &inst->dst, nullptr);
+	DecodeVectorGpr(addr, &inst->src0, nullptr);
+	inst->src_count = 1;
+	if (segment == 0u || saddr == 0x7du || saddr == 0x7fu) {
+		DecodeVectorGpr(addr + 1u, &inst->src1, nullptr);
+		inst->src_count = 2;
+	} else {
+		DecodeScalarSource(saddr, pc, &inst->src1, nullptr);
+		inst->src_count = 2;
+	}
+	return true;
+}
 
 bool DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction* inst,
                 std::string* error) {
@@ -347,59 +447,17 @@ bool DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 
 bool DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction* inst,
                 std::string* error) {
-	if (word_index + 1u >= code.size()) {
-		if (error != nullptr) {
-			*error = fmt::format("truncated FLAT instruction at pc 0x{:08x}", pc);
-		}
-		return false;
-	}
+	return DecodeFlatMemory(pc, code, word_index, inst, error, 0u);
+}
 
-	const uint32_t word0  = code[word_index];
-	const uint32_t word1  = code[word_index + 1u];
-	const uint32_t offset = word0 & 0xfffu;
-	const uint32_t dlc    = (word0 >> 12u) & 1u;
-	const uint32_t lds    = (word0 >> 13u) & 1u;
-	const uint32_t seg    = (word0 >> 14u) & 0x3u;
-	const uint32_t opcode = (word0 >> 18u) & 0x7fu;
-	const uint32_t vdst   = (word1 >> 24u) & 0xffu;
-	const uint32_t saddr  = (word1 >> 16u) & 0x7fu;
-	const uint32_t data   = (word1 >> 8u) & 0xffu;
-	const uint32_t addr   = word1 & 0xffu;
+bool DecodeGlobal(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                  Instruction* inst, std::string* error) {
+	return DecodeFlatMemory(pc, code, word_index, inst, error, 2u);
+}
 
-	inst->pc             = pc;
-	inst->word           = word0;
-	inst->word_count     = 2;
-	inst->offset         = seg == 0u ? (offset & 0x7ffu) : SignExtendU32(offset, 12u);
-	inst->glc            = ((word0 >> 16u) & 1u) != 0;
-	inst->slc            = ((word0 >> 17u) & 1u) != 0;
-	inst->family         = Family::FLAT;
-	inst->opcode_id      = opcode;
-	inst->memory_segment = seg;
-	const auto* info =
-	    LookupMemoryOpcode(FLAT_OPS, static_cast<uint32_t>(std::size(FLAT_OPS)), opcode);
-	ApplyMemoryInfo(inst, info);
-	SetRawWords(inst, code, word_index, 2);
-
-	if (dlc != 0 || lds != 0 || inst->glc || inst->slc || seg == 3u) {
-		SetUnsupported(inst, Family::FLAT, opcode, "FLAT modifiers or segment are not implemented");
-		return true;
-	}
-	if (inst->opcode == Opcode::Unsupported) {
-		MarkMemoryUnsupported(inst, Family::FLAT, opcode, "FLAT opcode is not implemented");
-		return true;
-	}
-
-	DecodeVectorGpr(IsFlatStoreOpcode(inst->opcode) ? data : vdst, &inst->dst, nullptr);
-	DecodeVectorGpr(addr, &inst->src0, nullptr);
-	inst->src_count = 1;
-	if (seg == 0u || saddr == 0x7du || saddr == 0x7fu) {
-		DecodeVectorGpr(addr + 1u, &inst->src1, nullptr);
-		inst->src_count = 2;
-	} else {
-		DecodeScalarSource(saddr, pc, &inst->src1, nullptr);
-		inst->src_count = 2;
-	}
-	return true;
+bool DecodeScratch(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                   Instruction* inst, std::string* error) {
+	return DecodeFlatMemory(pc, code, word_index, inst, error, 1u);
 }
 
 bool DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction* inst,

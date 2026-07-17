@@ -223,7 +223,21 @@ MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded, ResourceKi
 	mem.typed          = decoded.typed;
 	mem.formatted      = decoded.formatted;
 	mem.image_has_mip  = decoded.opcode == Decoder::Opcode::ImageLoadMip ||
-	                     decoded.opcode == Decoder::Opcode::ImageStoreMip;
+	                     decoded.opcode == Decoder::Opcode::ImageStoreMip ||
+	                     decoded.opcode == Decoder::Opcode::ImageLoadMipPck ||
+	                     decoded.opcode == Decoder::Opcode::ImageLoadMipPckSgn ||
+	                     decoded.opcode == Decoder::Opcode::ImageStoreMipPck;
+	mem.memory_addtid =
+	    decoded.opcode == Decoder::Opcode::FlatLoadDwordAddtid ||
+	    decoded.opcode == Decoder::Opcode::FlatStoreDwordAddtid ||
+	    decoded.opcode == Decoder::Opcode::DsWriteAddtidB32 ||
+	    decoded.opcode == Decoder::Opcode::DsReadAddtidB32;
+	mem.image_pck_signed = decoded.opcode == Decoder::Opcode::ImageLoadPckSgn ||
+	                       decoded.opcode == Decoder::Opcode::ImageLoadMipPckSgn;
+	mem.image_msaa       = decoded.opcode == Decoder::Opcode::ImageMsaaLoad;
+	mem.load_d16_hi      = decoded.opcode == Decoder::Opcode::FlatLoadShortD16Hi ||
+	                      decoded.opcode == Decoder::Opcode::FlatLoadUbyteD16Hi ||
+	                      decoded.opcode == Decoder::Opcode::FlatLoadSbyteD16Hi;
 	mem.glc            = decoded.glc;
 	mem.slc            = decoded.slc;
 	mem.idxen          = decoded.idxen;
@@ -658,8 +672,7 @@ bool LowerVectorMoveRelSource(const Decoder::Instruction& decoded, BasicBlock* b
 		return false;
 	}
 	if (decoded.dst.sdwa_sel != 6u || decoded.dst.omod != 0u || decoded.dst.clamp ||
-	    decoded.src0.sdwa_sel != 6u || decoded.src0.sdwa_sext || decoded.src0.negate ||
-	    decoded.src0.absolute || decoded.src0.dpp) {
+	    decoded.src0.sdwa_sel != 6u || decoded.src0.sdwa_sext) {
 		SetError(error, "V_MOVRELS_B32 modifiers are not implemented");
 		return false;
 	}
@@ -685,8 +698,7 @@ bool LowerVectorMoveRelDestination(const Decoder::Instruction& decoded, BasicBlo
 		return false;
 	}
 	if (decoded.dst.sdwa_sel != 6u || decoded.dst.omod != 0u || decoded.dst.clamp ||
-	    decoded.src0.sdwa_sel != 6u || decoded.src0.sdwa_sext || decoded.src0.negate ||
-	    decoded.src0.absolute || decoded.src0.dpp) {
+	    decoded.src0.sdwa_sel != 6u || decoded.src0.sdwa_sext) {
 		SetError(error, "V_MOVRELD_B32 modifiers are not implemented");
 		return false;
 	}
@@ -726,19 +738,69 @@ bool LowerVectorCarryOut(const Decoder::Instruction& decoded, BasicBlock* block,
                          std::string* error) {
 	Instruction inst;
 	inst.pc = decoded.pc;
-	inst.op =
-	    decoded.opcode == Decoder::Opcode::VAddI32 ? Opcode::IAddCarryU32 : Opcode::ISubBorrowU32;
-	inst.src_count   = decoded.opcode == Decoder::Opcode::VAddI32 ? 3u : 2u;
-	const auto& src0 = decoded.opcode == Decoder::Opcode::VSubrevI32 ? decoded.src1 : decoded.src0;
-	const auto& src1 = decoded.opcode == Decoder::Opcode::VSubrevI32 ? decoded.src0 : decoded.src1;
+	switch (decoded.opcode) {
+		case Decoder::Opcode::VAddI32:
+		case Decoder::Opcode::VAddCoU32:
+			inst.op = Opcode::IAddCarryU32;
+			break;
+		case Decoder::Opcode::VSubI32:
+		case Decoder::Opcode::VSubCoU32:
+			inst.op = Opcode::ISubBorrowU32;
+			break;
+		case Decoder::Opcode::VSubrevI32:
+		case Decoder::Opcode::VSubrevCoU32:
+			inst.op = Opcode::ISubBorrowU32;
+			break;
+		default: return false;
+	}
+	const bool is_add = inst.op == Opcode::IAddCarryU32;
+	inst.src_count    = is_add ? 3u : 2u;
+	const bool subrev = decoded.opcode == Decoder::Opcode::VSubrevI32 ||
+	                    decoded.opcode == Decoder::Opcode::VSubrevCoU32;
+	const auto& src0  = subrev ? decoded.src1 : decoded.src0;
+	const auto& src1  = subrev ? decoded.src0 : decoded.src1;
 	if (!LowerRegisterOperand(decoded.dst, &inst.dst, error) ||
 	    !LowerRegisterOperand(decoded.dst2, &inst.dst2, error) ||
 	    !LowerSourceOperand(src0, &inst.src[0], error) ||
 	    !LowerSourceOperand(src1, &inst.src[1], error)) {
 		return false;
 	}
-	if (decoded.opcode == Decoder::Opcode::VAddI32) {
+	if (is_add) {
 		inst.src[2] = MakeImmediateU32(0);
+	}
+	block->instructions.push_back(inst);
+	return true;
+}
+
+bool LowerVectorDivScale(const Decoder::Instruction& decoded, BasicBlock* block,
+                         std::string* error) {
+	Instruction inst;
+	inst.pc        = decoded.pc;
+	inst.op        = decoded.opcode == Decoder::Opcode::VDivScaleF64 ? Opcode::DivScaleF64
+	                                                                 : Opcode::DivScaleF32;
+	inst.src_count = 3;
+	if (!LowerRegisterOperand(decoded.dst, &inst.dst, error) ||
+	    !LowerSourceOperand(decoded.src0, &inst.src[0], error) ||
+	    !LowerSourceOperand(decoded.src2, &inst.src[2], error) ||
+	    !LowerSourceOperand(decoded.src1, &inst.src[1], error)) {
+		return false;
+	}
+	block->instructions.push_back(inst);
+	return true;
+}
+
+bool LowerVectorMadI64I32(const Decoder::Instruction& decoded, BasicBlock* block,
+                          std::string* error) {
+	Instruction inst;
+	inst.pc        = decoded.pc;
+	inst.op        = Opcode::IMadI64I32;
+	inst.src_count = 3;
+	if (!LowerRegisterOperand(decoded.dst, &inst.dst, error) ||
+	    !LowerRegisterOperand(decoded.dst2, &inst.dst2, error) ||
+	    !LowerSourceOperand(decoded.src0, &inst.src[0], error) ||
+	    !LowerSourceOperand(decoded.src1, &inst.src[1], error) ||
+	    !LowerSourceOperand(decoded.src2, &inst.src[2], error)) {
+		return false;
 	}
 	block->instructions.push_back(inst);
 	return true;
@@ -858,7 +920,7 @@ bool LowerVInterpLoadF32(const Decoder::Instruction& decoded, BasicBlock* block,
                          std::string* error) {
 	// Modes 0/1/2 all load an input channel for now; perspective-specific behavior is folded
 	// into the pixel shader input fetch path.
-	if (decoded.opcode == Decoder::Opcode::VInterpMovF32 && decoded.src0.value > 2u) {
+	if (decoded.opcode == Decoder::Opcode::VInterpMovF32 && decoded.src0.value > 3u) {
 		if (error != nullptr) {
 			*error = fmt::format("v_interp_mov_f32 mode {} is not implemented at pc 0x{:08x}",
 			                     decoded.src0.value, decoded.pc);
@@ -1103,6 +1165,9 @@ bool LowerDecodedInstruction(const Decoder::Instruction& inst, BasicBlock* block
 		case Decoder::Opcode::VMovrelsB32: return LowerVectorMoveRelSource(inst, block, error);
 		case Decoder::Opcode::VAddcU32: return LowerVectorAddCarry(inst, block, error);
 		case Decoder::Opcode::VMadU64U32: return LowerVectorMadU64U32(inst, block, error);
+		case Decoder::Opcode::VMadI64I32: return LowerVectorMadI64I32(inst, block, error);
+		case Decoder::Opcode::VDivScaleF32:
+		case Decoder::Opcode::VDivScaleF64: return LowerVectorDivScale(inst, block, error);
 		case Decoder::Opcode::VMacF32: return LowerVectorMacF32(inst, block, error);
 		case Decoder::Opcode::VPkFmacF16: return LowerVectorPkFmacF16(inst, block, error);
 		case Decoder::Opcode::VFmacF16: return LowerVectorFmacF16(inst, block, error);

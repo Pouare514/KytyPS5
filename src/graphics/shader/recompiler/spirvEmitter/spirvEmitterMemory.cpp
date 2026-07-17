@@ -380,9 +380,16 @@ uint32_t EmitDwordIndex(EmitterState* state, const IR::Instruction& inst, uint32
 uint32_t EmitMemoryDwordIndex(EmitterState* state, const IR::Instruction& inst,
                               const IR::MemoryInfo& mem, uint32_t first_src, uint32_t src_count) {
 	const auto address = EmitMemoryByteAddress(state, inst, mem, first_src, src_count);
-	const auto index   = state->builder.AllocateId();
+	auto       index   = state->builder.AllocateId();
 	state->builder.AddFunction(
 	    {OpShiftRightLogical, state->uint_type, index, address, ConstantU32(state, 2)});
+	if (mem.memory_addtid && IsFlatMemoryKind(mem.kind) && state->stage == ShaderType::Compute) {
+		const auto lane = state->builder.AllocateId();
+		state->builder.AddFunction(
+		    {OpBitwiseAnd, state->uint_type, lane, EmitLocalInvocationIndex(state),
+		     ConstantU32(state, 63)});
+		index = EmitAddU32(state, index, lane);
+	}
 	return index;
 }
 
@@ -594,8 +601,14 @@ uint32_t EmitMemoryLoadSubDwordValueU32(EmitterState* state, const IR::Instructi
 void EmitMemoryLoadSubDwordU32(EmitterState* state, const IR::Instruction& inst,
                                IR::ResourceKind kind, uint32_t first_src, uint32_t src_count,
                                uint32_t data_bits, bool sign_extend) {
-	const auto value = EmitMemoryLoadSubDwordValueU32(state, inst, kind, first_src, src_count,
-	                                                  data_bits, sign_extend);
+	auto value = EmitMemoryLoadSubDwordValueU32(state, inst, kind, first_src, src_count, data_bits,
+	                                            sign_extend);
+	if (inst.memory.load_d16_hi) {
+		const auto shifted = state->builder.AllocateId();
+		state->builder.AddFunction(
+		    {OpShiftRightLogical, state->uint_type, shifted, value, ConstantU32(state, 16)});
+		value = shifted;
+	}
 	EmitStoreU32(state, inst.dst, value);
 }
 
@@ -1107,6 +1120,20 @@ void EmitDeviceAtomicMemoryBarrier(EmitterState* state) {
 }
 
 void EmitAtomicU32(EmitterState* state, const IR::Instruction& inst, uint32_t opcode) {
+	const auto finalize_atomic_result = [&](uint32_t old, uint32_t value) {
+		uint32_t result = old;
+		if (inst.memory.data_dwords >= 2u && opcode == OpAtomicIAdd) {
+			const auto incremented = state->builder.AllocateId();
+			state->builder.AddFunction({OpIAdd, state->uint_type, incremented, old, value});
+			result = incremented;
+		} else if (inst.memory.data_dwords >= 2u && opcode == OpAtomicISub) {
+			const auto decremented = state->builder.AllocateId();
+			state->builder.AddFunction({OpISub, state->uint_type, decremented, old, value});
+			result = decremented;
+		}
+		EmitStoreU32(state, inst.dst, result);
+	};
+
 	if (IsStorageBufferMemoryKind(inst.memory.kind)) {
 		const auto index =
 		    EmitMemoryDwordIndex(state, inst, inst.memory, 1, AddressSourceCount(inst, 1));
@@ -1122,7 +1149,7 @@ void EmitAtomicU32(EmitterState* state, const IR::Instruction& inst, uint32_t op
 			EmitDeviceAtomicMemoryBarrier(state);
 			return result;
 		});
-		EmitStoreU32(state, inst.dst, old);
+		finalize_atomic_result(old, value);
 		return;
 	}
 	if (inst.memory.kind == IR::ResourceKind::Gds) {
@@ -1138,7 +1165,7 @@ void EmitAtomicU32(EmitterState* state, const IR::Instruction& inst, uint32_t op
 			EmitDeviceAtomicMemoryBarrier(state);
 			return result;
 		});
-		EmitStoreU32(state, inst.dst, old);
+		finalize_atomic_result(old, value);
 		return;
 	}
 
@@ -1157,7 +1184,52 @@ void EmitAtomicU32(EmitterState* state, const IR::Instruction& inst, uint32_t op
 	    inst.memory.kind == IR::ResourceKind::Gds) {
 		EmitDeviceAtomicMemoryBarrier(state);
 	}
-	EmitStoreU32(state, inst.dst, old);
+	finalize_atomic_result(old, value);
+}
+
+void EmitAtomicF32(EmitterState* state, const IR::Instruction& inst, uint32_t opcode) {
+	state->uses_shader_atomic_float = true;
+	const auto pointer = EmitAtomicPointer(state, inst);
+	if (pointer == 0) {
+		EmitStoreU32(state, inst.dst, ConstantU32(state, 0));
+		return;
+	}
+	const auto value_bits = EmitValueLoad(state, inst.src[0]);
+	const auto value_f    = state->builder.AllocateId();
+	state->builder.AddFunction({OpBitcast, state->float_type, value_f, value_bits});
+	const auto old_f = state->builder.AllocateId();
+	const auto scope = inst.memory.kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
+	state->builder.AddFunction({opcode, state->float_type, old_f, pointer, ConstantU32(state, scope),
+	                            ConstantU32(state, MemorySemanticsNone), value_f});
+	const auto old_bits = state->builder.AllocateId();
+	state->builder.AddFunction({OpBitcast, state->uint_type, old_bits, old_f});
+	EmitStoreU32(state, inst.dst, old_bits);
+}
+
+void EmitAtomicCsubU32(EmitterState* state, const IR::Instruction& inst) {
+	const auto pointer = EmitAtomicPointer(state, inst);
+	if (pointer == 0) {
+		EmitStoreU32(state, inst.dst, ConstantU32(state, 0));
+		return;
+	}
+	const auto data      = EmitValueLoad(state, inst.src[0]);
+	const auto loaded    = state->builder.AllocateId();
+	const auto exchanged = state->builder.AllocateId();
+	const auto scope     = inst.memory.kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
+	const auto diff      = state->builder.AllocateId();
+	const auto clamped   = state->builder.AllocateId();
+	const auto nonneg    = state->builder.AllocateId();
+	state->builder.AddFunction({OpAtomicLoad, state->uint_type, loaded, pointer,
+	                            ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone)});
+	state->builder.AddFunction({OpISub, state->uint_type, diff, loaded, data});
+	state->builder.AddFunction(
+	    {OpUGreaterThanEqual, state->bool_type, nonneg, diff, ConstantU32(state, 0)});
+	state->builder.AddFunction(
+	    {OpSelect, state->uint_type, clamped, nonneg, diff, ConstantU32(state, 0)});
+	state->builder.AddFunction({OpAtomicExchange, state->uint_type, exchanged, pointer,
+	                            ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone),
+	                            clamped});
+	EmitStoreU32(state, inst.dst, exchanged);
 }
 
 void EmitSLoadDword(EmitterState* state, const IR::Instruction& inst) {

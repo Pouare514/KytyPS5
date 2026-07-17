@@ -36,6 +36,7 @@ constexpr OpcodeMap VOP2_OPS[] = {
     {0x36u, Opcode::VFmacF16},       {0x37u, Opcode::VFmamkF16},
     {0x38u, Opcode::VFmaakF16},      {0x39u, Opcode::VMaxF16},
     {0x3au, Opcode::VMinF16},        {0x3cu, Opcode::VPkFmacF16},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraVOP2.inc"
 };
 
 constexpr OpcodeMap VOP1_OPS[] = {
@@ -87,6 +88,7 @@ constexpr OpcodeMap VOP1_OPS[] = {
     {0x5cu, Opcode::VCeilF16},
     {0x5du, Opcode::VTruncF16},
     {0x5eu, Opcode::VRndneF16},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraVOP1.inc"
 };
 
 constexpr OpcodeMap VOP3_ENCODED_VOP1_OPS[] = {
@@ -163,7 +165,8 @@ constexpr OpcodeMap VOPC_OPS[] = {
     {0xcbu, Opcode::VCmpLeF16},    {0xccu, Opcode::VCmpGtF16},   {0xcdu, Opcode::VCmpLgF16},
     {0xceu, Opcode::VCmpGeF16},    {0xedu, Opcode::VCmpNeqF16},  {0xd9u, Opcode::VCmpxLtF16},
     {0xdau, Opcode::VCmpxEqF16},   {0xdbu, Opcode::VCmpxLeF16},  {0xdcu, Opcode::VCmpxGtF16},
-    {0xdeu, Opcode::VCmpxGeF16},   {0xfdu, Opcode::VCmpxNeqF16}, {0xfeu, Opcode::VCmpxNltF16},
+    {0xdeu, Opcode::VCmpxGeF16},   {0xfdu, Opcode::VCmpxNeqF16},     {0xfeu, Opcode::VCmpxNltF16},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraVOPC.inc"
 };
 
 constexpr OpcodeMap VOP3_OPS[] = {
@@ -201,6 +204,7 @@ constexpr OpcodeMap VOP3_OPS[] = {
     {0x371u, Opcode::VAndOrB32},        {0x372u, Opcode::VOr3B32},
     {0x377u, Opcode::VPermlane16B32},   {0x378u, Opcode::VPermlanex16B32},
     {0x34bu, Opcode::VFmaF16},          {0x36du, Opcode::VAdd3U32},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraVOP3.inc"
 };
 
 constexpr OpcodeMap VOP3P_OPS[] = {
@@ -212,6 +216,7 @@ constexpr OpcodeMap VOP3P_OPS[] = {
     {0x0fu, Opcode::VPkAddF16},     {0x10u, Opcode::VPkMulF16},     {0x11u, Opcode::VPkMinF16},
     {0x12u, Opcode::VPkMaxF16},     {0x20u, Opcode::VFmaF32},       {0x21u, Opcode::VMadMixloF16},
     {0x22u, Opcode::VMadMixhiF16},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraVOP3P.inc"
 };
 
 Opcode Lookup(const OpcodeMap* ops, uint32_t count, uint32_t opcode) {
@@ -280,11 +285,17 @@ bool UsesScalarDestination(Opcode opcode) {
 }
 
 bool IsVop3BCarryOutOpcode(Opcode opcode) {
-	return opcode == Opcode::VAddI32 || opcode == Opcode::VSubI32 || opcode == Opcode::VSubrevI32;
+	return opcode == Opcode::VAddI32 || opcode == Opcode::VSubI32 || opcode == Opcode::VSubrevI32 ||
+	       opcode == Opcode::VAddCoU32 || opcode == Opcode::VSubCoU32 ||
+	       opcode == Opcode::VSubrevCoU32;
 }
 
 bool IsVop3BMadU64Opcode(Opcode opcode) {
-	return opcode == Opcode::VMadU64U32;
+	return opcode == Opcode::VMadU64U32 || opcode == Opcode::VMadI64I32;
+}
+
+bool IsVop3BDivScaleOpcode(Opcode opcode) {
+	return opcode == Opcode::VDivScaleF32 || opcode == Opcode::VDivScaleF64;
 }
 
 bool IsPermlaneOpcode(Opcode opcode) {
@@ -1356,7 +1367,7 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 	const bool result_modifiers = SupportsNativeVop3ResultModifiers(opcode);
 
 	if (permlane) {
-		return abs != 0u || (op_sel & ~0x3u) != 0u || clamp != 0u || omod != 0u || neg != 0u;
+		return abs != 0u || clamp != 0u || omod != 0u || neg != 0u;
 	}
 	if (mad_mix) {
 		return clamp != 0u || omod != 0u;
@@ -1379,6 +1390,9 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 			return (abs & ~0x3u) != 0u || (op_sel & ~0x3u) != 0u || clamp != 0u || omod != 0u ||
 			       (neg & ~0x3u) != 0u;
 		default: break;
+	}
+	if (source_modifiers && result_modifiers) {
+		return false;
 	}
 	if (source_modifiers) {
 		return op_sel != 0u || (omod != 0u && !result_modifiers) ||
@@ -1585,6 +1599,7 @@ bool DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const bool addc                    = inst->opcode == Opcode::VAddcU32 && opcode == 0x128u;
 	const bool vop3b_carry_out         = IsVop3BCarryOutOpcode(inst->opcode);
 	const bool vop3b_mad_u64           = IsVop3BMadU64Opcode(inst->opcode);
+	const bool vop3b_div_scale         = IsVop3BDivScaleOpcode(inst->opcode);
 	const bool vop3b_uses_sdst         = addc || vop3b_carry_out || vop3b_mad_u64;
 	const bool mad_mix                 = false;
 	const bool f16_ternary             = IsNativeVop3F16TernaryOpcode(inst->opcode);
@@ -1602,10 +1617,8 @@ bool DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	                                      scalar_modifier_limits, abs, op_sel, clamp, omod, neg);
 	if (modifiers) {
 		SetUnsupported(inst, Family::VOP3, opcode,
-		               permlane && (op_sel & ~0x3u) != 0
-		                   ? "VOP3 perm-lane op_sel bits are not implemented"
-		               : mad_mix ? "VOP3 mad-mix clamp/omod is not implemented"
-		                         : "VOP3 source modifiers are not implemented");
+		               mad_mix ? "VOP3 mad-mix clamp/omod is not implemented"
+		                       : "VOP3 source modifiers are not implemented");
 		return true;
 	}
 	if (inst->opcode == Opcode::Unsupported) {
@@ -1676,6 +1689,17 @@ bool DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 			return false;
 		}
 		inst->src_count = 3;
+		return ReadLiteralOperands(code, word_index, inst, error);
+	}
+	if (vop3b_div_scale) {
+		if (!DecodeScalarSource(src1, pc, &inst->src1, error) ||
+		    !DecodeScalarSource(src2, pc, &inst->src2, error)) {
+			return false;
+		}
+		inst->src_count = 3;
+		if (native_source_modifiers) {
+			ApplyNativeVop3SourceModifiers(inst, abs, neg);
+		}
 		return ReadLiteralOperands(code, word_index, inst, error);
 	}
 	if (IsVop3EncodedVop2(opcode)) {

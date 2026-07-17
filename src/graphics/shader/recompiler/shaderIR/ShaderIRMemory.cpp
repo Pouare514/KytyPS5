@@ -111,20 +111,114 @@ bool LowerBufferStore(const Decoder::Instruction& decoded, BasicBlock* block, st
 	return true;
 }
 
+Opcode BufferAtomicIrOpcode(Decoder::Opcode opcode) {
+	switch (opcode) {
+		case Decoder::Opcode::BufferAtomicSwap: return Opcode::AtomicSwapU32;
+		case Decoder::Opcode::BufferAtomicAdd: return Opcode::AtomicAddU32;
+		case Decoder::Opcode::BufferAtomicSub: return Opcode::AtomicSubU32;
+		case Decoder::Opcode::BufferAtomicSMin: return Opcode::AtomicSMinI32;
+		case Decoder::Opcode::BufferAtomicUMin: return Opcode::AtomicUMinU32;
+		case Decoder::Opcode::BufferAtomicSMax: return Opcode::AtomicSMaxI32;
+		case Decoder::Opcode::BufferAtomicUMax: return Opcode::AtomicUMaxU32;
+		case Decoder::Opcode::BufferAtomicAnd: return Opcode::AtomicAndU32;
+		case Decoder::Opcode::BufferAtomicOr: return Opcode::AtomicOrU32;
+		case Decoder::Opcode::BufferAtomicXor: return Opcode::AtomicXorU32;
+		case Decoder::Opcode::BufferAtomicInc: return Opcode::AtomicIncU32;
+		case Decoder::Opcode::BufferAtomicDec: return Opcode::AtomicDecU32;
+		case Decoder::Opcode::BufferAtomicFmin: return Opcode::AtomicFMinF32;
+		case Decoder::Opcode::BufferAtomicFmax: return Opcode::AtomicFMaxF32;
+		case Decoder::Opcode::BufferAtomicFcmpswap: return Opcode::AtomicFcmpswapF32;
+		case Decoder::Opcode::BufferAtomicCsub: return Opcode::AtomicCsubU32;
+		case Decoder::Opcode::BufferAtomicIncX2: return Opcode::AtomicIncU32;
+		case Decoder::Opcode::BufferAtomicDecX2: return Opcode::AtomicDecU32;
+		case Decoder::Opcode::BufferAtomicFminX2: return Opcode::AtomicFMinF32;
+		case Decoder::Opcode::BufferAtomicFmaxX2: return Opcode::AtomicFMaxF32;
+		case Decoder::Opcode::BufferAtomicFcmpswapX2: return Opcode::AtomicFcmpswapF32;
+		default: break;
+	}
+	const auto name = Decoder::OpcodeToString(opcode);
+	if (name.find("atomic_inc") != std::string::npos) {
+		return Opcode::AtomicIncU32;
+	}
+	if (name.find("atomic_dec") != std::string::npos) {
+		return Opcode::AtomicDecU32;
+	}
+	if (name.find("atomic_cmpswap") != std::string::npos ||
+	    name.find("atomic_swap") != std::string::npos) {
+		return Opcode::AtomicSwapU32;
+	}
+	if (name.find("atomic_add") != std::string::npos) {
+		return Opcode::AtomicAddU32;
+	}
+	if (name.find("atomic_sub") != std::string::npos) {
+		return Opcode::AtomicSubU32;
+	}
+	if (name.find("atomic_smin") != std::string::npos) {
+		return Opcode::AtomicSMinI32;
+	}
+	if (name.find("atomic_umin") != std::string::npos) {
+		return Opcode::AtomicUMinU32;
+	}
+	if (name.find("atomic_smax") != std::string::npos) {
+		return Opcode::AtomicSMaxI32;
+	}
+	if (name.find("atomic_umax") != std::string::npos) {
+		return Opcode::AtomicUMaxU32;
+	}
+	if (name.find("atomic_and") != std::string::npos) {
+		return Opcode::AtomicAndU32;
+	}
+	if (name.find("atomic_or") != std::string::npos) {
+		return Opcode::AtomicOrU32;
+	}
+	if (name.find("atomic_xor") != std::string::npos) {
+		return Opcode::AtomicXorU32;
+	}
+	return Opcode::AtomicAddU32;
+}
+
 bool LowerBufferAtomicDword(const Decoder::Instruction& decoded, BasicBlock* block, Opcode op,
                             std::string* error) {
 	Instruction inst;
-	inst.pc       = decoded.pc;
-	inst.op       = op;
-	inst.memory   = MemoryInfoFromDecoded(decoded, ResourceKind::Buffer);
+	inst.pc     = decoded.pc;
+	inst.op     = op;
+	const bool  is_flat = decoded.family == Decoder::Family::FLAT;
+	const bool  implicit_inc_dec = op == Opcode::AtomicIncU32 || op == Opcode::AtomicDecU32;
+	const auto  kind =
+	    is_flat ? FlatSegmentResourceKind(decoded.memory_segment) : ResourceKind::Buffer;
+	inst.memory = MemoryInfoFromDecoded(decoded, kind);
+	if (is_flat) {
+		inst.memory.resource = 0;
+	}
 	inst.dst.kind = OperandKind::Null;
-	if ((decoded.glc && !LowerRegisterOperand(decoded.dst, &inst.dst, error)) ||
-	    !LowerSourceOperand(decoded.dst, &inst.src[0], error) ||
-	    !LowerBufferAddressSources(decoded, &inst, 1, error)) {
+	const bool returns_old = decoded.glc || (is_flat && implicit_inc_dec);
+	if (returns_old && !LowerRegisterOperand(decoded.dst, &inst.dst, error)) {
+		return false;
+	}
+	if (implicit_inc_dec) {
+		inst.src[0].kind = OperandKind::ImmediateU32;
+		inst.src[0].imm  = 1;
+	} else if ((decoded.glc && !LowerRegisterOperand(decoded.dst, &inst.dst, error)) ||
+	           !LowerSourceOperand(decoded.dst, &inst.src[0], error)) {
+		return false;
+	}
+	if (is_flat) {
+		inst.src_count = decoded.src_count + 1u;
+		for (uint32_t i = 0; i < decoded.src_count && i + 1u < 3u; i++) {
+			if (!LowerSourceOperand(DecodedSourceAt(decoded, i), &inst.src[i + 1u], error)) {
+				return false;
+			}
+		}
+	} else if (!LowerBufferAddressSources(decoded, &inst, 1, error)) {
 		return false;
 	}
 	block->instructions.push_back(inst);
 	return true;
+}
+
+bool LowerBufferAtomicOpcode(const Decoder::Instruction& decoded, BasicBlock* block,
+                             std::string* error) {
+	return LowerBufferAtomicDword(decoded, block, BufferAtomicIrOpcode(decoded.opcode), error);
 }
 
 ResourceKind DsMemoryKind(const Decoder::Instruction& decoded) {
@@ -432,8 +526,12 @@ bool LowerImageOperation(const Decoder::Instruction& decoded, BasicBlock* block,
 	Instruction inst;
 	inst.pc = decoded.pc;
 	if (decoded.opcode == Decoder::Opcode::ImageStore ||
-	    decoded.opcode == Decoder::Opcode::ImageStoreMip) {
-		inst.op             = Opcode::ImageStore;
+	    decoded.opcode == Decoder::Opcode::ImageStoreMip ||
+	    decoded.opcode == Decoder::Opcode::ImageStorePck ||
+	    decoded.opcode == Decoder::Opcode::ImageStoreMipPck) {
+		inst.op = decoded.opcode == Decoder::Opcode::ImageStorePck       ? Opcode::ImageStorePck
+		        : decoded.opcode == Decoder::Opcode::ImageStoreMipPck ? Opcode::ImageStoreMipPck
+		                                                              : Opcode::ImageStore;
 		inst.src_count      = 2;
 		inst.memory         = MemoryInfoFromDecoded(decoded, ResourceKind::StorageImage);
 		inst.memory.sampler = 0;
@@ -446,20 +544,50 @@ bool LowerImageOperation(const Decoder::Instruction& decoded, BasicBlock* block,
 		return true;
 	}
 
-	inst.op        = decoded.opcode == Decoder::Opcode::ImageGetResinfo ? Opcode::ImageGetResinfo
-	                 : decoded.opcode == Decoder::Opcode::ImageGetLod   ? Opcode::ImageGetLod
-	                 : decoded.opcode == Decoder::Opcode::ImageLoad ||
-	                         decoded.opcode == Decoder::Opcode::ImageLoadMip
-	                     ? Opcode::ImageLoad
-	                 : decoded.opcode == Decoder::Opcode::ImageGather4Lz ||
-	                         decoded.opcode == Decoder::Opcode::ImageGather4C ||
-	                         decoded.opcode == Decoder::Opcode::ImageGather4CLz ||
-	                         decoded.opcode == Decoder::Opcode::ImageGather4LzO ||
-	                         decoded.opcode == Decoder::Opcode::ImageGather4CO ||
-	                         decoded.opcode == Decoder::Opcode::ImageGather4CLzO ||
-	                         decoded.opcode == Decoder::Opcode::ImageGather4H
-	                     ? Opcode::ImageGather4
-	                     : Opcode::ImageSample;
+	inst.op = [&]() -> Opcode {
+		switch (decoded.opcode) {
+			case Decoder::Opcode::ImageGetResinfo: return Opcode::ImageGetResinfo;
+			case Decoder::Opcode::ImageGetLod: return Opcode::ImageGetLod;
+			case Decoder::Opcode::ImageLoadPck: return Opcode::ImageLoadPck;
+			case Decoder::Opcode::ImageLoadPckSgn: return Opcode::ImageLoadPckSgn;
+			case Decoder::Opcode::ImageLoadMipPck: return Opcode::ImageLoadMipPck;
+			case Decoder::Opcode::ImageLoadMipPckSgn: return Opcode::ImageLoadMipPckSgn;
+			case Decoder::Opcode::ImageMsaaLoad: return Opcode::ImageMsaaLoad;
+			case Decoder::Opcode::ImageBvhIntersectRay: return Opcode::ImageBvhIntersectRay;
+			case Decoder::Opcode::ImageBvh64IntersectRay: return Opcode::ImageBvh64IntersectRay;
+			case Decoder::Opcode::ImageLoad:
+			case Decoder::Opcode::ImageLoadMip: return Opcode::ImageLoad;
+			default: break;
+		}
+		if (decoded.opcode == Decoder::Opcode::ImageGather4Lz ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4C ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4CLz ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4LzO ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4CO ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4CLzO ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4H ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4 ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4Cl ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4L ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4B ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4BCl ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4CCl ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4CL ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4CB ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4CBCl ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4O ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4ClO ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4LO ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4BO ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4BClO ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4CClO ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4CLO ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4CBO ||
+		    decoded.opcode == Decoder::Opcode::ImageGather4CBClO) {
+			return Opcode::ImageGather4;
+		}
+		return Opcode::ImageSample;
+	}();
 	inst.src_count = 1;
 	inst.memory    = MemoryInfoFromDecoded(decoded, ResourceKind::Image);
 	if (!LowerRegisterOperand(decoded.dst, &inst.dst, error) ||
@@ -539,6 +667,40 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock* blo
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicOrU32, error);
 		case Decoder::Opcode::BufferAtomicXor:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicXorU32, error);
+		case Decoder::Opcode::BufferAtomicSwapX2:
+			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicSwapU32, error);
+		case Decoder::Opcode::BufferAtomicAddX2:
+			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicAddU32, error);
+		case Decoder::Opcode::BufferAtomicSubX2:
+			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicSubU32, error);
+		case Decoder::Opcode::BufferAtomicSminX2:
+			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicSMinI32, error);
+		case Decoder::Opcode::BufferAtomicUminX2:
+			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicUMinU32, error);
+		case Decoder::Opcode::BufferAtomicSmaxX2:
+			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicSMaxI32, error);
+		case Decoder::Opcode::BufferAtomicUmaxX2:
+			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicUMaxU32, error);
+		case Decoder::Opcode::BufferAtomicAndX2:
+			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicAndU32, error);
+		case Decoder::Opcode::BufferAtomicOrX2:
+			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicOrU32, error);
+		case Decoder::Opcode::BufferAtomicXorX2:
+			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicXorU32, error);
+		case Decoder::Opcode::BufferAtomicCmpswap:
+		case Decoder::Opcode::BufferAtomicCmpswapX2:
+		case Decoder::Opcode::BufferAtomicInc:
+		case Decoder::Opcode::BufferAtomicDec:
+		case Decoder::Opcode::BufferAtomicIncX2:
+		case Decoder::Opcode::BufferAtomicDecX2:
+		case Decoder::Opcode::BufferAtomicFcmpswap:
+		case Decoder::Opcode::BufferAtomicFcmpswapX2:
+		case Decoder::Opcode::BufferAtomicFmin:
+		case Decoder::Opcode::BufferAtomicFmax:
+		case Decoder::Opcode::BufferAtomicFminX2:
+		case Decoder::Opcode::BufferAtomicFmaxX2:
+		case Decoder::Opcode::BufferAtomicCsub:
+			return LowerBufferAtomicOpcode(decoded, block, error);
 		case Decoder::Opcode::FlatLoadUbyte:
 		case Decoder::Opcode::FlatLoadSbyte:
 		case Decoder::Opcode::FlatLoadUshort:
@@ -546,13 +708,23 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock* blo
 		case Decoder::Opcode::FlatLoadDword:
 		case Decoder::Opcode::FlatLoadDwordx2:
 		case Decoder::Opcode::FlatLoadDwordx3:
-		case Decoder::Opcode::FlatLoadDwordx4: return LowerFlatLoad(decoded, block, error);
+		case Decoder::Opcode::FlatLoadDwordx4:
+		case Decoder::Opcode::FlatLoadShortD16:
+		case Decoder::Opcode::FlatLoadShortD16Hi:
+		case Decoder::Opcode::FlatLoadUbyteD16:
+		case Decoder::Opcode::FlatLoadUbyteD16Hi:
+		case Decoder::Opcode::FlatLoadSbyteD16:
+		case Decoder::Opcode::FlatLoadSbyteD16Hi:
+		case Decoder::Opcode::FlatLoadDwordAddtid: return LowerFlatLoad(decoded, block, error);
 		case Decoder::Opcode::FlatStoreByte:
 		case Decoder::Opcode::FlatStoreShort:
 		case Decoder::Opcode::FlatStoreDword:
 		case Decoder::Opcode::FlatStoreDwordx2:
 		case Decoder::Opcode::FlatStoreDwordx3:
-		case Decoder::Opcode::FlatStoreDwordx4: return LowerFlatStore(decoded, block, error);
+		case Decoder::Opcode::FlatStoreDwordx4:
+		case Decoder::Opcode::FlatStoreByteD16Hi:
+		case Decoder::Opcode::FlatStoreShortD16Hi:
+		case Decoder::Opcode::FlatStoreDwordAddtid: return LowerFlatStore(decoded, block, error);
 		case Decoder::Opcode::DsAddU32:
 			return LowerDsAtomicU32(decoded, block, Opcode::AtomicAddU32, false, error);
 		case Decoder::Opcode::DsAddRtnU32:
@@ -627,13 +799,40 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock* blo
 		case Decoder::Opcode::ImageGetLod:
 		case Decoder::Opcode::ImageLoad:
 		case Decoder::Opcode::ImageLoadMip:
+		case Decoder::Opcode::ImageLoadPck:
+		case Decoder::Opcode::ImageLoadPckSgn:
+		case Decoder::Opcode::ImageLoadMipPck:
+		case Decoder::Opcode::ImageLoadMipPckSgn:
+		case Decoder::Opcode::ImageMsaaLoad:
+		case Decoder::Opcode::ImageBvhIntersectRay:
+		case Decoder::Opcode::ImageBvh64IntersectRay:
 		case Decoder::Opcode::ImageStore:
 		case Decoder::Opcode::ImageStoreMip:
+		case Decoder::Opcode::ImageStorePck:
+		case Decoder::Opcode::ImageStoreMipPck:
+		case Decoder::Opcode::ImageGather4:
+		case Decoder::Opcode::ImageGather4Cl:
+		case Decoder::Opcode::ImageGather4L:
+		case Decoder::Opcode::ImageGather4B:
+		case Decoder::Opcode::ImageGather4BCl:
 		case Decoder::Opcode::ImageGather4Lz:
 		case Decoder::Opcode::ImageGather4C:
+		case Decoder::Opcode::ImageGather4CCl:
+		case Decoder::Opcode::ImageGather4CL:
+		case Decoder::Opcode::ImageGather4CB:
+		case Decoder::Opcode::ImageGather4CBCl:
 		case Decoder::Opcode::ImageGather4CLz:
+		case Decoder::Opcode::ImageGather4O:
+		case Decoder::Opcode::ImageGather4ClO:
+		case Decoder::Opcode::ImageGather4LO:
+		case Decoder::Opcode::ImageGather4BO:
+		case Decoder::Opcode::ImageGather4BClO:
 		case Decoder::Opcode::ImageGather4LzO:
 		case Decoder::Opcode::ImageGather4CO:
+		case Decoder::Opcode::ImageGather4CClO:
+		case Decoder::Opcode::ImageGather4CLO:
+		case Decoder::Opcode::ImageGather4CBO:
+		case Decoder::Opcode::ImageGather4CBClO:
 		case Decoder::Opcode::ImageGather4CLzO:
 		case Decoder::Opcode::ImageGather4H:
 		case Decoder::Opcode::ImageSample: return LowerImageOperation(decoded, block, error);
@@ -642,7 +841,17 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock* blo
 		case Decoder::Opcode::ImageAtomicUMax:
 		case Decoder::Opcode::ImageAtomicAnd:
 		case Decoder::Opcode::ImageAtomicOr:
-		case Decoder::Opcode::ImageAtomicXor: return LowerImageAtomicU32(decoded, block, error);
+		case Decoder::Opcode::ImageAtomicXor:
+		case Decoder::Opcode::ImageAtomicSwap:
+		case Decoder::Opcode::ImageAtomicCmpswap:
+		case Decoder::Opcode::ImageAtomicSub:
+		case Decoder::Opcode::ImageAtomicSmin:
+		case Decoder::Opcode::ImageAtomicSmax:
+		case Decoder::Opcode::ImageAtomicInc:
+		case Decoder::Opcode::ImageAtomicDec:
+		case Decoder::Opcode::ImageAtomicFcmpswap:
+		case Decoder::Opcode::ImageAtomicFmin:
+		case Decoder::Opcode::ImageAtomicFmax: return LowerImageAtomicU32(decoded, block, error);
 		default: return false;
 	}
 }
@@ -700,6 +909,29 @@ bool IsMemoryOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::BufferAtomicAnd:
 		case Decoder::Opcode::BufferAtomicOr:
 		case Decoder::Opcode::BufferAtomicXor:
+		case Decoder::Opcode::BufferAtomicInc:
+		case Decoder::Opcode::BufferAtomicDec:
+		case Decoder::Opcode::BufferAtomicIncX2:
+		case Decoder::Opcode::BufferAtomicDecX2:
+		case Decoder::Opcode::BufferAtomicSwapX2:
+		case Decoder::Opcode::BufferAtomicAddX2:
+		case Decoder::Opcode::BufferAtomicSubX2:
+		case Decoder::Opcode::BufferAtomicSminX2:
+		case Decoder::Opcode::BufferAtomicUminX2:
+		case Decoder::Opcode::BufferAtomicSmaxX2:
+		case Decoder::Opcode::BufferAtomicUmaxX2:
+		case Decoder::Opcode::BufferAtomicAndX2:
+		case Decoder::Opcode::BufferAtomicOrX2:
+		case Decoder::Opcode::BufferAtomicXorX2:
+		case Decoder::Opcode::BufferAtomicFcmpswap:
+		case Decoder::Opcode::BufferAtomicFcmpswapX2:
+		case Decoder::Opcode::BufferAtomicFmin:
+		case Decoder::Opcode::BufferAtomicFmax:
+		case Decoder::Opcode::BufferAtomicFminX2:
+		case Decoder::Opcode::BufferAtomicFmaxX2:
+		case Decoder::Opcode::BufferAtomicCsub:
+		case Decoder::Opcode::BufferAtomicCmpswap:
+		case Decoder::Opcode::BufferAtomicCmpswapX2:
 		case Decoder::Opcode::FlatLoadUbyte:
 		case Decoder::Opcode::FlatLoadSbyte:
 		case Decoder::Opcode::FlatLoadUshort:
@@ -708,12 +940,22 @@ bool IsMemoryOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::FlatLoadDwordx2:
 		case Decoder::Opcode::FlatLoadDwordx3:
 		case Decoder::Opcode::FlatLoadDwordx4:
+		case Decoder::Opcode::FlatLoadShortD16:
+		case Decoder::Opcode::FlatLoadShortD16Hi:
+		case Decoder::Opcode::FlatLoadUbyteD16:
+		case Decoder::Opcode::FlatLoadUbyteD16Hi:
+		case Decoder::Opcode::FlatLoadSbyteD16:
+		case Decoder::Opcode::FlatLoadSbyteD16Hi:
+		case Decoder::Opcode::FlatLoadDwordAddtid:
 		case Decoder::Opcode::FlatStoreByte:
 		case Decoder::Opcode::FlatStoreShort:
 		case Decoder::Opcode::FlatStoreDword:
 		case Decoder::Opcode::FlatStoreDwordx2:
 		case Decoder::Opcode::FlatStoreDwordx3:
 		case Decoder::Opcode::FlatStoreDwordx4:
+		case Decoder::Opcode::FlatStoreByteD16Hi:
+		case Decoder::Opcode::FlatStoreShortD16Hi:
+		case Decoder::Opcode::FlatStoreDwordAddtid:
 		case Decoder::Opcode::DsAddU32:
 		case Decoder::Opcode::DsAddRtnU32:
 		case Decoder::Opcode::DsSubU32:
@@ -765,19 +1007,56 @@ bool IsMemoryOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::ImageGetLod:
 		case Decoder::Opcode::ImageLoad:
 		case Decoder::Opcode::ImageLoadMip:
+		case Decoder::Opcode::ImageLoadPck:
+		case Decoder::Opcode::ImageLoadPckSgn:
+		case Decoder::Opcode::ImageLoadMipPck:
+		case Decoder::Opcode::ImageLoadMipPckSgn:
+		case Decoder::Opcode::ImageMsaaLoad:
+		case Decoder::Opcode::ImageBvhIntersectRay:
+		case Decoder::Opcode::ImageBvh64IntersectRay:
 		case Decoder::Opcode::ImageStore:
 		case Decoder::Opcode::ImageStoreMip:
+		case Decoder::Opcode::ImageStorePck:
+		case Decoder::Opcode::ImageStoreMipPck:
 		case Decoder::Opcode::ImageAtomicAdd:
 		case Decoder::Opcode::ImageAtomicUMin:
 		case Decoder::Opcode::ImageAtomicUMax:
 		case Decoder::Opcode::ImageAtomicAnd:
 		case Decoder::Opcode::ImageAtomicOr:
 		case Decoder::Opcode::ImageAtomicXor:
+		case Decoder::Opcode::ImageAtomicSwap:
+		case Decoder::Opcode::ImageAtomicCmpswap:
+		case Decoder::Opcode::ImageAtomicSub:
+		case Decoder::Opcode::ImageAtomicSmin:
+		case Decoder::Opcode::ImageAtomicSmax:
+		case Decoder::Opcode::ImageAtomicInc:
+		case Decoder::Opcode::ImageAtomicDec:
+		case Decoder::Opcode::ImageAtomicFcmpswap:
+		case Decoder::Opcode::ImageAtomicFmin:
+		case Decoder::Opcode::ImageAtomicFmax:
+		case Decoder::Opcode::ImageGather4:
+		case Decoder::Opcode::ImageGather4Cl:
+		case Decoder::Opcode::ImageGather4L:
+		case Decoder::Opcode::ImageGather4B:
+		case Decoder::Opcode::ImageGather4BCl:
 		case Decoder::Opcode::ImageGather4Lz:
 		case Decoder::Opcode::ImageGather4C:
+		case Decoder::Opcode::ImageGather4CCl:
+		case Decoder::Opcode::ImageGather4CL:
+		case Decoder::Opcode::ImageGather4CB:
+		case Decoder::Opcode::ImageGather4CBCl:
 		case Decoder::Opcode::ImageGather4CLz:
+		case Decoder::Opcode::ImageGather4O:
+		case Decoder::Opcode::ImageGather4ClO:
+		case Decoder::Opcode::ImageGather4LO:
+		case Decoder::Opcode::ImageGather4BO:
+		case Decoder::Opcode::ImageGather4BClO:
 		case Decoder::Opcode::ImageGather4LzO:
 		case Decoder::Opcode::ImageGather4CO:
+		case Decoder::Opcode::ImageGather4CClO:
+		case Decoder::Opcode::ImageGather4CLO:
+		case Decoder::Opcode::ImageGather4CBO:
+		case Decoder::Opcode::ImageGather4CBClO:
 		case Decoder::Opcode::ImageGather4CLzO:
 		case Decoder::Opcode::ImageGather4H:
 		case Decoder::Opcode::ImageSample: return true;

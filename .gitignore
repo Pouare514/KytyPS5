@@ -49,12 +49,15 @@ x86/
 [Mm]inSizeRel/
 ipch/
 
-# --- JetBrains / VS Code (local IDE state) -----------------------------------
+# --- JetBrains / VS Code / Cursor (local IDE state) --------------------------
 
 .idea/
-.vscode/ipch/
-.vscode/.browse.VC.db
-.vscode/*.local.json
+.cursor/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/settings.json
 *.code-workspace
 
 # --- Qt ----------------------------------------------------------------------
@@ -84,6 +87,14 @@ _ImportReport.txt
 *_pipeline_*.log
 *_buffer_*.log
 
+# Local build transcripts (redirected compiler output, not *.log)
+/build-log*.txt
+/build-output.txt
+/build-validate.txt
+/crash-*.txt
+/crash-*.log
+*.err
+
 # --- Python (aqtinstall, tooling) ----------------------------------------------
 
 __pycache__/
@@ -92,10 +103,23 @@ __pycache__/
 venv/
 .Python
 
+# RDNA2 coverage audit (baseline is tracked; latest report is local)
+tools/rdna2_coverage.json
+
+# --- Emulator runtime / local game data ----------------------------------------
+
+**/_SaveData/
+
 # --- Package managers --------------------------------------------------------
 
 vcpkg_installed/
 conan/
+aqtinstall.log
+3rdparty/aqtinstall.log
+
+# --- Local CMake presets -----------------------------------------------------
+
+CMakeUserPresets.json
 
 # --- Editor / temp -----------------------------------------------------------
 
@@ -104,3 +128,8 @@ conan/
 *.swo
 *~
 .#*
+
+# --- GPU captures / profiling ------------------------------------------------
+
+*.rdc
+*.tracy

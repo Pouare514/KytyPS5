@@ -195,7 +195,10 @@ uint32_t DecodedDstSize(const Decoder::Instruction& inst) {
 }
 
 uint32_t EmbeddedFetchDstSize(const Decoder::Instruction& inst) {
-	return inst.opcode == Decoder::Opcode::VMadU64U32 ? 2u : DecodedDstSize(inst);
+	return inst.opcode == Decoder::Opcode::VMadU64U32 ||
+	               inst.opcode == Decoder::Opcode::VMadI64I32
+	           ? 2u
+	           : DecodedDstSize(inst);
 }
 
 bool EmbeddedFetchHasBranch(Decoder::Opcode opcode) {

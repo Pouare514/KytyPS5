@@ -423,6 +423,8 @@ constexpr LowerMap LOWER_OPS[] = {
     {Decoder::Opcode::ImageGather4CO, Opcode::ImageGather4},
     {Decoder::Opcode::ImageGather4CLzO, Opcode::ImageGather4},
     {Decoder::Opcode::ImageGather4H, Opcode::ImageGather4},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraLowerOps.inc"
+#include "graphics/shader/recompiler/generated/Rdna2ExplicitLowerOps.inc"
 };
 
 
@@ -472,7 +474,10 @@ bool IsVectorCarryOutOpcode(Decoder::Opcode opcode) {
 	switch (opcode) {
 		case Decoder::Opcode::VAddI32:
 		case Decoder::Opcode::VSubI32:
-		case Decoder::Opcode::VSubrevI32: return true;
+		case Decoder::Opcode::VSubrevI32:
+		case Decoder::Opcode::VAddCoU32:
+		case Decoder::Opcode::VSubCoU32:
+		case Decoder::Opcode::VSubrevCoU32: return true;
 		default: return false;
 	}
 }

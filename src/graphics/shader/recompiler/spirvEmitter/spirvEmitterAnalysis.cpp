@@ -379,6 +379,16 @@ bool InstructionHasDppSource(const IR::Instruction& inst) {
 	return false;
 }
 
+bool OpcodeWritesWaveLaneMask(IR::Opcode op) {
+	switch (op) {
+		case IR::Opcode::IAddCarryU32:
+		case IR::Opcode::ISubBorrowU32:
+		case IR::Opcode::UMadU64U32:
+		case IR::Opcode::IMadI64I32: return true;
+		default: return false;
+	}
+}
+
 bool ProgramNeedsSubgroupBallot(const IR::Program& program) {
 	if (program.lane_mask_mode == ShaderLaneMaskMode::PerInvocation) {
 		for (const auto& block: program.blocks) {
@@ -386,6 +396,15 @@ bool ProgramNeedsSubgroupBallot(const IR::Program& program) {
 				if (inst.op == IR::Opcode::WqmB64) {
 					return true;
 				}
+			}
+		}
+		return ProgramRequiresExactSubgroupSize(program);
+	}
+
+	for (const auto& block: program.blocks) {
+		for (const auto& inst: block.instructions) {
+			if (inst.op == IR::Opcode::WqmB64 || OpcodeWritesWaveLaneMask(inst.op)) {
+				return true;
 			}
 		}
 	}
@@ -591,6 +610,19 @@ ImageViewKind StorageImageViewKind(const EmitterState& state, const IR::MemoryIn
 	(void)uint_image;
 	(void)use_pc;
 	return ImageViewKindFromDimension(mem.image_dimension);
+}
+
+void MarkMultisampledSampledImages(EmitterState* state, const IR::Program& program) {
+	for (const auto& block: program.blocks) {
+		for (const auto& inst: block.instructions) {
+			if (inst.op != IR::Opcode::ImageMsaaLoad) {
+				continue;
+			}
+			const bool integer = inst.memory.kind == IR::ResourceKind::ImageUint;
+			const auto view    = SampledImageViewKind(*state, inst.memory, inst.pc);
+			state->sampled_images[SampledImageIndex(integer, view)].multisampled = true;
+		}
+	}
 }
 
 uint32_t ImageViewCoordinateComponents(ImageViewKind view) {

@@ -274,6 +274,198 @@ static bool CommitFixedHostRange(uint64_t start, uint64_t size, VirtualMemory::M
 	return true;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static bool ReleaseHostCommittedSpan(uint64_t release_start, uint64_t release_size,
+                                     const MEMORY_BASIC_INFORMATION& info) {
+	if (release_size == 0) {
+		return true;
+	}
+
+	if (info.State != MEM_COMMIT) {
+		return true;
+	}
+
+	const auto region_base = reinterpret_cast<uint64_t>(info.BaseAddress);
+	if (info.Type == MEM_MAPPED || info.Type == MEM_IMAGE) {
+		if (UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void*>(release_start),
+		                     MEM_PRESERVE_PLACEHOLDER) != 0) {
+			return true;
+		}
+		if (release_start == region_base && release_size == info.RegionSize) {
+			return UnmapViewOfFile(reinterpret_cast<void*>(region_base)) != 0;
+		}
+		return false;
+	}
+
+	if (VirtualFree(reinterpret_cast<void*>(release_start), release_size,
+	                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0) {
+		return true;
+	}
+
+	return VirtualMemory::Decommit(release_start, release_size);
+}
+
+static bool ReleaseHostVmSpan(uint64_t start, uint64_t size) {
+	if (size == 0) {
+		return true;
+	}
+
+	constexpr uint64_t PAGE_SIZE = 0x4000;
+	const auto         end       = start + size;
+	uint64_t           cursor    = start;
+
+	while (cursor < end) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0) {
+			return false;
+		}
+
+		const auto region_base = reinterpret_cast<uint64_t>(info.BaseAddress);
+		const auto region_end  = region_base + info.RegionSize;
+		const auto release_start = std::max(cursor, region_base);
+		const auto release_end   = std::min(end, region_end);
+		const auto release_size  = release_end - release_start;
+
+		if (info.State == MEM_COMMIT) {
+			if (!ReleaseHostCommittedSpan(release_start, release_size, info)) {
+				return false;
+			}
+		} else if (info.State == MEM_RESERVE && release_size != 0) {
+			if (release_start == reinterpret_cast<uint64_t>(info.AllocationBase) &&
+			    release_size == info.RegionSize) {
+				if (VirtualFree(reinterpret_cast<void*>(release_start), 0, MEM_RELEASE) == 0) {
+					return false;
+				}
+			} else if (VirtualFree(reinterpret_cast<void*>(release_start), release_size,
+			                         MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
+				return false;
+			}
+		}
+
+		if (region_end <= cursor) {
+			return false;
+		}
+		cursor = std::max(cursor + PAGE_SIZE, region_end);
+	}
+
+	return true;
+}
+
+using VirtualAlloc2_t = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*,
+                                       ULONG);
+
+static VirtualAlloc2_t ResolveVirtualAlloc2() {
+	for (const wchar_t* module: {L"KernelBase", L"kernel32"}) {
+		const HMODULE handle = GetModuleHandleW(module);
+		if (handle == nullptr) {
+			continue;
+		}
+		if (auto* fn = reinterpret_cast<VirtualAlloc2_t>(GetProcAddress(handle, "VirtualAlloc2"));
+		    fn != nullptr) {
+			return fn;
+		}
+	}
+	return nullptr;
+}
+
+static bool ReserveFixedPlaceholderAt(uint64_t addr, uint64_t bytes) {
+	if (addr == 0 || bytes == 0) {
+		return false;
+	}
+
+	static const auto virtual_alloc2 = ResolveVirtualAlloc2();
+	if (virtual_alloc2 == nullptr) {
+		return false;
+	}
+
+	void* ptr = virtual_alloc2(GetCurrentProcess(), reinterpret_cast<void*>(addr), bytes,
+	                           MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+	if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != addr) {
+		if (ptr != nullptr) {
+			VirtualFree(ptr, 0, MEM_RELEASE);
+		}
+		return false;
+	}
+	return true;
+}
+
+static bool SplitFixedPlaceholder(uint64_t addr, uint64_t bytes) {
+	return addr != 0 && bytes != 0 &&
+	       VirtualFree(reinterpret_cast<void*>(addr), bytes,
+	                   MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0;
+}
+
+static bool ReserveFixedPlaceholderRange(uint64_t start, uint64_t size) {
+	if (start == 0 || size == 0) {
+		return false;
+	}
+
+	SYSTEM_INFO system_info {};
+	GetSystemInfo(&system_info);
+	const uint64_t granularity = system_info.dwAllocationGranularity;
+
+	if ((start & (granularity - 1u)) == 0 && (size & (granularity - 1u)) == 0) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(start), &info, sizeof(info)) != 0 &&
+		    info.State == MEM_FREE && info.RegionSize >= size &&
+		    ReserveFixedPlaceholderAt(start, size)) {
+			return true;
+		}
+		if (!ReleaseHostVmSpan(start, size)) {
+			return false;
+		}
+		return ReserveFixedPlaceholderAt(start, size);
+	}
+
+	const auto range_end = start + size;
+	for (uint64_t cursor = start; cursor < range_end;) {
+		const uint64_t container_start = cursor & ~(granularity - 1u);
+		const uint64_t container_end   = container_start + granularity;
+		const uint64_t segment_start   = cursor;
+		const uint64_t segment_end     = std::min(range_end, container_end);
+
+		if (!ReleaseHostVmSpan(container_start, granularity)) {
+			return false;
+		}
+
+		MEMORY_BASIC_INFORMATION info {};
+		const bool already_reserved =
+		    VirtualQuery(reinterpret_cast<const void*>(container_start), &info, sizeof(info)) != 0 &&
+		    info.State == MEM_RESERVE &&
+		    reinterpret_cast<uint64_t>(info.AllocationBase) == container_start &&
+		    info.RegionSize == granularity;
+		if (!already_reserved && !ReserveFixedPlaceholderAt(container_start, granularity)) {
+			return false;
+		}
+
+		if (segment_start > container_start &&
+		    !SplitFixedPlaceholder(container_start, segment_start - container_start)) {
+			return false;
+		}
+		if (segment_end < container_end &&
+		    !SplitFixedPlaceholder(segment_end, container_end - segment_end)) {
+			return false;
+		}
+
+		cursor = segment_end;
+	}
+
+	return true;
+}
+#else
+static bool ReleaseHostVmSpan(uint64_t /*start*/, uint64_t /*size*/) { return true; }
+
+static bool ReserveFixedPlaceholderRange(uint64_t start, uint64_t size) {
+	constexpr uint64_t PAGE_SIZE = 0x4000;
+	for (uint64_t addr = start; addr < start + size; addr += PAGE_SIZE) {
+		if (!VirtualMemory::ReserveFixed(addr, PAGE_SIZE)) {
+			return false;
+		}
+	}
+	return true;
+}
+#endif
+
 #include "memoryAddressSpace.inc"
 
 enum class VirtualRangeType {
@@ -2926,8 +3118,10 @@ int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** e
 	return OK;
 }
 
-static bool ReserveFixedHostRange(uint64_t start, uint64_t size) {
-	constexpr uint64_t PAGE_SIZE = 0x4000;
+static bool ReserveFixedHostRange(uint64_t start, uint64_t size, bool* placeholder_backed) {
+	if (placeholder_backed != nullptr) {
+		*placeholder_backed = false;
+	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SYSTEM_INFO system_info {};
@@ -2941,26 +3135,17 @@ static bool ReserveFixedHostRange(uint64_t start, uint64_t size) {
 			return true;
 		}
 	}
-#endif
 
-	for (uint64_t addr = start; addr < start + size; addr += PAGE_SIZE) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		MEMORY_BASIC_INFORMATION info {};
-		if (VirtualQuery(reinterpret_cast<const void*>(addr), &info, sizeof(info)) != 0) {
-			if (info.State == MEM_COMMIT) {
-				if (!VirtualMemory::Decommit(addr, PAGE_SIZE)) {
-					LOGF_COLOR(Log::Color::Red,
-					           "\t reserve-fixed replace: decommit failed at 0x%016" PRIx64 "\n",
-					           addr);
-					return false;
-				}
-				continue;
-			}
-			if (info.State == MEM_RESERVE) {
-				continue;
-			}
+	if (ReserveFixedPlaceholderRange(start, size)) {
+		if (placeholder_backed != nullptr) {
+			*placeholder_backed = true;
 		}
-#endif
+		return true;
+	}
+
+	return false;
+#else
+	for (uint64_t addr = start; addr < start + size; addr += PAGE_SIZE) {
 		if (!VirtualMemory::ReserveFixed(addr, PAGE_SIZE)) {
 			LOGF_COLOR(Log::Color::Red,
 			           "\t reserve-fixed replace: reserve failed at 0x%016" PRIx64 "\n", addr);
@@ -2969,6 +3154,7 @@ static bool ReserveFixedHostRange(uint64_t start, uint64_t size) {
 	}
 
 	return true;
+#endif
 }
 
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size, bool* placeholder_backed) {
@@ -3090,6 +3276,11 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size, bool* p
 				unmapped = g_physical_memory->Unmap(chunk.range.start, chunk.range.size, &gpu_mode);
 				chunk.gpu_mode = gpu_mode;
 			}
+			if (unmapped && !chunk.shared_backing) {
+				if (!ReleaseHostVmSpan(chunk.range.start, chunk.range.size)) {
+					unmapped = false;
+				}
+			}
 		} else if (chunk.range.type == VirtualRangeType::Flexible ||
 		           chunk.range.type == VirtualRangeType::Stack ||
 		           chunk.range.type == VirtualRangeType::Pooled) {
@@ -3113,16 +3304,37 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size, bool* p
 		}
 	}
 
-	if (g_placeholder_address_space->ReserveFixed(start, size)) {
-		*placeholder_backed = true;
-	} else if (!ReserveFixedHostRange(start, size)) {
+	if (!ReleaseHostVmSpan(start, size)) {
 		if (gpu_unmapped) {
-			EXIT("reserve-fixed host reservation failed after GPU unmap: addr=0x%016" PRIx64
+			EXIT("reserve-fixed host cleanup failed after GPU unmap: addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 "\n",
 			     start, size);
 		}
+		LOGF_COLOR(Log::Color::Red,
+		           "\t reserve-fixed replace: host cleanup failed at 0x%016" PRIx64
+		           ", size=0x%016" PRIx64 "\n",
+		           start, size);
 		restore_chunks();
 		return false;
+	}
+
+	if (g_placeholder_address_space->ReserveFixed(start, size)) {
+		*placeholder_backed = true;
+	} else {
+		bool host_placeholder = false;
+		if (!ReserveFixedHostRange(start, size, &host_placeholder)) {
+			if (gpu_unmapped) {
+				EXIT("reserve-fixed host reservation failed after GPU unmap: addr=0x%016" PRIx64
+				     " size=0x%016" PRIx64 "\n",
+				     start, size);
+			}
+			restore_chunks();
+			return false;
+		}
+		if (host_placeholder) {
+			g_placeholder_address_space->AddFree(start, size);
+			*placeholder_backed = true;
+		}
 	}
 
 	if (!g_virtual_ranges->Add(start, size, 0, 0, 0, VirtualRangeType::Reserved, "anon", false,

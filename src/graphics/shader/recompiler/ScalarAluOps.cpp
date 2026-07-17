@@ -27,6 +27,7 @@ constexpr OpcodeMap SOP2_OPS[] = {
     {0x2fu, Opcode::SLshl2AddU32},  {0x30u, Opcode::SLshl3AddU32},  {0x31u, Opcode::SLshl4AddU32},
     {0x32u, Opcode::SPackLlB32B16}, {0x33u, Opcode::SPackLhB32B16}, {0x34u, Opcode::SPackHhB32B16},
     {0x35u, Opcode::SMulHiU32},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraSOP2.inc"
 };
 
 constexpr OpcodeMap SOP1_OPS[] = {
@@ -51,6 +52,7 @@ constexpr OpcodeMap SOP1_OPS[] = {
     {0x3bu, Opcode::SBitreplicateB64B32},
     {0x3cu, Opcode::SAndSaveexecB32},
     {0x44u, Opcode::SAndn1SaveexecB32},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraSOP1.inc"
 };
 
 constexpr OpcodeMap SOPC_OPS[] = {
@@ -59,6 +61,7 @@ constexpr OpcodeMap SOPC_OPS[] = {
     {0x06u, Opcode::SCmpEqU32},   {0x07u, Opcode::SCmpLgU32},   {0x08u, Opcode::SCmpGtU32},
     {0x09u, Opcode::SCmpGeU32},   {0x0au, Opcode::SCmpLtU32},   {0x0bu, Opcode::SCmpLeU32},
     {0x0cu, Opcode::SBitcmp0B32}, {0x0du, Opcode::SBitcmp1B32}, {0x13u, Opcode::SCmpLgU64},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraSOPC.inc"
 };
 
 constexpr OpcodeMap SOPK_OPS[] = {
@@ -69,6 +72,7 @@ constexpr OpcodeMap SOPK_OPS[] = {
     {0x0eu, Opcode::SCmpLeU32},  {0x0fu, Opcode::SAddI32},   {0x10u, Opcode::SMulkI32},
     {0x13u, Opcode::SSetregB32}, {0x17u, Opcode::SWaitcnt},  {0x18u, Opcode::SWaitcnt},
     {0x19u, Opcode::SWaitcnt},   {0x1au, Opcode::SWaitcnt},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraSOPK.inc"
 };
 
 constexpr OpcodeMap SOPP_OPS[] = {
@@ -77,6 +81,7 @@ constexpr OpcodeMap SOPP_OPS[] = {
     {0x07u, Opcode::SCbranchVccnz}, {0x08u, Opcode::SCbranchExecz}, {0x09u, Opcode::SCbranchExecnz},
     {0x0au, Opcode::SBarrier},      {0x0cu, Opcode::SWaitcnt},      {0x0eu, Opcode::SSleep},
     {0x10u, Opcode::SSendmsg},      {0x16u, Opcode::STtraceData},   {0x20u, Opcode::SInstPrefetch},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraSOPP.inc"
 };
 
 Opcode Lookup(const OpcodeMap* ops, uint32_t count, uint32_t opcode) {

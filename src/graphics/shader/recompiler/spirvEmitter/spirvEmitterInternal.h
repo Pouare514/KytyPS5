@@ -97,6 +97,7 @@ enum : uint32_t {
 	ImageOperandsGradMask         = 0x00000004u,
 	ImageOperandsOffsetMask       = 0x00000010u,
 	ImageOperandsConstOffsetsMask = 0x00000020u,
+	ImageOperandsSampleMask       = 0x00000040u,
 };
 
 enum : uint32_t {
@@ -167,6 +168,7 @@ enum : uint32_t {
 	OpUDiv                         = 134,
 	OpFDiv                         = 136,
 	OpIAddCarry                    = 149,
+	OpUMax                         = 146,
 	OpUMulExtended                 = 151,
 	OpSMulExtended                 = 152,
 	OpLogicalNotEqual              = 165,
@@ -222,6 +224,8 @@ enum : uint32_t {
 	OpAtomicAnd                    = 240,
 	OpAtomicOr                     = 241,
 	OpAtomicXor                    = 242,
+	OpAtomicFMinEXT                = 563,
+	OpAtomicFMaxEXT                = 564,
 	OpPhi                          = 245,
 	OpLoopMerge                    = 246,
 	OpSelectionMerge               = 247,
@@ -295,6 +299,7 @@ struct SampledImageDescriptors {
 	uint32_t array_type         = 0;
 	uint32_t array_pointer_type = 0;
 	uint32_t variable           = 0;
+	bool     multisampled       = false;
 };
 
 struct EmitterState {
@@ -426,6 +431,7 @@ struct EmitterState {
 	bool                                   needs_subgroup_shuffle                        = false;
 	bool                                   needs_subgroup_local_invocation_id            = false;
 	bool                                   needs_compute_derivatives                     = false;
+	bool                                   uses_shader_atomic_float                      = false;
 	bool                                   needs_image_gather_extended                   = false;
 	bool                                   needs_function_lds                            = false;
 	bool                                   needs_pixel_valid_mask                        = false;
@@ -579,6 +585,7 @@ void CollectRegisters(const IR::Program& program, std::vector<RegisterBinding>* 
 bool HasOutput(const std::vector<OutputBinding>& outputs, IR::StageOutputKind kind, uint32_t index);
 
 void CopyProgramInputsAndOutputs(EmitterState* state, const IR::Program& program);
+void MarkMultisampledSampledImages(EmitterState* state, const IR::Program& program);
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
 
@@ -962,6 +969,8 @@ uint32_t EmitAtomicPointer(EmitterState* state, const IR::Instruction& inst);
 void EmitDeviceAtomicMemoryBarrier(EmitterState* state);
 
 void EmitAtomicU32(EmitterState* state, const IR::Instruction& inst, uint32_t opcode);
+void EmitAtomicF32(EmitterState* state, const IR::Instruction& inst, uint32_t opcode);
+void EmitAtomicCsubU32(EmitterState* state, const IR::Instruction& inst);
 
 void EmitSLoadDword(EmitterState* state, const IR::Instruction& inst);
 
@@ -1012,6 +1021,9 @@ void EmitImageGetResinfo(EmitterState* state, const IR::Instruction& inst);
 void EmitImageGetLod(EmitterState* state, const IR::Instruction& inst);
 
 void EmitImageLoad(EmitterState* state, const IR::Instruction& inst);
+void EmitImageLoadPck(EmitterState* state, const IR::Instruction& inst);
+void EmitImageMsaaLoad(EmitterState* state, const IR::Instruction& inst);
+void EmitImageBvhIntersectRay(EmitterState* state, const IR::Instruction& inst);
 
 void EmitImageStore(EmitterState* state, const IR::Instruction& inst);
 
@@ -1166,6 +1178,9 @@ void EmitBitClearU32(EmitterState* state, const IR::Instruction& inst);
 void EmitBitSetU32(EmitterState* state, const IR::Instruction& inst);
 
 void EmitUMadU64U32(EmitterState* state, const IR::Instruction& inst);
+void EmitIMadI64I32(EmitterState* state, const IR::Instruction& inst);
+void EmitDivScaleF32(EmitterState* state, const IR::Instruction& inst);
+void EmitDivScaleF64(EmitterState* state, const IR::Instruction& inst);
 
 void EmitScalarSignedOverflowI32(EmitterState* state, const IR::Instruction& inst, bool subtract);
 

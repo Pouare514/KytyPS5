@@ -115,7 +115,9 @@ bool IsAtomic(IR::Opcode op) {
 		case IR::Opcode::AtomicUMaxU32:
 		case IR::Opcode::AtomicAndU32:
 		case IR::Opcode::AtomicOrU32:
-		case IR::Opcode::AtomicXorU32: return true;
+		case IR::Opcode::AtomicXorU32:
+		case IR::Opcode::AtomicIncU32:
+		case IR::Opcode::AtomicDecU32: return true;
 		default: return false;
 	}
 }
@@ -180,12 +182,15 @@ bool ValidateInstructionContract(const IR::Instruction& inst, std::string* error
 	     inst.src_count != 2)) {
 		return Fail(error, "storage image instruction has an invalid resource class");
 	}
-	if (IsAtomic(inst.op) &&
+	if ((IsAtomic(inst.op) || inst.op == IR::Opcode::AtomicIncU32 ||
+	     inst.op == IR::Opcode::AtomicDecU32) &&
 	    !((kind == IR::ResourceKind::Buffer && inst.src_count == buffer_address_count + 1u) ||
 	      ((kind == IR::ResourceKind::Lds || kind == IR::ResourceKind::Gds) &&
 	       inst.memory.resource == 0 && inst.src_count == 2 &&
 	       (inst.dst.kind == IR::OperandKind::Null ||
 	        inst.dst.kind == IR::OperandKind::Register)) ||
+	      (flat_kind && inst.src_count == 3 &&
+	       inst.dst.kind == IR::OperandKind::Register) ||
 	      (kind == IR::ResourceKind::StorageImageUint && inst.src_count == 2))) {
 		return Fail(error, "atomic instruction has an invalid resource/operand contract");
 	}
@@ -456,6 +461,7 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	state.reachable_blocks.reserve(InitialEmitterVectorReserve);
 	CollectRegisters(program, &state.registers);
 	CopyProgramInputsAndOutputs(&state, program);
+	MarkMultisampledSampledImages(&state, program);
 	state.needs_subgroup_ballot              = ProgramNeedsSubgroupBallot(program);
 	state.needs_subgroup_shuffle             = ProgramNeedsSubgroupShuffle(program);
 	state.needs_subgroup_local_invocation_id = ProgramNeedsSubgroupLocalInvocationId(program);

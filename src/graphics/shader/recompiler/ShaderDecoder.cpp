@@ -378,7 +378,9 @@ bool DecodeProgram(std::span<const uint32_t> code, Program* program, std::string
 				case 0x36u: ok = DecodeDs(pc, code, word_index, &inst, error); break;
 				case 0x37u: ok = DecodeFlat(pc, code, word_index, &inst, error); break;
 				case 0x38u: ok = DecodeMubuf(pc, code, word_index, &inst, error); break;
+				case 0x39u: ok = DecodeGlobal(pc, code, word_index, &inst, error); break;
 				case 0x3au: ok = DecodeMtbuf(pc, code, word_index, &inst, error); break;
+				case 0x3bu: ok = DecodeScratch(pc, code, word_index, &inst, error); break;
 				case 0x3cu: ok = DecodeMimg(pc, code, word_index, &inst, error); break;
 				case 0x3du: ok = DecodeSmem(pc, code, word_index, &inst, error); break;
 				case 0x3eu: ok = DecodeExp(pc, code, word_index, &inst, error); break;

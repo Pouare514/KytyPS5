@@ -28,6 +28,21 @@ struct MimgAtomicInfo {
 	Opcode      decoded = Opcode::Unsupported;
 };
 
+struct MimgBaseInfo {
+	uint32_t opcode  = 0;
+	Opcode   decoded = Opcode::Unsupported;
+};
+
+constexpr MimgBaseInfo MIMG_BASE_OPS[] = {
+    {0x00u, Opcode::ImageLoad},
+    {0x01u, Opcode::ImageLoadMip},
+    {0x08u, Opcode::ImageStore},
+    {0x09u, Opcode::ImageStoreMip},
+    {0x0eu, Opcode::ImageGetResinfo},
+    {0x60u, Opcode::ImageGetLod},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraMIMG_BASE.inc"
+};
+
 constexpr ImageDimension DecodeImageDimension(uint32_t dim) {
 	switch (dim) {
 		case 1u: return ImageDimension::Dim2D;
@@ -160,6 +175,7 @@ constexpr MimgSampleInfo MIMG_SAMPLE_OPS[] = {
     SampleInfo(0xbeu, "image_sample_c_b_cl_o_a",
                ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
                    ImageSampleFlagOffset),
+#include "graphics/shader/recompiler/generated/Rdna2ExtraMIMG_SAMPLE.inc"
 };
 
 constexpr MimgGatherInfo MIMG_GATHER_OPS[] = {
@@ -174,6 +190,7 @@ constexpr MimgGatherInfo MIMG_GATHER_OPS[] = {
     {0x5fu, "image_gather4_c_lz_o", Opcode::ImageGather4CLzO,
      ImageSampleFlagCompare | ImageSampleFlagLevelZero | ImageSampleFlagOffset, 4u},
     {0x61u, "image_gather4h", Opcode::ImageGather4H, ImageSampleFlagGatherHorizontal, 2u},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraMIMG_GATHER.inc"
 };
 
 constexpr MimgAtomicInfo MIMG_ATOMIC_OPS[] = {
@@ -183,6 +200,7 @@ constexpr MimgAtomicInfo MIMG_ATOMIC_OPS[] = {
     {0x18u, "image_atomic_and", Opcode::ImageAtomicAnd},
     {0x19u, "image_atomic_or", Opcode::ImageAtomicOr},
     {0x1au, "image_atomic_xor", Opcode::ImageAtomicXor},
+#include "graphics/shader/recompiler/generated/Rdna2ExtraMIMG_ATOMIC.inc"
 };
 
 const MimgSampleInfo* LookupSample(uint32_t opcode) {
@@ -205,6 +223,15 @@ const MimgGatherInfo* LookupGather(uint32_t opcode) {
 
 const MimgAtomicInfo* LookupAtomic(uint32_t opcode) {
 	for (const auto& info: MIMG_ATOMIC_OPS) {
+		if (info.opcode == opcode) {
+			return &info;
+		}
+	}
+	return nullptr;
+}
+
+const MimgBaseInfo* LookupBase(uint32_t opcode) {
+	for (const auto& info: MIMG_BASE_OPS) {
 		if (info.opcode == opcode) {
 			return &info;
 		}
@@ -256,6 +283,7 @@ bool DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const auto*    sample = LookupSample(opcode);
 	const auto*    gather = LookupGather(opcode);
 	const auto*    atomic = LookupAtomic(opcode);
+	const auto*    base   = LookupBase(opcode);
 
 	inst->pc                 = pc;
 	inst->word               = word0;
@@ -265,12 +293,7 @@ bool DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst->opcode             = (sample != nullptr   ? Opcode::ImageSample
 	                            : gather != nullptr ? gather->decoded
 	                            : atomic != nullptr ? atomic->decoded
-	                            : opcode == 0x00u   ? Opcode::ImageLoad
-	                            : opcode == 0x01u   ? Opcode::ImageLoadMip
-	                            : opcode == 0x08u   ? Opcode::ImageStore
-	                            : opcode == 0x09u   ? Opcode::ImageStoreMip
-	                            : opcode == 0x0eu   ? Opcode::ImageGetResinfo
-	                            : opcode == 0x60u   ? Opcode::ImageGetLod
+	                            : base != nullptr   ? base->decoded
 	                                                : Opcode::Unsupported);
 	inst->dmask              = (word0 >> 8u) & 0xfu;
 	inst->data_dwords        = gather != nullptr ? 4u : CountDmaskComponents(inst->dmask);
@@ -289,12 +312,19 @@ bool DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	    sample != nullptr   ? ImageSampleAddressComponents(sample->flags, dimension)
 	    : gather != nullptr ? ImageSampleAddressComponents(gather->flags, dimension)
 	    : atomic != nullptr ? 3u
-	    : opcode == 0x60u   ? ImageCoordComponents(dimension)
-	    : opcode == 0x01u   ? ImageCoordComponents(dimension) + 1u
-	    : opcode == 0x00u   ? ImageCoordComponents(dimension)
-	                        : (opcode == 0x09u   ? ImageCoordComponents(dimension) + 1u
-	                           : opcode == 0x08u ? ImageCoordComponents(dimension)
-	                                             : 0u);
+	    : base != nullptr && base->decoded == Opcode::ImageGetLod
+	        ? ImageCoordComponents(dimension)
+	    : base != nullptr && base->decoded == Opcode::ImageLoadMip
+	        ? ImageCoordComponents(dimension) + 1u
+	    : base != nullptr &&
+	              (base->decoded == Opcode::ImageLoad || base->decoded == Opcode::ImageMsaaLoad)
+	          ? ImageCoordComponents(dimension)
+	    : base != nullptr &&
+	              (base->decoded == Opcode::ImageStoreMip)
+	          ? ImageCoordComponents(dimension) + 1u
+	    : base != nullptr && base->decoded == Opcode::ImageStore
+	        ? ImageCoordComponents(dimension)
+	        : 0u;
 	SetRawWords(inst, code, word_index, word_count);
 
 	if (inst->opcode == Opcode::Unsupported) {

@@ -409,6 +409,9 @@ void EmitInstruction(EmitterState* state, const IR::Instruction& inst) {
 		case IR::Opcode::IMadI24U32: EmitMadI32I24(state, inst); break;
 		case IR::Opcode::UMadU24U32: EmitMadU32U24(state, inst); break;
 		case IR::Opcode::UMadU64U32: EmitUMadU64U32(state, inst); break;
+		case IR::Opcode::IMadI64I32: EmitIMadI64I32(state, inst); break;
+		case IR::Opcode::DivScaleF32: EmitDivScaleF32(state, inst); break;
+		case IR::Opcode::DivScaleF64: EmitDivScaleF64(state, inst); break;
 		case IR::Opcode::SadU32: EmitSadU32(state, inst); break;
 		case IR::Opcode::IAdd3U32: EmitAdd3U32(state, inst); break;
 		case IR::Opcode::IMulI24U32: EmitMulI24U32(state, inst); break;
@@ -775,6 +778,24 @@ void EmitInstruction(EmitterState* state, const IR::Instruction& inst) {
 		case IR::Opcode::AtomicXorU32:
 			EmitGuardedByExec(state, [&]() { EmitAtomicU32(state, inst, OpAtomicXor); });
 			break;
+		case IR::Opcode::AtomicIncU32:
+			EmitGuardedByExec(state, [&]() { EmitAtomicU32(state, inst, OpAtomicIAdd); });
+			break;
+		case IR::Opcode::AtomicDecU32:
+			EmitGuardedByExec(state, [&]() { EmitAtomicU32(state, inst, OpAtomicISub); });
+			break;
+		case IR::Opcode::AtomicFMinF32:
+			EmitGuardedByExec(state, [&]() { EmitAtomicF32(state, inst, OpAtomicFMinEXT); });
+			break;
+		case IR::Opcode::AtomicFMaxF32:
+			EmitGuardedByExec(state, [&]() { EmitAtomicF32(state, inst, OpAtomicFMaxEXT); });
+			break;
+		case IR::Opcode::AtomicFcmpswapF32:
+			EmitGuardedByExec(state, [&]() { EmitAtomicF32(state, inst, OpAtomicExchange); });
+			break;
+		case IR::Opcode::AtomicCsubU32:
+			EmitGuardedByExec(state, [&]() { EmitAtomicCsubU32(state, inst); });
+			break;
 		case IR::Opcode::FlatLoadUbyte: EmitFlatLoadUbyte(state, inst); break;
 		case IR::Opcode::FlatLoadSbyte: EmitFlatLoadSbyte(state, inst); break;
 		case IR::Opcode::FlatLoadUshort: EmitFlatLoadUshort(state, inst); break;
@@ -840,6 +861,13 @@ void EmitInstruction(EmitterState* state, const IR::Instruction& inst) {
 		case IR::Opcode::ImageGetResinfo: EmitImageGetResinfo(state, inst); break;
 		case IR::Opcode::ImageGetLod: EmitImageGetLod(state, inst); break;
 		case IR::Opcode::ImageLoad: EmitImageLoad(state, inst); break;
+		case IR::Opcode::ImageLoadPck:
+		case IR::Opcode::ImageLoadPckSgn:
+		case IR::Opcode::ImageLoadMipPck:
+		case IR::Opcode::ImageLoadMipPckSgn: EmitImageLoadPck(state, inst); break;
+		case IR::Opcode::ImageMsaaLoad: EmitImageMsaaLoad(state, inst); break;
+		case IR::Opcode::ImageBvhIntersectRay:
+		case IR::Opcode::ImageBvh64IntersectRay: EmitImageBvhIntersectRay(state, inst); break;
 		case IR::Opcode::ImageStore:
 			EmitGuardedByExec(state, [&]() { EmitImageStore(state, inst); });
 			break;

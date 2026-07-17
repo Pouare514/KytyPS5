@@ -1125,12 +1125,7 @@ public:
 				return true;
 			}
 		}
-		auto* ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(vaddr), size,
-		                          MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
-		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != vaddr) {
-			if (ptr != nullptr) {
-				VirtualFree(ptr, 0, MEM_RELEASE);
-			}
+		if (!ReserveFixedPlaceholderRange(vaddr, size)) {
 			return false;
 		}
 		AddFree(vaddr, size);

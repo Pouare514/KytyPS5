@@ -1,0 +1,29 @@
+{
+  "extra_enum_count": 465,
+  "extra_memory_rows": 33,
+  "extra_mubuf_rows": 43,
+  "extra_scalar_rows": 376,
+  "extra_lower_rows": 127,
+  "explicit_lower_rows": 145,
+  "extra_mimg_base_rows": 0,
+  "extra_mimg_gather_rows": 0,
+  "extra_mimg_atomic_rows": 0,
+  "extra_mimg_sample_rows": 0,
+  "tables": {
+    "SOP2_OPS": 5,
+    "SOPK_OPS": 7,
+    "SOP1_OPS": 44,
+    "SOPC_OPS": 3,
+    "SOPP_OPS": 21,
+    "SMEM_OPS": 6,
+    "VOP2_OPS": 8,
+    "VOP1_OPS": 33,
+    "VOPC_OPS": 106,
+    "VOP3_OPS": 53,
+    "VOP3P_OPS": 7,
+    "DS_OPS": 75,
+    "MTBUF_OPS": 8,
+    "MUBUF_OPS": 43,
+    "FLAT_OPS": 33
+  }
+}

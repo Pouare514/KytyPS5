@@ -13,6 +13,10 @@ bool DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
                  Instruction* inst, std::string* error);
 bool DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction* inst,
                 std::string* error);
+bool DecodeGlobal(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                  Instruction* inst, std::string* error);
+bool DecodeScratch(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                   Instruction* inst, std::string* error);
 bool DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction* inst,
               std::string* error);
 

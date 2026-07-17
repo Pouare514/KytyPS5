@@ -718,6 +718,17 @@ bool Equal(const DepthTargetInfo& left, const DepthTargetInfo& right) {
 	       (source.buffer != nullptr || source.offset == 0);
 }
 
+[[nodiscard]] bool StencilGuestLoadable(const DepthTargetInfo&       info,
+                                        const BufferImageCopySource& source) {
+	if (info.stencil_address == 0 && info.stencil_size == 0) {
+		return false;
+	}
+	if (info.stencil_load_clear) {
+		return false;
+	}
+	return IsCoherentGuestImageSource(source, info.stencil_address, info.stencil_size);
+}
+
 [[nodiscard]] BufferImageCopySource SelectSourceRange(const BufferImageCopySource& source,
                                                       uint64_t address, uint64_t size) {
 	if (address < source.address || size > source.size ||
@@ -2363,7 +2374,9 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 		match = cached;
 	}
 	if (match != nullptr) {
-		if (!CanLoadStencilAttachment(info, match->stencil_initialized)) {
+		const bool stencil_ready = match->stencil_initialized ||
+		                           StencilGuestLoadable(info, stencil_source);
+		if (!CanLoadStencilAttachment(info, stencil_ready)) {
 			EXIT("TextureCache: stencil load requires initialized contents, addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 "\n",
 			     info.stencil_address, info.stencil_size);
@@ -2449,18 +2462,31 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 	}
 	RequireRetirementIsolation(retire, "depth target", info.address, info.size);
 	RetireImages(retire, native_depth_source.get());
-	if (!CanLoadStencilAttachment(info, native_depth_source != nullptr &&
-	                                        native_depth_source->stencil_initialized)) {
-		EXIT("TextureCache: new stencil target requires a clear before stencil access, "
-		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-		     info.stencil_address, info.stencil_size);
+	DepthTargetInfo bind_info   = info;
+	const bool      stencil_ready =
+	    (native_depth_source != nullptr && native_depth_source->stencil_initialized) ||
+	    StencilGuestLoadable(info, stencil_source);
+	if (!CanLoadStencilAttachment(info, stencil_ready)) {
+		if (has_stencil && info.stencil_access && !info.stencil_load_clear && !stencil_ready) {
+			static std::atomic<bool> logged {false};
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				LOGF("TextureCache: implicit stencil clear on first bind without loadable guest "
+				     "backing, addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     info.stencil_address, info.stencil_size);
+			}
+			bind_info.stencil_load_clear = true;
+		} else {
+			EXIT("TextureCache: new stencil target requires a clear before stencil access, "
+			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			     info.stencil_address, info.stencil_size);
+		}
 	}
 	auto cached                 = std::make_shared<CachedImage>();
 	cached->kind                = CachedImage::Kind::DepthTarget;
-	cached->depth               = info;
+	cached->depth               = bind_info;
 	cached->ctx                 = ctx;
 	cached->stencil_initialized = !has_stencil;
-	cached->image               = CreateDepthTarget(ctx, info, &cached->memory);
+	cached->image               = CreateDepthTarget(ctx, bind_info, &cached->memory);
 	if (native_depth_source != nullptr) {
 		const auto& old = native_depth_source->depth;
 		if (old.layers >= info.layers || native_depth_source->image->layers != old.layers) {
@@ -2550,10 +2576,10 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 			m_memory_tracker.ForEachUploadRange(
 			    info.stencil_address, info.stencil_size, false, [](uint64_t, uint64_t) noexcept {},
 			    [&]() noexcept {
-				    if (!info.stencil_load_clear) {
+				    if (!bind_info.stencil_load_clear) {
 					    m_tiler.DetileStencil(ctx,
 					                          static_cast<DepthStencilVulkanImage*>(cached->image),
-					                          info, stencil_source, false);
+					                          bind_info, stencil_source, false);
 				    }
 			    });
 			cached->stencil_initialized = true;

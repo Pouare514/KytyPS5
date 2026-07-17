@@ -6549,6 +6549,7 @@ void TestPixelProgramCacheDescriptorSetIdentity() {
 }
 
 void TestNewShaderRecompilerUnsupportedMemoryDecode() {
+	// Keep opcodes unmapped in generated/*.inc (audit via tools/rdna2_opcode_matrix.py).
 	const uint32_t mubuf_unknown[] = {EncodeMubuf0(0x7b), EncodeMubuf1(0, 0, 1), 0xbf810000u};
 	CheckNewDecoderUnsupported(mubuf_unknown, static_cast<uint32_t>(std::size(mubuf_unknown)),
 	                           "MUBUF", "opcode=0x7b");
@@ -6558,10 +6559,7 @@ void TestNewShaderRecompilerUnsupportedMemoryDecode() {
 	CheckNewDecoderUnsupported(flat_unknown, static_cast<uint32_t>(std::size(flat_unknown)), "FLAT",
 	                           "opcode=0x7e");
 
-	const uint32_t mtbuf_unknown[] = {EncodeMtbuf0(0x08, 14, 7, 4), EncodeMtbuf1(0x08, 9, 0, 1),
-	                                  0xbf810000u};
-	CheckNewDecoderUnsupported(mtbuf_unknown, static_cast<uint32_t>(std::size(mtbuf_unknown)),
-	                           "MTBUF", "opcode=0x08");
+	// MTBUF only exposes a 4-bit opcode field (0x00-0x0F); all values are decoded today.
 }
 
 void TestNewShaderRecompilerFlatUserPointerProvenance() {

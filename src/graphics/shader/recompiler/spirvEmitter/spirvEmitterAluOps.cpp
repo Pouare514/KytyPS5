@@ -668,6 +668,57 @@ void EmitUMadU64U32(EmitterState* state, const IR::Instruction& inst) {
 	EmitLaneMaskPairFromBool(state, inst.dst2, carry_bool);
 }
 
+void EmitIMadI64I32(EmitterState* state, const IR::Instruction& inst) {
+	const auto src0        = EmitValueLoad(state, inst.src[0]);
+	const auto src1        = EmitValueLoad(state, inst.src[1]);
+	const auto add_low     = EmitSequentialValueLoad(state, inst.src[2], 0);
+	const auto add_high    = EmitSequentialValueLoad(state, inst.src[2], 1);
+	const auto src0_signed = state->builder.AllocateId();
+	const auto src1_signed = state->builder.AllocateId();
+	const auto mul_pair    = state->builder.AllocateId();
+	const auto mul_low     = state->builder.AllocateId();
+	const auto mul_high    = state->builder.AllocateId();
+	const auto mul_low_i   = state->builder.AllocateId();
+	const auto mul_high_i  = state->builder.AllocateId();
+	const auto low_pair    = state->builder.AllocateId();
+	const auto result_low  = state->builder.AllocateId();
+	const auto carry_low   = state->builder.AllocateId();
+	const auto high_pair   = state->builder.AllocateId();
+	const auto high_sum    = state->builder.AllocateId();
+	const auto carry_high0 = state->builder.AllocateId();
+	const auto carry_pair  = state->builder.AllocateId();
+	const auto result_high = state->builder.AllocateId();
+	const auto carry_high1 = state->builder.AllocateId();
+	const auto carry       = state->builder.AllocateId();
+	const auto carry_bool  = state->builder.AllocateId();
+
+	state->builder.AddFunction({OpBitcast, state->int_type, src0_signed, src0});
+	state->builder.AddFunction({OpBitcast, state->int_type, src1_signed, src1});
+	state->builder.AddFunction(
+	    {OpSMulExtended, state->int_pair_type, mul_pair, src0_signed, src1_signed});
+	state->builder.AddFunction({OpCompositeExtract, state->int_type, mul_low_i, mul_pair, 0});
+	state->builder.AddFunction({OpCompositeExtract, state->int_type, mul_high_i, mul_pair, 1});
+	state->builder.AddFunction({OpBitcast, state->uint_type, mul_low, mul_low_i});
+	state->builder.AddFunction({OpBitcast, state->uint_type, mul_high, mul_high_i});
+	state->builder.AddFunction({OpIAddCarry, state->uint_pair_type, low_pair, mul_low, add_low});
+	state->builder.AddFunction({OpCompositeExtract, state->uint_type, result_low, low_pair, 0});
+	state->builder.AddFunction({OpCompositeExtract, state->uint_type, carry_low, low_pair, 1});
+	state->builder.AddFunction({OpIAddCarry, state->uint_pair_type, high_pair, mul_high, add_high});
+	state->builder.AddFunction({OpCompositeExtract, state->uint_type, high_sum, high_pair, 0});
+	state->builder.AddFunction({OpCompositeExtract, state->uint_type, carry_high0, high_pair, 1});
+	state->builder.AddFunction(
+	    {OpIAddCarry, state->uint_pair_type, carry_pair, high_sum, carry_low});
+	state->builder.AddFunction({OpCompositeExtract, state->uint_type, result_high, carry_pair, 0});
+	state->builder.AddFunction({OpCompositeExtract, state->uint_type, carry_high1, carry_pair, 1});
+	state->builder.AddFunction({OpBitwiseOr, state->uint_type, carry, carry_high0, carry_high1});
+	state->builder.AddFunction(
+	    {OpINotEqual, state->bool_type, carry_bool, carry, ConstantU32(state, 0)});
+
+	EmitStoreU32(state, inst.dst, result_low);
+	EmitStoreU32(state, OffsetRegisterOperand(inst.dst, 1), result_high);
+	EmitLaneMaskPairFromBool(state, inst.dst2, carry_bool);
+}
+
 void EmitScalarSignedOverflowI32(EmitterState* state, const IR::Instruction& inst, bool subtract) {
 	const auto lhs         = EmitValueLoad(state, inst.src[0]);
 	const auto rhs         = EmitValueLoad(state, inst.src[1]);
@@ -1345,6 +1396,119 @@ F32Class EmitClassifyF32(EmitterState* state, uint32_t value) {
 	cls.zero       = EmitCompareU32Constant(state, OpIEqual, abs_bits, 0);
 	cls.quiet_bits = EmitOrU32(state, cls.bits, ConstantU32(state, 0x00400000u));
 	return cls;
+}
+
+uint32_t EmitSelectF32(EmitterState* state, uint32_t cond, uint32_t true_value,
+                       uint32_t false_value) {
+	const auto ret = state->builder.AllocateId();
+	state->builder.AddFunction(
+	    {OpSelect, state->float_type, ret, cond, true_value, false_value});
+	return ret;
+}
+
+uint32_t EmitLdexpF32Constant(EmitterState* state, uint32_t value, int32_t exponent) {
+	const auto exp_i32 = ConstantI32(state, exponent);
+	const auto ret_f32 = state->builder.AllocateId();
+	state->builder.AddFunction(
+	    {OpExtInst, state->float_type, ret_f32, state->glsl_std450, GlslLdexp, value, exp_i32});
+	return ret_f32;
+}
+
+uint32_t EmitFloatExponentFieldF32(EmitterState* state, uint32_t value) {
+	const auto bits     = EmitBitcastF32ToU32(state, value);
+	const auto abs_bits = EmitAndConstant(state, bits, 0x7fffffffu);
+	return EmitShiftRightConstant(state, abs_bits, 23);
+}
+
+uint32_t EmitIsDenormF32(EmitterState* state, uint32_t value) {
+	const auto bits          = EmitBitcastF32ToU32(state, value);
+	const auto abs_bits      = EmitAndConstant(state, bits, 0x7fffffffu);
+	const auto exponent_bits = EmitAndConstant(state, abs_bits, 0x7f800000u);
+	const auto mantissa_bits = EmitAndConstant(state, abs_bits, 0x007fffffu);
+	const auto exponent_zero = EmitCompareU32Constant(state, OpIEqual, exponent_bits, 0);
+	const auto mantissa_nonzero =
+	    EmitCompareU32Constant(state, OpINotEqual, mantissa_bits, 0);
+	return EmitLogicalAndBool(state, exponent_zero, mantissa_nonzero);
+}
+
+uint32_t EmitFloatOrdEqual(EmitterState* state, uint32_t lhs, uint32_t rhs) {
+	const auto ret = state->builder.AllocateId();
+	state->builder.AddFunction({OpFOrdEqual, state->bool_type, ret, lhs, rhs});
+	return ret;
+}
+
+void EmitDivScaleF32(EmitterState* state, const IR::Instruction& inst) {
+	const auto s0 = EmitFloatLoad(state, inst.src[0]);
+	const auto s1 = EmitFloatLoad(state, inst.src[1]);
+	const auto s2 = EmitFloatLoad(state, inst.src[2]);
+
+	const auto nan_f32 = ConstantF32(state, 0x7fc00000u);
+	const auto one_f32 = ConstantF32(state, 0x3f800000u);
+
+	const auto s0_eq_s1 = EmitFloatOrdEqual(state, s0, s1);
+	const auto s0_eq_s2 = EmitFloatOrdEqual(state, s0, s2);
+
+	const auto s1_zero = EmitClassifyF32(state, s1).zero;
+	const auto s2_zero = EmitClassifyF32(state, s2).zero;
+	const auto zero_input =
+	    EmitLogicalOrBool(state, s1_zero, s2_zero);
+
+	const auto exp_s1 = EmitFloatExponentFieldF32(state, s1);
+	const auto exp_s2 = EmitFloatExponentFieldF32(state, s2);
+	const auto exp_s1_i32 = state->builder.AllocateId();
+	const auto exp_s2_i32 = state->builder.AllocateId();
+	const auto exp_diff   = state->builder.AllocateId();
+	const auto exp_diff_ge_96 = state->builder.AllocateId();
+	const auto exp_s2_le_23   = state->builder.AllocateId();
+	state->builder.AddFunction({OpBitcast, state->int_type, exp_s1_i32, exp_s1});
+	state->builder.AddFunction({OpBitcast, state->int_type, exp_s2_i32, exp_s2});
+	state->builder.AddFunction({OpISub, state->int_type, exp_diff, exp_s2_i32, exp_s1_i32});
+	state->builder.AddFunction(
+	    {OpSGreaterThanEqual, state->bool_type, exp_diff_ge_96, exp_diff, ConstantI32(state, 96)});
+	state->builder.AddFunction(
+	    {OpSLessThanEqual, state->bool_type, exp_s2_le_23, exp_s2_i32, ConstantI32(state, 23)});
+
+	const auto s1_denorm = EmitIsDenormF32(state, s1);
+
+	const auto rcp_s1 = state->builder.AllocateId();
+	state->builder.AddFunction({OpFDiv, state->float_type, rcp_s1, one_f32, s1});
+	const auto rcp_denorm = EmitIsDenormF32(state, rcp_s1);
+
+	const auto quotient = state->builder.AllocateId();
+	state->builder.AddFunction({OpFDiv, state->float_type, quotient, s2, s1});
+	const auto quotient_denorm = EmitIsDenormF32(state, quotient);
+
+	const auto ldexp_pos64 = EmitLdexpF32Constant(state, s0, 64);
+	const auto ldexp_neg64 = EmitLdexpF32Constant(state, s0, -64);
+
+	uint32_t result  = s0;
+	uint32_t matched = EmitLogicalNotBool(state, EmitTrueBool(state));
+
+	auto try_branch = [&](uint32_t cond, uint32_t value) {
+		const auto apply = EmitLogicalAndBool(state, EmitLogicalNotBool(state, matched), cond);
+		result           = EmitSelectF32(state, apply, value, result);
+		matched          = EmitLogicalOrBool(state, matched, apply);
+	};
+
+	try_branch(EmitLogicalAndBool(state, exp_diff_ge_96, s0_eq_s1), ldexp_pos64);
+	try_branch(s1_denorm, ldexp_pos64);
+	try_branch(EmitLogicalAndBool(state, EmitLogicalAndBool(state, rcp_denorm, quotient_denorm),
+	                              s0_eq_s1),
+	           ldexp_pos64);
+	try_branch(rcp_denorm, ldexp_neg64);
+	try_branch(EmitLogicalAndBool(state, quotient_denorm, s0_eq_s2), ldexp_pos64);
+	try_branch(exp_s2_le_23, ldexp_pos64);
+
+	result = EmitSelectF32(state, zero_input, nan_f32, result);
+
+	const auto final_f32 = ApplyResultModifiersF32(state, result, inst.dst);
+	const auto bits      = state->builder.AllocateId();
+	state->builder.AddFunction({OpBitcast, state->uint_type, bits, final_f32});
+	EmitStoreU32(state, inst.dst, bits);
+}
+
+void EmitDivScaleF64(EmitterState* state, const IR::Instruction& inst) {
+	EmitDivScaleF32(state, inst);
 }
 
 uint32_t EmitClassMaskBitMatch(EmitterState* state, uint32_t mask, uint32_t bit,
