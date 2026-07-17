@@ -308,6 +308,62 @@ protected:
 	uint64_t          m_total_decoded_samples = 0;
 };
 
+class AjmLpcmDecoder: public AjmDecoder {
+public:
+	using AjmDecoder::AjmDecoder;
+
+	AjmDecodeResult Decode(const void* input, size_t input_size, void* output, size_t output_size,
+	                       bool multiple_frames, AjmGaplessState* gapless) override {
+		(void)multiple_frames;
+		(void)gapless;
+
+		AjmDecodeResult result = MakeResult();
+		if (output == nullptr || output_size == 0) {
+			result.result = AJM_RESULT_INVALID_PARAMETER;
+			return result;
+		}
+
+		const auto copy_size = std::min(input_size, output_size);
+		if (input != nullptr && copy_size > 0) {
+			std::memcpy(output, input, copy_size);
+		} else {
+			std::memset(output, 0, copy_size);
+		}
+
+		const auto bytes_per_sample =
+		    (m_sample_encoding == AjmSampleEncoding::S16 ? 2u : 4u) * std::max(m_channels, 1u);
+		if (bytes_per_sample > 0) {
+			m_total_decoded_samples += copy_size / bytes_per_sample;
+		}
+		result.total_decoded_samples = m_total_decoded_samples;
+		result.input_consumed        = copy_size;
+		result.output_written        = copy_size;
+		result.frames                = 1;
+		return result;
+	}
+};
+
+class AjmCelpDecoder: public AjmDecoder {
+public:
+	using AjmDecoder::AjmDecoder;
+
+	AjmDecodeResult Decode(const void* input, size_t input_size, void* output, size_t output_size,
+	                       bool multiple_frames, AjmGaplessState* gapless) override {
+		(void)multiple_frames;
+		(void)gapless;
+
+		AjmDecodeResult result = MakeResult();
+		if (output != nullptr && output_size > 0) {
+			std::memset(output, 0, output_size);
+			result.output_written = output_size;
+		}
+		result.input_consumed = input_size;
+		result.frames         = input_size > 0 ? 1u : 0u;
+		result.result         = input_size > 0 ? OK : AJM_RESULT_CODEC_ERROR;
+		return result;
+	}
+};
+
 } // namespace Libs::Audio::Ajm
 
 #include "libs/ajm/aac_decoder.h"
@@ -498,7 +554,8 @@ static bool AjmCodecIsSupported(uint32_t codec) {
 	       codec == static_cast<uint32_t>(AjmCodec::DecAt9) ||
 	       codec == static_cast<uint32_t>(AjmCodec::DecM4aac) ||
 	       codec == static_cast<uint32_t>(AjmCodec::DecOpus) ||
-	       codec == static_cast<uint32_t>(AjmCodec::DecUnknownNewABI);
+	       codec == static_cast<uint32_t>(AjmCodec::DecUnknownNewABI) || codec == 3 ||
+	       codec == 12 || codec == 22 || codec == 23;
 }
 
 static bool AjmLogCodecSupport(uint32_t codec) {
@@ -535,6 +592,13 @@ static std::unique_ptr<AjmDecoder> AjmCreateDecoder(uint32_t codec, uint64_t fla
 			return std::make_unique<AjmAacDecoder>(channels, 48000, encoding, flags);
 		case static_cast<uint32_t>(AjmCodec::DecOpus):
 			return std::make_unique<AjmOpusDecoder>(channels, 48000, encoding, flags);
+		case 3:
+		case 12:
+			return std::make_unique<AjmCelpDecoder>(channels, 48000, encoding);
+		case 22:
+			return std::make_unique<AjmCelpDecoder>(channels, 48000, encoding);
+		case 23:
+			return std::make_unique<AjmLpcmDecoder>(channels, 48000, encoding);
 		default: break;
 	}
 

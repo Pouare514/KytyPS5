@@ -414,6 +414,9 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 			}
 
 			if (type != AUDIO_OUT_PORT_TYPE_VIBRATION) {
+				if (type == AUDIO_OUT_PORT_TYPE_AUDIO3D) {
+					LOGF("AudioOut: Audio3D port mapped to stereo SDL output\n");
+				}
 				OpenSdlDevice(&port);
 			}
 

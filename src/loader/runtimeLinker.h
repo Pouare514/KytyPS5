@@ -204,6 +204,17 @@ private:
 	application_heap_posix_memalign_func_t m_application_heap_posix_memalign = nullptr;
 };
 
+struct StubbedImportSummary {
+	std::string name;
+	std::string program;
+	uint32_t    registration_index = 0;
+	uint64_t    call_count         = 0;
+	bool        was_called         = false;
+};
+
+std::vector<StubbedImportSummary> GetStubbedImportReport();
+bool                              WriteStubbedImportReport(const std::filesystem::path& file_path);
+
 } // namespace Loader
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_LOADER_RUNTIMELINKER_H_ */

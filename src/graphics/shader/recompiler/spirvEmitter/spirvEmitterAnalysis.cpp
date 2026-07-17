@@ -744,6 +744,7 @@ uint32_t LoadStorageImageDescriptor(EmitterState* state, uint32_t resource, bool
 uint32_t ExecutionModelForStage(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Vertex: return ExecutionModelVertex;
+		case ShaderType::Fetch: return ExecutionModelGeometry;
 		case ShaderType::Pixel: return ExecutionModelFragment;
 		default: return ExecutionModelGLCompute;
 	}

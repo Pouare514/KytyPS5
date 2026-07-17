@@ -24,6 +24,7 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 enum : uint32_t {
 	ExecutionModelVertex                     = 0,
+	ExecutionModelGeometry                   = 3,
 	ExecutionModelFragment                   = 4,
 	ExecutionModelGLCompute                  = 5,
 	ExecutionModeOriginUpperLeft             = 7,

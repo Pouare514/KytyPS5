@@ -62,6 +62,8 @@ static void PrintUsage() {
 	::printf("  --ngg-rectlist-draw <true|false>     Draw rect-list auto draws using the NGG "
 	         "4-vertex path.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
+	::printf("  --save-data-folder <path>            Host folder for save data. Default: "
+	         "_SaveData.\n");
 }
 
 static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
@@ -219,6 +221,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--save-data-folder") {
+			options.config.save_data_folder = value;
 		} else {
 			::printf("unknown option: %s\n", arg.c_str());
 			return false;

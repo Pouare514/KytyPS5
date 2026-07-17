@@ -856,7 +856,9 @@ bool LowerVInterpP1F32(const Decoder::Instruction& decoded, BasicBlock* block) {
 
 bool LowerVInterpLoadF32(const Decoder::Instruction& decoded, BasicBlock* block,
                          std::string* error) {
-	if (decoded.opcode == Decoder::Opcode::VInterpMovF32 && decoded.src0.value != 2u) {
+	// Modes 0/1/2 all load an input channel for now; perspective-specific behavior is folded
+	// into the pixel shader input fetch path.
+	if (decoded.opcode == Decoder::Opcode::VInterpMovF32 && decoded.src0.value > 2u) {
 		if (error != nullptr) {
 			*error = fmt::format("v_interp_mov_f32 mode {} is not implemented at pc 0x{:08x}",
 			                     decoded.src0.value, decoded.pc);

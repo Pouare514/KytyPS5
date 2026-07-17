@@ -134,8 +134,22 @@ KYTY_HW_CTX_PARSER(HwCtxSetAaSampleControl) {
 		    static_cast<uint64_t>(buffer[18]) | (static_cast<uint64_t>(buffer[19]) << 32u);
 
 		cp->GetCtx()->SetAaSampleControl(r);
+	} else if (dw >= 16) {
+		count = 16;
+
+		HW::AaSampleControl r;
+		std::memset(&r, 0, sizeof(r));
+		std::memcpy(r.locations, buffer, static_cast<size_t>(16) * 4);
+		cp->GetCtx()->SetAaSampleControl(r);
+	} else if (dw > 0) {
+		count = dw;
+
+		HW::AaSampleControl r;
+		std::memset(&r, 0, sizeof(r));
+		std::memcpy(r.locations, buffer, static_cast<size_t>(dw) * 4);
+		cp->GetCtx()->SetAaSampleControl(r);
 	} else {
-		KYTY_NOT_IMPLEMENTED;
+		LOGF("HwCtxSetAaSampleControl: empty packet, ignored\n");
 	}
 
 	return count;
@@ -738,11 +752,50 @@ KYTY_HW_CTX_PARSER(HwCtxSetDepthRenderTarget) {
 			}
 
 			cp->GetCtx()->SetDepthRenderTarget(z);
+		} else if (dw >= 8) {
+			count = std::min<uint32_t>(dw, 22);
+
+			HW::DepthRenderTarget z {};
+			z.z_info.format              = KYTY_PM4_GET(buffer[0], DB_Z_INFO, FORMAT);
+			z.z_info.num_samples         = KYTY_PM4_GET(buffer[0], DB_Z_INFO, NUM_SAMPLES);
+			z.z_info.tile_mode_index     = KYTY_PM4_GET(buffer[0], DB_Z_INFO, TILE_MODE_INDEX);
+			z.z_info.tile_surface_enable = KYTY_PM4_GET(buffer[0], DB_Z_INFO, TILE_SURFACE_ENABLE) != 0;
+			z.stencil_info.format        = KYTY_PM4_GET(buffer[1], DB_STENCIL_INFO, FORMAT);
+			z.z_read_base_addr           = static_cast<uint64_t>(buffer[2]) << 8u;
+			z.stencil_read_base_addr     = static_cast<uint64_t>(buffer[3]) << 8u;
+			z.z_write_base_addr          = static_cast<uint64_t>(buffer[4]) << 8u;
+			z.stencil_write_base_addr    = static_cast<uint64_t>(buffer[5]) << 8u;
+			z.pitch_div8_minus1          = (buffer[6] >> Pm4::DB_DEPTH_SIZE_PITCH_TILE_MAX_SHIFT) &
+			                               Pm4::DB_DEPTH_SIZE_PITCH_TILE_MAX_MASK;
+			z.height_div8_minus1 = (buffer[6] >> Pm4::DB_DEPTH_SIZE_HEIGHT_TILE_MAX_SHIFT) &
+			                       Pm4::DB_DEPTH_SIZE_HEIGHT_TILE_MAX_MASK;
+			z.pitch_height_valid = true;
+			z.slice_div64_minus1 = (buffer[7] >> Pm4::DB_DEPTH_SLICE_SLICE_TILE_MAX_SHIFT) &
+			                       Pm4::DB_DEPTH_SLICE_SLICE_TILE_MAX_MASK;
+			if (dw > 13) {
+				z.depth_view.slice_start = KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, SLICE_START) +
+				                           (KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, SLICE_START_HI)
+				                            << 11u);
+				z.depth_view.slice_max = KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, SLICE_MAX) +
+				                         (KYTY_PM4_GET(buffer[13], DB_DEPTH_VIEW, SLICE_MAX_HI) << 11u);
+			}
+			if (dw > 16) {
+				z.htile_data_base_addr = static_cast<uint64_t>(buffer[16]) << 8u;
+			}
+			if (dw > 19) {
+				z.htile_surface = ParseDepthHtileSurface(buffer[19]);
+			}
+			if (dw > 21 && buffer[21] != 0) {
+				z.width              = ((buffer[21] >> 0u) & 0x3fffu) + 1u;
+				z.height             = ((buffer[21] >> 16u) & 0x3fffu) + 1u;
+				z.width_height_valid = true;
+			}
+			cp->GetCtx()->SetDepthRenderTarget(z);
 		} else {
-			KYTY_NOT_IMPLEMENTED;
+			LOGF("HwCtxSetDepthRenderTarget: packet too small (dw=%u), ignored\n", dw);
 		}
 	} else {
-		KYTY_NOT_IMPLEMENTED;
+		LOGF("HwCtxSetDepthRenderTarget: unsupported cmd_id=0x%08x\n", cmd_id);
 	}
 
 	return count;

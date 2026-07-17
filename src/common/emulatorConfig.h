@@ -38,6 +38,7 @@ struct ConfigOptions {
 	std::filesystem::path  pipeline_dump_folder        = "_Pipelines";
 	bool                   renderdoc_enabled           = false;
 	bool                   ngg_rectlist_draw_enabled   = true;
+	std::filesystem::path  save_data_folder             = "_SaveData";
 };
 
 void Load(const ConfigOptions& cfg);
@@ -69,6 +70,8 @@ std::filesystem::path GetPipelineDumpFolder();
 
 bool RenderDocEnabled();
 bool NggRectlistDrawEnabled();
+
+std::filesystem::path GetSaveDataFolder();
 
 } // namespace Config
 

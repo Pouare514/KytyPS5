@@ -39,6 +39,8 @@ static void PrintSystemInfo() {
 static void KytyClose() {
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
+	Loader::WriteStubbedImportReport("_ImportReport.txt");
+
 	rt->Clear();
 
 	LOGF("done!\n");

@@ -1,6 +1,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <vector>
 
 namespace Libs {
@@ -21,8 +23,10 @@ LIB_VERSION("SaveData", 1, "SaveData", 1, 1);
 
 namespace SaveData {
 
-// TODO(): specify dir at launcher
-static constexpr char     SAVE_DATA_DIR[]      = "_SaveData";
+// SaveData root directory; override with --save-data-folder or launcher settings.
+static std::string get_save_data_root() {
+	return Common::PathToString(Config::GetSaveDataFolder());
+}
 static constexpr char     SAVE_DATA_POINT[]    = "/savedata0";
 static constexpr uint64_t SAVE_DATA_BLOCKS_MAX = 16384;
 
@@ -234,6 +238,80 @@ static constexpr uint32_t SAVE_DATA_EVENT_TYPE_COMMIT_BACKUP_END = 4u;
 static std::vector<uint8_t>      g_save_data_memory(0x10000);
 static int32_t                   g_next_transaction_resource = 1;
 static std::deque<SaveDataEvent> g_save_data_events;
+static std::string               g_mounted_save_dir;
+
+static constexpr char SAVE_PARAM_FILE[] = "sce_save_param.bin";
+static constexpr char SAVE_ICON_FILE[]  = "icon0.png";
+static constexpr char SAVE_MEMORY_FILE[] = "save_memory.bin";
+
+static std::filesystem::path save_param_path(const std::string& mount_dir) {
+	return std::filesystem::path(mount_dir) / SAVE_PARAM_FILE;
+}
+
+static std::filesystem::path save_icon_path(const std::string& mount_dir) {
+	return std::filesystem::path(mount_dir) / SAVE_ICON_FILE;
+}
+
+static std::filesystem::path save_memory_path(const std::string& mount_dir) {
+	return std::filesystem::path(mount_dir) / SAVE_MEMORY_FILE;
+}
+
+static bool write_param_file(const std::string& mount_dir, const SaveDataParam& param) {
+	Common::File file;
+	file.Create(save_param_path(mount_dir));
+	if (file.IsInvalid()) {
+		return false;
+	}
+	file.Write(&param, sizeof(param));
+	file.Close();
+	return true;
+}
+
+static bool read_param_file(const std::string& mount_dir, SaveDataParam* param) {
+	Common::File file;
+	file.Open(save_param_path(mount_dir), Common::File::Mode::Read);
+	if (file.IsInvalid()) {
+		return false;
+	}
+	const auto size = file.Size();
+	if (size < sizeof(SaveDataParam)) {
+		file.Close();
+		return false;
+	}
+	file.Read(param, sizeof(SaveDataParam));
+	file.Close();
+	return true;
+}
+
+static bool write_memory_file(const std::string& mount_dir) {
+	Common::File file;
+	file.Create(save_memory_path(mount_dir));
+	if (file.IsInvalid()) {
+		return false;
+	}
+	if (!g_save_data_memory.empty()) {
+		file.Write(g_save_data_memory.data(), g_save_data_memory.size());
+	}
+	file.Close();
+	return true;
+}
+
+static bool read_memory_file(const std::string& mount_dir) {
+	Common::File file;
+	file.Open(save_memory_path(mount_dir), Common::File::Mode::Read);
+	if (file.IsInvalid()) {
+		return false;
+	}
+	const auto size = file.Size();
+	if (size == 0) {
+		file.Close();
+		return false;
+	}
+	g_save_data_memory.resize(static_cast<size_t>(size));
+	file.Read(g_save_data_memory.data(), size);
+	file.Close();
+	return true;
+}
 
 static std::string get_title_id() {
 	std::string title_id;
@@ -352,7 +430,7 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 
 	std::vector<std::string> dir_list;
 	std::string              root =
-	    Common::FixDirectorySlash((std::string(SAVE_DATA_DIR) + "/" + get_title_id()));
+	    Common::FixDirectorySlash(get_save_data_root() + "/" + get_title_id());
 
 	if (Common::File::IsDirectoryExisting(root)) {
 		for (const auto& entry: Common::File::GetDirEntries(root)) {
@@ -418,7 +496,7 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 
 	*mount_result = {};
 
-	std::string mount_dir   = std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" +
+	std::string mount_dir   = get_save_data_root() + "/" + get_title_id() + "/" +
 	                          std::string(mount->dir_name->data);
 	std::string mount_point = SAVE_DATA_POINT;
 	bool        create      = ((mount->mount_mode & 4u) != 0);
@@ -446,6 +524,8 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	}
 
 	LibKernel::FileSystem::Mount(mount_dir, mount_point);
+	g_mounted_save_dir = mount_dir;
+	read_memory_file(mount_dir);
 
 	int s = snprintf(mount_result->mount_point.data, 16, "%s", mount_point.c_str());
 
@@ -575,7 +655,7 @@ int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mou
 
 	*mount_result = {};
 
-	std::string mount_dir   = std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" +
+	std::string mount_dir   = get_save_data_root() + "/" + get_title_id() + "/" +
 	                          std::string(mount->dir_name->data);
 	std::string mount_point = SAVE_DATA_POINT;
 
@@ -584,6 +664,8 @@ int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mou
 	}
 
 	LibKernel::FileSystem::Mount(mount_dir, mount_point);
+	g_mounted_save_dir = mount_dir;
+	read_memory_file(mount_dir);
 
 	int s = snprintf(mount_result->mount_point.data, 16, "%s", mount_point.c_str());
 
@@ -611,6 +693,10 @@ int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount
 	}
 
 	LibKernel::FileSystem::Umount(std::string(mount_point->data));
+	if (g_mounted_save_dir.empty() || mount_point->data == SAVE_DATA_POINT) {
+		write_memory_file(g_mounted_save_dir);
+		g_mounted_save_dir.clear();
+	}
 
 	return OK;
 }
@@ -663,7 +749,7 @@ int KYTY_SYSV_ABI SaveDataDelete(const SaveDataDelete* del) {
 	     del->dir_name->data);
 
 	std::string dir =
-	    std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" + std::string(del->dir_name->data);
+	    get_save_data_root() + "/" + get_title_id() + "/" + std::string(del->dir_name->data);
 	if (Common::File::IsDirectoryExisting(dir)) {
 		Common::File::DeleteDirectory(dir);
 	}
@@ -687,6 +773,13 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 	if (param_type == 0) {
 		if (param_buf_size < sizeof(SaveDataParam)) {
 			return SAVE_DATA_ERROR_PARAMETER;
+		}
+		auto* param = static_cast<SaveDataParam*>(param_buf);
+		if (!g_mounted_save_dir.empty() && read_param_file(g_mounted_save_dir, param)) {
+			if (got_size != nullptr) {
+				*got_size = sizeof(SaveDataParam);
+			}
+			return OK;
 		}
 		std::memset(param_buf, 0, sizeof(SaveDataParam));
 		if (got_size != nullptr) {
@@ -717,6 +810,17 @@ int KYTY_SYSV_ABI SaveDataLoadIcon(const SaveDataMountPoint* mount_point, SaveDa
 
 	icon->data_size = 0;
 
+	if (!g_mounted_save_dir.empty() && icon->buf != nullptr && icon->buf_size > 0) {
+		Common::File file;
+		file.Open(save_icon_path(g_mounted_save_dir), Common::File::Mode::Read);
+		if (!file.IsInvalid()) {
+			const auto size = std::min(static_cast<size_t>(file.Size()), icon->buf_size);
+			file.Read(icon->buf, size);
+			icon->data_size = size;
+			file.Close();
+		}
+	}
+
 	return OK;
 }
 
@@ -731,6 +835,11 @@ int KYTY_SYSV_ABI SaveDataSaveIconByPath(const SaveDataMountPoint* mount_point, 
 	     "\t path        = %s\n",
 	     mount_point->data, path);
 
+	if (!g_mounted_save_dir.empty()) {
+		Common::File::CopyFile(std::filesystem::path(path),
+		                       save_icon_path(g_mounted_save_dir));
+	}
+
 	return OK;
 }
 
@@ -738,6 +847,10 @@ int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const void* sync_param) {
 	PRINT_NAME();
 
 	LOGF("\t sync_param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(sync_param));
+
+	if (!g_mounted_save_dir.empty()) {
+		write_memory_file(g_mounted_save_dir);
+	}
 
 	return OK;
 }
@@ -811,6 +924,10 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 		     "\t detail     = %s\n"
 		     "\t user_param = %u\n",
 		     p->title, p->sub_title, p->detail, p->user_param);
+
+		if (!g_mounted_save_dir.empty()) {
+			write_param_file(g_mounted_save_dir, *p);
+		}
 	} else {
 		LOGF("\t unsupported param_type, accepting as no-op\n");
 	}
@@ -842,6 +959,16 @@ int KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point,
 	     "\t buf_size  = %" PRIu64 "\n"
 	     "\t data_size = %" PRIu64 "\n",
 	     reinterpret_cast<uint64_t>(icon->buf), icon->buf_size, icon->data_size);
+
+	if (!g_mounted_save_dir.empty() && icon->buf != nullptr && icon->data_size > 0) {
+		Common::File file;
+		file.Create(save_icon_path(g_mounted_save_dir));
+		if (!file.IsInvalid()) {
+			const auto size = std::min(icon->data_size, icon->buf_size);
+			file.Write(icon->buf, size);
+			file.Close();
+		}
+	}
 
 	return OK;
 }

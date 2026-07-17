@@ -52,6 +52,7 @@ bool ValidateOptions(const Program& program, const ShaderInfoOptions& options, s
 	};
 	switch (program.stage) {
 		case ShaderType::Vertex:
+		case ShaderType::Fetch:
 			if (options.vertex == nullptr) {
 				return Fail("vertex shader info requires vertex metadata");
 			}
@@ -211,7 +212,8 @@ bool CollectShaderInfo(Program* program, const ShaderInfoOptions& options, std::
 	next.inputs.clear();
 	next.outputs.clear();
 	switch (program->stage) {
-		case ShaderType::Vertex: CollectVertexInputs(*program, options.vertex, &next); break;
+		case ShaderType::Vertex:
+		case ShaderType::Fetch: CollectVertexInputs(*program, options.vertex, &next); break;
 		case ShaderType::Pixel: CollectPixelInputs(options.pixel, &next); break;
 		case ShaderType::Compute: CollectComputeInputs(*program, options.compute, &next); break;
 		default: return false;

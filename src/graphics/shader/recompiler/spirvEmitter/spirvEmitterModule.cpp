@@ -57,7 +57,8 @@ uint32_t ConstantF32Value(EmitterState* state, float value) {
 }
 
 VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint32_t location) {
-	if (state.stage != ShaderType::Vertex || state.vertex_input_info == nullptr ||
+	if ((state.stage != ShaderType::Vertex && state.stage != ShaderType::Fetch) ||
+	    state.vertex_input_info == nullptr ||
 	    location >= ShaderVertexInputInfo::RES_MAX ||
 	    location >= static_cast<uint32_t>(state.vertex_input_info->resources_num)) {
 		return VertexInputScalarKind::Float;
@@ -90,7 +91,8 @@ VertexInputScalarKind VertexParameterScalarKind(const EmitterState& state, uint3
 
 uint32_t VertexParameterComponentCount(const EmitterState& state, const InputBinding& input) {
 	uint32_t count = input.component_count;
-	if (state.stage == ShaderType::Vertex && state.vertex_input_info != nullptr &&
+	if ((state.stage == ShaderType::Vertex || state.stage == ShaderType::Fetch) &&
+	    state.vertex_input_info != nullptr &&
 	    input.location < ShaderVertexInputInfo::RES_MAX &&
 	    input.location < static_cast<uint32_t>(state.vertex_input_info->resources_num) &&
 	    state.vertex_input_info->resources_dst[input.location].registers_num > 0) {
@@ -622,7 +624,7 @@ void EmitHeaderAndTypes(EmitterState* state) {
 			case IR::StageInputKind::FragCoord: ptr_type = state->ptr_input_vec4_float; break;
 			case IR::StageInputKind::FrontFacing: ptr_type = state->ptr_input_bool; break;
 			case IR::StageInputKind::Parameter:
-				if (state->stage == ShaderType::Vertex) {
+				if (state->stage == ShaderType::Vertex || state->stage == ShaderType::Fetch) {
 					const auto kind       = VertexParameterScalarKind(*state, input.location);
 					const auto components = VertexParameterComponentCount(*state, input);
 					ptr_type = VertexParameterInputPointerType(*state, kind, components);

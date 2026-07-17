@@ -258,6 +258,26 @@ static void VulkanFindPhysicalDevice(VkInstance instance, VkSurfaceKHR surface,
 
 	VkPhysicalDevice best_device = nullptr;
 	VulkanQueues     best_queues;
+	int              best_score  = -1;
+
+	auto score_device = [](const VkPhysicalDeviceProperties& props) {
+		int score = 0;
+		switch (props.deviceType) {
+			case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: score += 1000; break;
+			case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: score += 100; break;
+			case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: score += 50; break;
+			default: break;
+		}
+		if (props.vendorID == 0x1002u) {
+			score += 200;
+		} else if (props.vendorID == 0x10deu) {
+			score += 150;
+		} else if (props.vendorID == 0x8086u) {
+			score += 120;
+		}
+		score += static_cast<int>(props.apiVersion & 0xfffu);
+		return score;
+	};
 
 	for (const auto& device: devices) {
 		bool skip_device = false;
@@ -265,7 +285,9 @@ static void VulkanFindPhysicalDevice(VkInstance instance, VkSurfaceKHR surface,
 		VkPhysicalDeviceProperties device_properties {};
 		vkGetPhysicalDeviceProperties(device, &device_properties);
 
-		LOGF("Vulkan device: %s\n", device_properties.deviceName);
+		LOGF("Vulkan device: %s (vendor=0x%04x type=%u score candidate=%d)\n",
+		     device_properties.deviceName, device_properties.vendorID,
+		     static_cast<uint32_t>(device_properties.deviceType), score_device(device_properties));
 		if (device_properties.apiVersion < VULKAN_TARGET_API_VERSION) {
 			LOGF("Vulkan %u.%u is required, but device supports only %u.%u.%u\n",
 			     VK_VERSION_MAJOR(VULKAN_TARGET_API_VERSION),
@@ -502,15 +524,22 @@ static void VulkanFindPhysicalDevice(VkInstance instance, VkSurfaceKHR surface,
 			continue;
 		}
 
-		if (best_device == nullptr ||
-		    device_properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+		const auto score = score_device(device_properties);
+		if (best_device == nullptr || score > best_score) {
 			best_device = device;
 			best_queues = qs;
+			best_score  = score;
 		}
 	}
 
 	*out_device = best_device;
 	*out_queues = best_queues;
+	if (best_device != nullptr) {
+		VkPhysicalDeviceProperties selected {};
+		vkGetPhysicalDeviceProperties(best_device, &selected);
+		LOGF("Vulkan selected device: %s (vendor=0x%04x score=%d)\n", selected.deviceName,
+		     selected.vendorID, best_score);
+	}
 }
 
 static void VulkanInitSubgroupSizeControl(VkPhysicalDevice physical_device, GraphicContext* ctx) {

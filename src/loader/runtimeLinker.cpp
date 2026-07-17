@@ -112,6 +112,7 @@ struct StubbedImportRecord {
 	SymbolType  type = SymbolType::Unknown;
 	BindType    bind = BindType::Unknown;
 	std::string program;
+	uint64_t    call_count = 0;
 };
 
 // The structure will be passed via the stack
@@ -299,6 +300,9 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 	}
 
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
+	if (record_id < g_stubbed_imports.size()) {
+		g_stubbed_imports[record_id].call_count++;
+	}
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
 			const auto& record = g_stubbed_imports[record_id];
@@ -2382,6 +2386,63 @@ void* RuntimeLinker::ApplicationHeapMalloc(uint64_t size) {
 	Common::LockGuard lock(m_mutex);
 
 	return m_application_heap_malloc != nullptr ? m_application_heap_malloc(size) : nullptr;
+}
+
+std::vector<StubbedImportSummary> GetStubbedImportReport() {
+	std::vector<StubbedImportSummary> report;
+	report.reserve(g_stubbed_imports.size());
+
+	for (const auto& record: g_stubbed_imports) {
+		StubbedImportSummary entry {};
+		entry.name               = record.name;
+		entry.program            = record.program;
+		entry.registration_index = record.index;
+		entry.call_count         = record.call_count;
+		entry.was_called         = record.call_count > 0;
+		report.push_back(std::move(entry));
+	}
+
+	std::sort(report.begin(), report.end(), [](const StubbedImportSummary& a,
+	                                           const StubbedImportSummary& b) {
+		if (a.call_count != b.call_count) {
+			return a.call_count > b.call_count;
+		}
+		return a.name < b.name;
+	});
+
+	return report;
+}
+
+bool WriteStubbedImportReport(const std::filesystem::path& file_path) {
+	const auto report = GetStubbedImportReport();
+
+	Common::File file;
+	file.Create(file_path);
+	if (file.IsInvalid()) {
+		LOGF("Can't create stub import report: %s\n", Common::PathToString(file_path).c_str());
+		return false;
+	}
+
+	uint64_t registered = report.size();
+	uint64_t called     = 0;
+	for (const auto& entry: report) {
+		if (entry.was_called) {
+			called++;
+		}
+	}
+
+	file.Printf("# KytyPS5 unresolved import report\n");
+	file.Printf("# registered=%" PRIu64 " called=%" PRIu64 "\n\n", registered, called);
+
+	for (const auto& entry: report) {
+		file.Printf("[%s] calls=%" PRIu64 " index=%" PRIu32 " program=%s\n", entry.name.c_str(),
+		            entry.call_count, entry.registration_index, entry.program.c_str());
+	}
+
+	file.Close();
+	LOGF("Wrote stub import report (%" PRIu64 " entries, %" PRIu64 " called): %s\n", registered,
+	     called, Common::PathToString(file_path).c_str());
+	return true;
 }
 
 } // namespace Loader

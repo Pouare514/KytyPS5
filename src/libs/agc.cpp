@@ -1047,19 +1047,28 @@ int KYTY_SYSV_ABI GraphicsCreatePrimState(ShaderRegister* cx_regs, ShaderRegiste
 
 	EXIT_NOT_IMPLEMENTED(gs == nullptr);
 
+	const auto gs_type = static_cast<Prospero::ShaderBinaryType>(gs->type);
+	EXIT_NOT_IMPLEMENTED(gs_type != Prospero::ShaderBinaryType::kGs &&
+	                     gs_type != Prospero::ShaderBinaryType::kGsFront);
 	EXIT_NOT_IMPLEMENTED(hs != nullptr &&
-	                     static_cast<Prospero::ShaderBinaryType>(hs->type) != Prospero::ShaderBinaryType::kHs);
-	EXIT_NOT_IMPLEMENTED(static_cast<Prospero::ShaderBinaryType>(gs->type) != Prospero::ShaderBinaryType::kGs);
+	                     static_cast<Prospero::ShaderBinaryType>(hs->type) !=
+	                         Prospero::ShaderBinaryType::kHs &&
+	                     static_cast<Prospero::ShaderBinaryType>(hs->type) !=
+	                         Prospero::ShaderBinaryType::kHsFront);
 
 	if (cx_regs != nullptr) {
-		EXIT_NOT_IMPLEMENTED(hs != nullptr && hs->specials->vgt_shader_stages_en.offset !=
-		                                          Pm4::VGT_SHADER_STAGES_EN);
-		EXIT_NOT_IMPLEMENTED(hs != nullptr && hs->specials->vgt_gs_out_prim_type.offset !=
-		                                          Pm4::VGT_GS_OUT_PRIM_TYPE);
-		EXIT_NOT_IMPLEMENTED(gs->specials->vgt_shader_stages_en.offset !=
-		                     Pm4::VGT_SHADER_STAGES_EN);
-		EXIT_NOT_IMPLEMENTED(gs->specials->vgt_gs_out_prim_type.offset !=
-		                     Pm4::VGT_GS_OUT_PRIM_TYPE);
+		if (hs != nullptr && hs->specials->vgt_shader_stages_en.offset != Pm4::VGT_SHADER_STAGES_EN) {
+			LOGF("GraphicsCreatePrimState: unexpected hs vgt_shader_stages_en offset\n");
+		}
+		if (hs != nullptr && hs->specials->vgt_gs_out_prim_type.offset != Pm4::VGT_GS_OUT_PRIM_TYPE) {
+			LOGF("GraphicsCreatePrimState: unexpected hs vgt_gs_out_prim_type offset\n");
+		}
+		if (gs->specials->vgt_shader_stages_en.offset != Pm4::VGT_SHADER_STAGES_EN) {
+			LOGF("GraphicsCreatePrimState: unexpected gs vgt_shader_stages_en offset\n");
+		}
+		if (gs->specials->vgt_gs_out_prim_type.offset != Pm4::VGT_GS_OUT_PRIM_TYPE) {
+			LOGF("GraphicsCreatePrimState: unexpected gs vgt_gs_out_prim_type offset\n");
+		}
 
 		cx_regs[0] = gs->specials->vgt_shader_stages_en;
 		if ((cx_regs[0].value & 0x20u) != 0) {
@@ -1078,10 +1087,15 @@ int KYTY_SYSV_ABI GraphicsCreatePrimState(ShaderRegister* cx_regs, ShaderRegiste
 	}
 
 	if (uc_regs != nullptr) {
-		EXIT_NOT_IMPLEMENTED(gs->specials->ge_cntl.offset != Pm4::GE_CNTL);
-		EXIT_NOT_IMPLEMENTED(gs->specials->ge_user_vgpr_en.offset != Pm4::GE_USER_VGPR_EN);
-		EXIT_NOT_IMPLEMENTED(hs != nullptr &&
-		                     hs->specials->ge_user_vgpr_en.offset != Pm4::GE_USER_VGPR_EN);
+		if (gs->specials->ge_cntl.offset != Pm4::GE_CNTL) {
+			LOGF("GraphicsCreatePrimState: unexpected ge_cntl offset\n");
+		}
+		if (gs->specials->ge_user_vgpr_en.offset != Pm4::GE_USER_VGPR_EN) {
+			LOGF("GraphicsCreatePrimState: unexpected ge_user_vgpr_en offset\n");
+		}
+		if (hs != nullptr && hs->specials->ge_user_vgpr_en.offset != Pm4::GE_USER_VGPR_EN) {
+			LOGF("GraphicsCreatePrimState: unexpected hs ge_user_vgpr_en offset\n");
+		}
 
 		uc_regs[0]        = gs->specials->ge_cntl;
 		uc_regs[1]        = gs->specials->ge_user_vgpr_en;

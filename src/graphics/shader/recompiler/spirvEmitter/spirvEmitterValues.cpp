@@ -482,7 +482,7 @@ void EmitLoadInputF32(EmitterState* state, const IR::Instruction& inst) {
 		return;
 	}
 
-	if (state->stage == ShaderType::Vertex) {
+	if (state->stage == ShaderType::Vertex || state->stage == ShaderType::Fetch) {
 		EmitStoreU32(state, inst.dst,
 		             EmitVertexParameterComponentU32(state, *input, inst.input_info.chan & 3u));
 		return;

@@ -347,7 +347,7 @@ uint32_t EmitInputScalarU32(EmitterState* state, IR::StageInputKind kind) {
 }
 
 void EmitVertexInputRegisters(EmitterState* state) {
-	if (state->stage != ShaderType::Vertex) {
+	if (state->stage != ShaderType::Vertex && state->stage != ShaderType::Fetch) {
 		return;
 	}
 

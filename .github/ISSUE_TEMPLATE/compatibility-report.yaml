@@ -1,0 +1,71 @@
+name: Compatibility Report
+description: Report game compatibility status for the KytyPS5 compatibility database.
+title: "[COMPAT]: "
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template to suggest an update to `compat-db/compatibility_db.json`.
+        A maintainer can merge your report into the database.
+
+  - type: input
+    id: title-id
+    attributes:
+      label: Title ID (PPSA...)
+    validations:
+      required: true
+
+  - type: input
+    id: game-title
+    attributes:
+      label: Game title
+    validations:
+      required: true
+
+  - type: dropdown
+    id: status
+    attributes:
+      label: Status
+      options:
+        - InGame
+        - MainMenu
+        - Logo
+        - DoesntBoot
+        - Unknown
+    validations:
+      required: true
+
+  - type: input
+    id: kyty-version
+    attributes:
+      label: KytyPS5 version
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU (vendor + model)
+      placeholder: "NVIDIA RTX 4070 / AMD RX 6800 / Intel Arc A770"
+    validations:
+      required: true
+
+  - type: textarea
+    id: comment
+    attributes:
+      label: Notes
+      description: Boot behavior, rendering/audio issues, steps tested.
+    validations:
+      required: true
+
+  - type: textarea
+    id: json-snippet
+    attributes:
+      label: Suggested JSON entry
+      description: Optional ready-to-paste object for compatibility_db.json
+      value: |
+        "PPSA00000": {
+          "status": "MainMenu",
+          "comment": "Reaches main menu, audio missing"
+        }

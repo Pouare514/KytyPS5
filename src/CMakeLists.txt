@@ -293,6 +293,23 @@ add_kyty_full_emulator_test(shader_recompiler_compute_tests ../tests/ShaderRecom
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests ../tests/VirtualMemoryAllocationTests.cpp)
 
+set(KYTY_TEST_TARGETS
+	shader_cfg_tests
+	scalar_provenance_tests
+	page_manager_tests
+	memory_tracker_tests
+	shader_vertex_metadata_tests
+	shader_stage_runtime_tests
+	resource_tracking_tests
+	resource_mutex_tests
+	shader_recompiler_compute_tests
+	virtual_memory_allocation_tests
+)
+
+enable_testing()
+foreach(test_target IN LISTS KYTY_TEST_TARGETS)
+	add_test(NAME ${test_target} COMMAND ${test_target})
+endforeach()
 
 add_executable(kyty_emulator main.cpp ${kyty_emulator_src})
 

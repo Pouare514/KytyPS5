@@ -1,0 +1,5 @@
+{
+  "_schema": "KytyPS5 compatibility database",
+  "_statuses": ["InGame", "MainMenu", "Logo", "DoesntBoot", "Unknown"],
+  "entries": {}
+}

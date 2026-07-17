@@ -51,6 +51,7 @@ const char* StageName(ShaderType stage) {
 		case ShaderType::Compute: return "CS";
 		case ShaderType::Vertex: return "VS";
 		case ShaderType::Pixel: return "PS";
+		case ShaderType::Fetch: return "GS";
 		default: return "unknown";
 	}
 }
@@ -633,9 +634,9 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		return false;
 	}
 	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
-	    options.stage != ShaderType::Pixel) {
+	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Fetch) {
 		if (error != nullptr) {
-			*error = "shader recompiler supports compute, vertex, and pixel stages";
+			*error = "shader recompiler supports compute, vertex, pixel, and fetch stages";
 		}
 		return false;
 	}
@@ -729,8 +730,8 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	EmbeddedFetchData embedded_fetch;
-	if (options.stage == ShaderType::Vertex && options.vertex_input_info != nullptr &&
-	    options.vertex_input_info->fetch_embedded) {
+	if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Fetch) &&
+	    options.vertex_input_info != nullptr && options.vertex_input_info->fetch_embedded) {
 		embedded_fetch =
 		    DetectEmbeddedVertexFetch(decoded, options.vertex_input_info, ir.user_data_base,
 		                              ir.user_data_count, options.wave_size);
@@ -761,7 +762,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	if (!IR::PatchSrtReads(&ir, error) || !IR::TrackResources(&ir, error)) {
 		return false;
 	}
-	if (options.stage == ShaderType::Vertex) {
+	if (options.stage == ShaderType::Vertex || options.stage == ShaderType::Fetch) {
 		ir.info.vertex_offset_sgpr = embedded_fetch.vertex_offset_sgpr;
 	}
 	if (!dispatcher_fallback) {

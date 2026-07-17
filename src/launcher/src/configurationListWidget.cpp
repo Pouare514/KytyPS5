@@ -170,9 +170,10 @@ static void ApplyGameListStyle(Ui::ConfigurationListWidget* ui) {
 }
 
 static void AddSaveDataDir(QStringList* dirs, QSet<QString>* seen, const QString& root,
-                           const QString& title_id) {
-	const auto path = QDir(root).filePath(
-	    QStringLiteral("%1/%2").arg(QString::fromLatin1(SAVE_DATA_DIR), title_id));
+                           const QString& title_id, const QString& save_data_folder) {
+	const auto folder =
+	    save_data_folder.trimmed().isEmpty() ? QString::fromLatin1(SAVE_DATA_DIR) : save_data_folder.trimmed();
+	const auto path = QDir(root).filePath(QStringLiteral("%1/%2").arg(folder, title_id));
 	QDir dir(path);
 	if (!dir.exists()) {
 		return;
@@ -211,7 +212,7 @@ static QStringList GetSaveDataDirs(const Configuration& info) {
 	}
 
 	for (const auto& root: roots) {
-		AddSaveDataDir(&dirs, &seen, root, info.title_id.trimmed());
+		AddSaveDataDir(&dirs, &seen, root, info.title_id.trimmed(), info.save_data_folder);
 	}
 
 	return dirs;

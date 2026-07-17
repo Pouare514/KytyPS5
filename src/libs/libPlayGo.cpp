@@ -27,6 +27,7 @@ static constexpr uint64_t PLAYGO_LANGUAGE_MASK_ALL      = 0xffffffffffffffffull;
 static constexpr uint64_t PLAYGO_SCENARIO_MASK_ALL      = 0x1full;
 
 static uint32_t g_chunks_num = 0;
+static std::vector<int8_t> g_chunk_locus;
 
 struct PlayGoInitParams {
 	const void* buf_addr;
@@ -69,6 +70,28 @@ static bool is_valid_chunk(uint16_t chunk_id) {
 static bool is_valid_locus(int8_t locus) {
 	return locus == PLAYGO_LOCUS_NOT_DOWNLOADED || locus == PLAYGO_LOCUS_LOCAL_SLOW ||
 	       locus == PLAYGO_LOCUS_LOCAL_FAST;
+}
+
+static void ensure_locus_state() {
+	ensure_chunks_loaded();
+	if (g_chunk_locus.size() != g_chunks_num) {
+		g_chunk_locus.assign(g_chunks_num, PLAYGO_LOCUS_LOCAL_FAST);
+	}
+}
+
+static int8_t get_chunk_locus(uint16_t chunk_id) {
+	ensure_locus_state();
+	if (!is_valid_chunk(chunk_id)) {
+		return PLAYGO_LOCUS_NOT_DOWNLOADED;
+	}
+	return g_chunk_locus[chunk_id];
+}
+
+static void set_chunk_locus(uint16_t chunk_id, int8_t locus) {
+	ensure_locus_state();
+	if (is_valid_chunk(chunk_id)) {
+		g_chunk_locus[chunk_id] = locus;
+	}
 }
 
 static int validate_handle(int handle) {
@@ -160,7 +183,7 @@ int KYTY_SYSV_ABI PlayGoGetLocus(int handle, const uint16_t* chunk_ids, uint32_t
 		LOGF("\t chunk_ids[%u] = %" PRIu16 "\n", i, chunk_ids[i]);
 
 		if (is_valid_chunk(chunk_ids[i])) {
-			out_loci[i] = PLAYGO_LOCUS_LOCAL_FAST;
+			out_loci[i] = get_chunk_locus(chunk_ids[i]);
 		} else {
 			return PLAYGO_ERROR_BAD_CHUNK_ID;
 		}
@@ -254,7 +277,19 @@ int KYTY_SYSV_ABI PlayGoGetToDoList(int handle, PlayGoToDo* out_todo_list,
 	if (number_of_entries != 0 && out_todo_list == nullptr) {
 		return PLAYGO_ERROR_BAD_POINTER;
 	}
-	*out_entries = 0;
+
+	ensure_locus_state();
+
+	uint32_t entries = 0;
+	for (uint32_t i = 0; i < g_chunks_num && entries < number_of_entries; i++) {
+		if (g_chunk_locus[i] < PLAYGO_LOCUS_LOCAL_FAST) {
+			out_todo_list[entries].chunk_id = static_cast<uint16_t>(i);
+			out_todo_list[entries].locus    = g_chunk_locus[i];
+			out_todo_list[entries].reserved = 0;
+			entries++;
+		}
+	}
+	*out_entries = entries;
 
 	return OK;
 }
@@ -284,6 +319,7 @@ int KYTY_SYSV_ABI PlayGoSetToDoList(int handle, const PlayGoToDo* todo_list,
 		if (!is_valid_locus(todo_list[i].locus)) {
 			return PLAYGO_ERROR_BAD_LOCUS;
 		}
+		set_chunk_locus(todo_list[i].chunk_id, todo_list[i].locus);
 	}
 
 	return OK;
@@ -314,6 +350,10 @@ int KYTY_SYSV_ABI PlayGoPrefetch(int handle, const uint16_t* chunk_ids, uint32_t
 	for (uint32_t i = 0; i < number_of_entries; i++) {
 		if (!is_valid_chunk(chunk_ids[i])) {
 			return PLAYGO_ERROR_BAD_CHUNK_ID;
+		}
+		const auto current = get_chunk_locus(chunk_ids[i]);
+		if (current < minimum_locus) {
+			set_chunk_locus(chunk_ids[i], minimum_locus);
 		}
 	}
 
@@ -378,7 +418,12 @@ int KYTY_SYSV_ABI PlayGoGetProgress(int handle, const uint16_t* chunk_ids,
 	}
 
 	out_progress->total_size    = number_of_entries;
-	out_progress->progress_size = number_of_entries;
+	out_progress->progress_size = 0;
+	for (uint32_t i = 0; i < number_of_entries; i++) {
+		if (get_chunk_locus(chunk_ids[i]) >= PLAYGO_LOCUS_LOCAL_FAST) {
+			out_progress->progress_size++;
+		}
+	}
 
 	return OK;
 }
