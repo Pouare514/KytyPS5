@@ -183,6 +183,13 @@ bool UsesGds(const Program& program) {
 
 } // namespace
 
+uint32_t PushConstantVulkanRangeSize(uint32_t logical_bytes) {
+	if (logical_bytes == 0) {
+		return 0;
+	}
+	return ((logical_bytes + 15u) / 16u) * 16u;
+}
+
 bool AllocateBindings(Program* program, const BindingLayoutOptions& options, std::string* error) {
 	if (program == nullptr || !program->shader_info_complete || program->binding_layout_complete) {
 		if (error != nullptr) {

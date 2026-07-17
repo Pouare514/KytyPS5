@@ -1315,6 +1315,41 @@ void TestNativeBindingLayoutSrtAndUserDataOverflow() {
         "oversized sparse user data was not moved to a descriptor binding");
 }
 
+void TestPushConstantVulkanRangeAlignment() {
+  Check(PushConstantVulkanRangeSize(0) == 0,
+        "zero-byte push constants should not reserve a Vulkan range");
+  Check(PushConstantVulkanRangeSize(16) == 16,
+        "vec4-aligned push constants should keep the same range size");
+  Check(PushConstantVulkanRangeSize(120) == 128,
+        "120-byte SPIR-V push constant blocks require a 128-byte Vulkan range");
+
+  Program program;
+  program.stage = ShaderType::Pixel;
+  program.blocks.resize(1);
+  for (uint32_t i = 0; i < 30; i++) {
+    Instruction direct;
+    direct.pc = i * 4;
+    direct.op = Opcode::MoveU32;
+    direct.dst.kind = OperandKind::Register;
+    direct.dst.reg = {RegisterFile::Vector, i};
+    direct.src[0] = Sgpr(i);
+    direct.src_count = 1;
+    program.blocks[0].instructions.push_back(direct);
+  }
+  std::string error;
+  ShaderPixelInputInfo pixel;
+  Check(BuildScalarProvenance(&program, &error) &&
+            BuildSrtPlan(&program, &error) && PatchSrtReads(&program, &error) &&
+            TrackResources(&program, &error) &&
+            CollectShaderInfo(&program, {.pixel = &pixel}, &error) &&
+            AllocateBindings(&program, {}, &error),
+        error.c_str());
+  Check(program.bindings.push_constant_size == 120 &&
+            program.bindings.user_data_registers.size() == 30 &&
+            PushConstantVulkanRangeSize(program.bindings.push_constant_size) == 128,
+        "30 user-data registers should keep 120-byte logical data in a 128-byte Vulkan range");
+}
+
 void TestNativeBindingLayoutGds() {
   Program program;
   program.stage = ShaderType::Compute;
@@ -1762,6 +1797,7 @@ int main() {
     RUN(TestTrackedProgramIsImmutable);
     RUN(TestNativeBindingLayout);
     RUN(TestNativeBindingLayoutSrtAndUserDataOverflow);
+    RUN(TestPushConstantVulkanRangeAlignment);
     RUN(TestNativeBindingLayoutGds);
     RUN(TestNativeBindingLayoutIsTransactional);
     RUN(TestNativeBindingLayoutTracksReachingUserData);

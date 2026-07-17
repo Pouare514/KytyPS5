@@ -1192,41 +1192,105 @@ void TestProgramMemoryRegistrationAndProtection() {
 void TestReserveFixedAfterGpuUnmapSub64K() {
 	const char* test = "ReserveFixedAfterGpuUnmapSub64K";
 
-	constexpr uint64_t arena_base      = 0x1000000000ull;
-	constexpr uint64_t reserve_len       = SceKernelPageSize * 12;
-	constexpr uint64_t sub64k_offset     = 0xC000;
-	constexpr uint64_t mapped_vaddr      = arena_base + sub64k_offset;
+	auto run_case = [&](uint64_t offset, uint64_t map_size, uint64_t arena_pages, const char* label) {
+		void* arena = nullptr;
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelReserveVirtualRange(
+		            &arena, SceKernelPageSize * arena_pages, 0, SceKernelPageSize),
+		        "KernelReserveVirtualRange(arena)");
+		const auto base         = reinterpret_cast<uint64_t>(arena);
+		const auto mapped_vaddr = base + offset;
 
-	void* arena = reinterpret_cast<void*>(arena_base);
+		void* fixed = reinterpret_cast<void*>(mapped_vaddr);
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+		            &fixed, map_size, SceKernelProtCpuRw, SceKernelMapFixed, label),
+		        "KernelMapNamedFlexibleMemory(sub64k MAP_FIXED)");
+		Check(test, reinterpret_cast<uint64_t>(fixed) == mapped_vaddr,
+		      "MAP_FIXED flexible mapping moved");
+
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelReserveVirtualRange(
+		            &fixed, map_size, SceKernelMapFixed, SceKernelPageSize),
+		        "KernelReserveVirtualRange(MAP_FIXED replace)");
+		Check(test, reinterpret_cast<uint64_t>(fixed) == mapped_vaddr,
+		      "MAP_FIXED reserve moved");
+
+		ExpectRange(test, Query(test, mapped_vaddr), base, base + SceKernelPageSize * arena_pages, 0,
+		            0, 0, 0, 0);
+
+		void* remapped = reinterpret_cast<void*>(mapped_vaddr);
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+		            &remapped, map_size, SceKernelProtCpuRw, SceKernelMapFixed, "cleanup_split"),
+		        "KernelMapNamedFlexibleMemory(cleanup split)");
+		CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(mapped_vaddr, map_size),
+		        "KernelMunmap(replaced page)");
+		CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, offset),
+		        "KernelMunmap(left reserve cleanup)");
+		if (offset + map_size < SceKernelPageSize * arena_pages) {
+			CheckOk(test,
+			        Libs::LibKernel::Memory::KernelMunmap(base + offset + map_size,
+			                                              SceKernelPageSize * arena_pages -
+			                                                  offset - map_size),
+			        "KernelMunmap(right reserve cleanup)");
+		}
+	};
+
+	run_case(0xC000, SceKernelPageSize, 4, "sub64k_replace_c000");
+	run_case(0x4000, SceKernelPageSize, 4, "sub64k_replace_4000");
+	run_case(0xC000, SceKernelPageSize * 2, 5, "sub64k_replace_c000_8k");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestReserveFixedAfterDirectMapOnReservedSub64K() {
+	const char* test = "ReserveFixedAfterDirectMapOnReservedSub64K";
+
+	void* arena = nullptr;
 	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&arena, reserve_len, 0,
-	                                                           SceKernelPageSize),
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(
+	            &arena, SceKernelPageSize * 4, 0, SceKernelPageSize),
 	        "KernelReserveVirtualRange(arena)");
-	Check(test, reinterpret_cast<uint64_t>(arena) == arena_base, "arena address moved");
+	const auto base         = reinterpret_cast<uint64_t>(arena);
+	const auto mapped_vaddr = base + 0xC000;
+
+	int64_t phys = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), SceKernelPageSize,
+	            SceKernelPageSize, SceKernelMtypeC, &phys),
+	        "KernelAllocateDirectMemory");
 
 	void* fixed = reinterpret_cast<void*>(mapped_vaddr);
 	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
-	            &fixed, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "sub64k_replace"),
-	        "KernelMapNamedFlexibleMemory(sub64k MAP_FIXED)");
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &fixed, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, phys, 0,
+	            "sub64k_direct_replace"),
+	        "KernelMapNamedDirectMemory(sub64k MAP_FIXED)");
 	Check(test, reinterpret_cast<uint64_t>(fixed) == mapped_vaddr,
-	      "MAP_FIXED flexible mapping moved");
-
-	ExpectRange(test, Query(test, mapped_vaddr), mapped_vaddr, mapped_vaddr + SceKernelPageSize,
-	            SceKernelProtCpuRw, 1, 0, 0, 1, "sub64k_replace");
+	      "MAP_FIXED direct mapping moved");
 
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelReserveVirtualRange(
 	            &fixed, SceKernelPageSize, SceKernelMapFixed, SceKernelPageSize),
 	        "KernelReserveVirtualRange(MAP_FIXED replace)");
-	Check(test, reinterpret_cast<uint64_t>(fixed) == mapped_vaddr,
-	      "MAP_FIXED reserve moved");
+	Check(test, reinterpret_cast<uint64_t>(fixed) == mapped_vaddr, "MAP_FIXED reserve moved");
 
-	ExpectRange(test, Query(test, mapped_vaddr), arena_base, arena_base + reserve_len, 0, 0, 0, 0,
-	            0);
+	ExpectRange(test, Query(test, mapped_vaddr), base, base + SceKernelPageSize * 4, 0, 0, 0, 0, 0);
 
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(arena_base, reserve_len),
-	        "KernelMunmap(arena cleanup)");
+	void* remapped = reinterpret_cast<void*>(mapped_vaddr);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &remapped, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, phys, 0,
+	            "sub64k_direct_cleanup"),
+	        "KernelMapNamedDirectMemory(cleanup)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(mapped_vaddr, SceKernelPageSize),
+	        "KernelMunmap(replaced page)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, 0xC000),
+	        "KernelMunmap(left reserve cleanup)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys, SceKernelPageSize),
+	        "KernelReleaseDirectMemory");
 
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -1241,6 +1305,7 @@ int main() {
 	RunTest(TestPartialFlexibleMunmapAndFindNext);
 	RunTest(TestReserveMapFixedAndNoOverwrite);
 	RunTest(TestReserveFixedAfterGpuUnmapSub64K);
+	RunTest(TestReserveFixedAfterDirectMapOnReservedSub64K);
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);

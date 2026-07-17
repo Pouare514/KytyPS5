@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderState.h"
 #include "graphics/host_gpu/renderer/shaderSubgroup.h"
+#include "graphics/shader/recompiler/BindingLayout.h"
 #include "graphics/shader/recompiler/ShaderIR.h"
 #include "graphics/shader/shader.h"
 
@@ -438,7 +439,9 @@ static void CreateLayout(VkDescriptorSetLayout* set_layouts, uint32_t* set_layou
 
 	if (bindings.push_constant_size != 0) {
 		AddOrMergePushConstantRange(push_constant_info, push_constant_info_num, vk_stage,
-		                            bindings.push_constant_offset, bindings.push_constant_size);
+		                            bindings.push_constant_offset,
+		                            ShaderRecompiler::IR::PushConstantVulkanRangeSize(
+		                                bindings.push_constant_size));
 	}
 
 	if (need_descriptor) {

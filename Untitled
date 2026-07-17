@@ -1,0 +1,16 @@
+Num compiled 2 shaders
+Num compiled 3 shaders
+Num compiled 4 shaders
+AJM codec=1, name=ATRAC9 decoder
+Num compiled 5 shaders
+Num compiled 6 shaders
+Num compiled 7 shaders
+Num compiled 8 shaders
+--- Stack Trace ---
+[0] 0000000000436939
+[1] 0000000000243b5a
+[2] 00000000002454cd
+[3] 0000000900be209b
+--- Error ---
+reserve-fixed backend unmap failed after GPU unmap: addr=0x0000000012a68000 size=0x0000000000004000
+ in C:\codes\KytyPS5-main\src\kernel\memory.cpp:3295

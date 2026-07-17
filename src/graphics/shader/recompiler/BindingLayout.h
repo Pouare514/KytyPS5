@@ -15,6 +15,8 @@ bool AllocateBindings(Program* program, const BindingLayoutOptions& options, std
 
 const DescriptorBinding* FindBinding(const BindingLayout& layout, DescriptorBindingKind kind);
 
+uint32_t PushConstantVulkanRangeSize(uint32_t logical_bytes);
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_BINDINGLAYOUT_H_ */

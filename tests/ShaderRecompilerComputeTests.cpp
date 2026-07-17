@@ -1478,7 +1478,8 @@ public:
     if (layout.push_constant_size != 0) {
       push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
       push_range.offset = layout.push_constant_offset;
-      push_range.size = layout.push_constant_size;
+      push_range.size =
+          PushConstantVulkanRangeSize(layout.push_constant_size);
       pipeline_layout_info.pushConstantRangeCount = 1;
       pipeline_layout_info.pPushConstantRanges = &push_range;
     }
@@ -1884,7 +1885,8 @@ public:
               "fragment push constant data size does not match reflection");
       push_constant_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
       push_constant_range.offset = fragment_bind.push_constant_offset;
-      push_constant_range.size = fragment_bind.push_constant_size;
+      push_constant_range.size =
+          PushConstantVulkanRangeSize(fragment_bind.push_constant_size);
     }
 
     VkPipelineLayoutCreateInfo pipeline_layout_info{};
