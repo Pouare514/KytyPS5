@@ -63,10 +63,17 @@ constexpr uint64_t PAGE_TABLE_POOL_SIZE   = 4ull * 1024ull * 1024ull * 1024ull;
 constexpr uint64_t PAGE_TABLE_GRANULARITY = 2ull * 1024ull * 1024ull;
 constexpr int      PAGE_TABLE_POOL_ENTRIES =
     static_cast<int>(PAGE_TABLE_POOL_SIZE / PAGE_TABLE_GRANULARITY);
-constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 4ull * 1024ull * 1024ull * 1024ull;
+constexpr uint64_t PS5_TOTAL_MEMORY_SIZE =
+    static_cast<uint64_t>(16384) * 1024ull * 1024ull; // 16 GiB system RAM
+constexpr uint64_t PS5_DIRECT_MEMORY_SIZE =
+    static_cast<uint64_t>(13824) * 1024ull * 1024ull; // sceKernelGetDirectMemorySize()
+constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = PS5_TOTAL_MEMORY_SIZE - PS5_DIRECT_MEMORY_SIZE;
 
 static uint64_t g_flexible_memory_size           = DEFAULT_FLEXIBLE_MEMORY_SIZE;
 static uint64_t g_flexible_program_code_bytes  = 0;
+
+static bool CountsTowardFlexibleProgramQuota(const char* name);
+static bool CountsTowardFlexibleMappingQuota(const char* name);
 
 static Graphics::GpuResourceManager& GetGpuResources() {
 	return *Graphics::g_render_ctx->GetGpuResources();
@@ -1440,10 +1447,29 @@ void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func) {
 	}
 }
 
+uint64_t GetDefaultFlexibleMemorySize() {
+	return DEFAULT_FLEXIBLE_MEMORY_SIZE;
+}
+
+uint64_t GetFlexibleMemorySize() {
+	return g_flexible_memory_size;
+}
+
 void SetFlexibleMemorySize(uint64_t size) {
 	g_flexible_memory_size = size;
 	LOGF("\t flexible memory size = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n", size,
 	     size / (1024ull * 1024ull));
+}
+
+void SyncFlexibleMemoryFromProcParam(uint64_t flex_scalar) {
+	constexpr uint64_t flexible_base = 64ull * 1024ull * 1024ull;
+	const auto         configured    = flex_scalar + flexible_base;
+	if (g_flexible_memory_size != configured) {
+		LOGF("SyncFlexibleMemoryFromProcParam: kernel flex 0x%016" PRIx64
+		     " != proc_param 0x%016" PRIx64 ", updating kernel\n",
+		     g_flexible_memory_size, configured);
+		SetFlexibleMemorySize(configured);
+	}
 }
 
 bool PhysicalMemory::Alloc(uint64_t search_start, uint64_t search_end, size_t len, size_t alignment,
@@ -1877,8 +1903,12 @@ bool FlexibleMemory::Map(uint64_t vaddr, size_t len, int prot, VirtualMemory::Mo
                          GpuAccessMode gpu_mode, const char* name) {
 	Common::LockGuard lock(m_mutex);
 
-	const auto available = (Size() >= m_allocated_total ? Size() - m_allocated_total : 0);
-	if (len == 0 || len > available) {
+	const uint64_t used      = m_allocated_total + g_flexible_program_code_bytes;
+	const auto     available = (Size() >= used ? Size() - used : 0);
+	if (len == 0) {
+		return false;
+	}
+	if (CountsTowardFlexibleMappingQuota(name) && len > available) {
 		LOGF_COLOR(Log::Color::Red,
 		           "\t flexible memory exhausted: configured = 0x%016" PRIx64
 		           ", allocated = 0x%016" PRIx64 ", available = 0x%016" PRIx64
@@ -1898,7 +1928,9 @@ bool FlexibleMemory::Map(uint64_t vaddr, size_t len, int prot, VirtualMemory::Mo
 	CopyVirtualRangeName(b.name, name);
 
 	m_allocated.push_back(b);
-	m_allocated_total += len;
+	if (CountsTowardFlexibleMappingQuota(name)) {
+		m_allocated_total += len;
+	}
 
 	return true;
 }
@@ -1927,6 +1959,12 @@ bool FlexibleMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 		}
 	};
 
+	auto subtract_mapping_quota = [&](const AllocatedBlock& block, uint64_t unmap_size) {
+		if (CountsTowardFlexibleMappingQuota(block.name)) {
+			m_allocated_total -= unmap_size;
+		}
+	};
+
 	size_t index = 0;
 	for (auto& b: m_allocated) {
 		if (b.map_vaddr == vaddr && b.map_size == size) {
@@ -1935,7 +1973,7 @@ bool FlexibleMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 			const auto host_size  = b.host_size;
 
 			m_allocated.erase(m_allocated.begin() + static_cast<std::ptrdiff_t>(index));
-			m_allocated_total -= size;
+			subtract_mapping_quota(b, size);
 			set_host_release_if_last(host_vaddr, host_size);
 			return true;
 		}
@@ -1948,7 +1986,7 @@ bool FlexibleMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 
 			b.map_size = vaddr - b.map_vaddr;
 			m_allocated.push_back(right);
-			m_allocated_total -= size;
+			subtract_mapping_quota(b, size);
 			return true;
 		}
 		if (vaddr == b.map_vaddr && size < b.map_size) {
@@ -1956,14 +1994,14 @@ bool FlexibleMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 
 			b.map_vaddr += size;
 			b.map_size -= size;
-			m_allocated_total -= size;
+			subtract_mapping_quota(b, size);
 			return true;
 		}
 		if (vaddr > b.map_vaddr && vaddr + size == b.map_vaddr + b.map_size) {
 			*gpu_mode = b.gpu_mode;
 
 			b.map_size = vaddr - b.map_vaddr;
-			m_allocated_total -= size;
+			subtract_mapping_quota(b, size);
 			return true;
 		}
 		index++;
@@ -2029,6 +2067,18 @@ static bool CountsTowardFlexibleProgramQuota(const char* name) {
 	const auto lower = Common::ToLower(name);
 	return !Common::EndsWith(lower, "libc.prx") && !Common::EndsWith(lower, "libkernel.prx") &&
 	       !Common::EndsWith(lower, "libkernel_sys.prx");
+}
+
+static bool CountsTowardFlexibleMappingQuota(const char* name) {
+	if (name == nullptr) {
+		return true;
+	}
+
+	if (std::strcmp(name, "SceKernelInternalMemory") == 0 || std::strcmp(name, "stack") == 0) {
+		return false;
+	}
+
+	return true;
 }
 
 uint64_t FlexibleMemory::Available() {

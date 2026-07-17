@@ -204,13 +204,15 @@ void Run(const RunOptions& options) {
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");
 
 	auto param_json = options.app0_dir / "sce_sys" / "param.json";
+	uint64_t        flexible_memory_size = 0;
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);
-		if (auto flexible_memory_size = Loader::SystemContentGetFlexibleMemorySize();
-		    flexible_memory_size != 0) {
-			Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
-		}
+		flexible_memory_size = Loader::SystemContentGetFlexibleMemorySize();
 	}
+	if (flexible_memory_size == 0) {
+		flexible_memory_size = Libs::LibKernel::Memory::GetDefaultFlexibleMemorySize();
+	}
+	Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
 
 	MountSandboxDirs();
 

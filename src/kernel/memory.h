@@ -95,7 +95,10 @@ static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
               "KernelMemoryPoolBlockStats struct size is incorrect");
 
 void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
-void SetFlexibleMemorySize(uint64_t size);
+uint64_t GetDefaultFlexibleMemorySize();
+uint64_t GetFlexibleMemorySize();
+void     SetFlexibleMemorySize(uint64_t size);
+void     SyncFlexibleMemoryFromProcParam(uint64_t flex_scalar);
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;

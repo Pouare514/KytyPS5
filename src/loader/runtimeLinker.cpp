@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -42,6 +43,10 @@ void SetProgName(const std::string& name);
 } // namespace Libs::LibKernel
 
 namespace Loader {
+
+namespace {
+void SynthesizeProgramProcParam(Program* program);
+} // namespace
 
 Program::Program() = default;
 
@@ -1400,6 +1405,11 @@ void RuntimeLinker::Execute() {
 
 	PreloadAdjacentPrograms();
 	RelocateAll();
+	for (auto* program: m_programs) {
+		if (program->elf != nullptr && !program->elf->IsShared()) {
+			SynthesizeProgramProcParam(program);
+		}
+	}
 	StartAllModules();
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
@@ -1916,6 +1926,130 @@ static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 	return base_size;
 }
 
+namespace {
+
+constexpr uint64_t FLEXIBLE_MEMORY_BASE        = 64ull * 1024ull * 1024ull;
+constexpr uint32_t ORBIS_PROC_PARAM_MAGIC      = 0x13bccf52u;
+constexpr uint64_t ORBIS_PROC_PARAM_STRUCT_SIZE = 0x60;
+constexpr uint64_t PROC_PARAM_SYNTH_SIZE       = 0x90;
+
+#pragma pack(push, 1)
+struct GuestKernelMemParam {
+	uint64_t size;
+	uint64_t extended_page_table;
+	uint64_t flexible_memory_size;
+	uint64_t extended_memory_1;
+	uint64_t extended_gpu_page_table;
+	uint64_t extended_memory_2;
+	uint64_t extended_cpu_page_table;
+};
+static_assert(sizeof(GuestKernelMemParam) == 0x38);
+
+struct GuestProcParam {
+	uint64_t size;
+	uint32_t magic;
+	uint32_t entry_count;
+	uint64_t sdk_version;
+	uint64_t process_name;
+	uint64_t main_thread_name;
+	uint64_t main_thread_prio;
+	uint64_t main_thread_stack_size;
+	uint64_t libc_param;
+	uint64_t mem_param;
+	uint64_t fs_param;
+	uint64_t process_preload_enable;
+	uint64_t unknown1;
+};
+static_assert(sizeof(GuestProcParam) == 0x60);
+#pragma pack(pop)
+
+static uint64_t GetProgramSdkVersion(const Program* program) {
+	if (program == nullptr || program->elf == nullptr) {
+		return 0x05000000ull;
+	}
+
+	uint64_t module_attr = 0;
+	if (const auto* dyn = program->elf->GetDynValue(DT_OS_MODULE_ATTR); dyn != nullptr) {
+		module_attr = static_cast<uint64_t>(dyn->d_un.d_val);
+	}
+	if (module_attr != 0) {
+		return module_attr;
+	}
+
+	return 0x05000000ull;
+}
+
+static bool MakeGuestRegionWritable(uint64_t vaddr, uint64_t size) {
+	Common::VirtualMemory::Mode old_mode {};
+	if (!Common::VirtualMemory::Protect(vaddr, size, Common::VirtualMemory::Mode::ReadWrite,
+	                                    &old_mode)) {
+		return false;
+	}
+	Libs::LibKernel::Memory::UpdateProgramMemoryProtection(vaddr, size,
+	                                                       Common::VirtualMemory::Mode::ReadWrite);
+	return true;
+}
+
+void SynthesizeProgramProcParam(Program* program) {
+	if (program == nullptr || program->proc_param_vaddr == 0) {
+		return;
+	}
+
+	const auto configured = Libs::LibKernel::Memory::GetFlexibleMemorySize();
+	const auto flex_scalar =
+	    (configured > FLEXIBLE_MEMORY_BASE ? configured - FLEXIBLE_MEMORY_BASE : 0ull);
+
+	const auto proc_vaddr = program->proc_param_vaddr;
+	const auto synth_size = std::max(program->proc_param_size, PROC_PARAM_SYNTH_SIZE);
+
+	if (!MakeGuestRegionWritable(proc_vaddr, synth_size)) {
+		LOGF("SynthesizeProgramProcParam: failed to make proc_param writable at 0x%016" PRIx64 "\n",
+		     proc_vaddr);
+		return;
+	}
+
+	auto* proc = reinterpret_cast<GuestProcParam*>(proc_vaddr);
+
+	if (proc->mem_param != 0) {
+		auto* mem = reinterpret_cast<GuestKernelMemParam*>(proc->mem_param);
+		if (mem->size >= offsetof(GuestKernelMemParam, flexible_memory_size) + sizeof(uint64_t) &&
+		    mem->flexible_memory_size != 0) {
+			auto* flex_ptr = reinterpret_cast<uint64_t*>(mem->flexible_memory_size);
+			LOGF("SynthesizeProgramProcParam: patching existing flex scalar at 0x%016" PRIx64
+			     " (was 0x%016" PRIx64 ")\n",
+			     mem->flexible_memory_size, *flex_ptr);
+			*flex_ptr = flex_scalar;
+			Libs::LibKernel::Memory::SyncFlexibleMemoryFromProcParam(flex_scalar);
+			return;
+		}
+	}
+
+	const auto mem_vaddr   = proc_vaddr + sizeof(GuestProcParam);
+	const auto scalar_vaddr = mem_vaddr + sizeof(GuestKernelMemParam);
+
+	auto* mem    = reinterpret_cast<GuestKernelMemParam*>(mem_vaddr);
+	auto* scalar = reinterpret_cast<uint64_t*>(scalar_vaddr);
+
+	std::memset(proc, 0, synth_size);
+	proc->size        = ORBIS_PROC_PARAM_STRUCT_SIZE;
+	proc->magic       = ORBIS_PROC_PARAM_MAGIC;
+	proc->entry_count = 1;
+	proc->sdk_version = GetProgramSdkVersion(program);
+	proc->mem_param   = mem_vaddr;
+
+	mem->size                  = sizeof(GuestKernelMemParam);
+	mem->flexible_memory_size  = scalar_vaddr;
+	*scalar                    = flex_scalar;
+
+	Libs::LibKernel::Memory::SyncFlexibleMemoryFromProcParam(flex_scalar);
+
+	LOGF("SynthesizeProgramProcParam: proc=0x%016" PRIx64 " mem_param=0x%016" PRIx64
+	     " flex_scalar=0x%016" PRIx64 " configured=0x%016" PRIx64 " sdk=0x%016" PRIx64 "\n",
+	     proc_vaddr, mem_vaddr, flex_scalar, configured, proc->sdk_version);
+}
+
+} // namespace
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	KYTY_PROFILER_FUNCTION();
@@ -1959,7 +2093,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	    program->base_vaddr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
 	Libs::LibKernel::Memory::RegisterProgramFlexibleQuota(
-	    program->base_size, Common::PathToString(program->file_name.filename()).c_str());
+	    program->mapped_size, Common::PathToString(program->file_name.filename()).c_str());
 
 	LOGF("base_vaddr             = 0x%016" PRIx64 "\n"
 	     "base_size              = 0x%016" PRIx64 "\n"
@@ -2033,6 +2167,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			EXIT_IF(phdr[i].p_vaddr >= program->base_size);
 
 			program->proc_param_vaddr = phdr[i].p_vaddr + program->base_vaddr;
+			program->proc_param_size  = phdr[i].p_memsz;
+			LOGF("proc_param_vaddr = 0x%016" PRIx64 " size = 0x%016" PRIx64 "\n",
+			     program->proc_param_vaddr, program->proc_param_size);
 		}
 	}
 
@@ -2050,7 +2187,7 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 		EXIT_IF(program->base_vaddr == 0 || program->mapped_size == 0);
 		Libs::LibKernel::Memory::UnregisterProgramMemory(program->base_vaddr, program->mapped_size);
 		Libs::LibKernel::Memory::UnregisterProgramFlexibleQuota(
-		    program->base_size, Common::PathToString(program->file_name.filename()).c_str());
+		    program->mapped_size, Common::PathToString(program->file_name.filename()).c_str());
 		EXIT_IF(!Common::VirtualMemory::Free(program->base_vaddr));
 	}
 
