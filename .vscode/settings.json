@@ -3,6 +3,7 @@
     "cmake.buildDirectory": "${workspaceFolder}/build/vscode-clang",
     "cmake.generator": "Ninja",
     "cmake.environment": {
+        "VULKAN_SDK": "C:/VulkanSDK/1.4.350.0",
         "CC": "clang-cl",
         "CXX": "clang-cl",
         "PATH": "${env:ProgramFiles}/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin;${env:ProgramFiles}/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja;${env:PATH}"

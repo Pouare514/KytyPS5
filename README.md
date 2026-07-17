@@ -95,7 +95,7 @@ the Vulkan/SPIR-V validation rules.
 - Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
   **C++ Clang tools for Windows** component
 - Qt 6 for MSVC 2022 64-bit, including Concurrent, Network, and Widgets
-- Vulkan SDK 1.3 or newer
+- Vulkan SDK 1.4.350 (same version as CI and `scripts/build-windows.cmd`)
 
 The Microsoft C++ compiler (`cl.exe`) is not supported; use `clang-cl`.
 
@@ -160,6 +160,38 @@ The emulator can also be started directly with a legally obtained game directory
 
 Run `kyty_emulator.exe --help` to see the available graphics, logging, validation, profiling, and
 debugging options.
+
+### Troubleshooting
+
+#### Crash at startup with `loader_get_json: Failed to open JSON file ... medal-vulkan64.json`
+
+This happens when a third-party Vulkan layer (commonly [Medal](https://medal.tv/)) is registered in
+Windows but its manifest JSON file is missing, often after an update or partial uninstall. With
+Vulkan validation layers enabled, the loader reports this as a general error.
+
+**Option A — Disable Vulkan validation** (fastest):
+
+In the launcher, uncheck **Enable Vulkan validation layers**, or run:
+
+```powershell
+.\build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame" --vulkan-validation false
+```
+
+**Option B — Fix Medal**:
+
+Reinstall or update Medal, disable Vulkan capture in Medal settings, or uninstall Medal if unused.
+
+**Option C — Disable the Medal layer via environment variable**:
+
+Check the startup log for the exact layer name (`Vulkan available layer: ...`), then:
+
+```powershell
+$env:VK_LOADER_LAYERS_DISABLE = "VK_LAYER_MEDAL_capture"
+.\build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
+```
+
+Recent builds log general loader errors without exiting, but disabling the broken layer or
+validation avoids the noise entirely.
 
 ### AI Use
 

@@ -185,6 +185,13 @@ set(kyty_emulator_link_libraries common vulkan-1 spirv-tools-opt spirv-tools SDL
 set(inc_headers
 	${CMAKE_CURRENT_SOURCE_DIR}
 	${KYTY_THIRD_PARTY_DIR}/SDL2/include
+)
+
+if(DEFINED ENV{VULKAN_SDK})
+	list(APPEND inc_headers $ENV{VULKAN_SDK}/Include)
+endif()
+
+list(APPEND inc_headers
 	${KYTY_THIRD_PARTY_DIR}/Vulkan-Headers/include
 	${KYTY_THIRD_PARTY_DIR}/VulkanMemoryAllocator/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
@@ -193,10 +200,6 @@ set(inc_headers
 	${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 	${KYTY_THIRD_PARTY_DIR}/stb
 )
-
-if(DEFINED ENV{VULKAN_SDK})
-	list(APPEND inc_headers $ENV{VULKAN_SDK}/Include)
-endif()
 
 if (KYTY_CLANG_CL)
 	list(APPEND kyty_emulator_link_libraries winpthread)

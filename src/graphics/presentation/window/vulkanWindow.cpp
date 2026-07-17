@@ -860,7 +860,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		case VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT:
 			severity_str   = "E";
 			severity_style = Log::Color::BrightRed;
-			error          = true;
+			error = (message_types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) != 0;
 			break;
 		default: severity_str = "?";
 	}
