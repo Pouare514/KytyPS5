@@ -25,6 +25,7 @@ void GraphicsRunSubmitFlipPreparation();
 void GraphicsRunWait();
 void GraphicsRunDone();
 int  GraphicsRunGetFrameNum();
+[[nodiscard]] bool              GraphicsRunGpuIsReady() noexcept;
 [[nodiscard]] bool              GraphicsRunIsCommandProcessorThread() noexcept;
 [[nodiscard]] CommandProcessor* GraphicsRunCurrentCommandProcessor() noexcept;
 void                            GraphicsRunFinishCommandProcessors();

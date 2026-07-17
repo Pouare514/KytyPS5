@@ -1,5 +1,7 @@
 #include "common/hostException.h"
 
+#include "common/fatalLog.h"
+
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
@@ -63,13 +65,14 @@ static void LogFatalWinException(PEXCEPTION_POINTERS exception) {
 		(void)GetModuleFileNameA(owner_module, module_name, MAX_PATH);
 	}
 
-	std::fprintf(stderr,
-	           "Fatal win exception: code=0x%08" PRIx32 ", addr=0x%016" PRIx64
-	           ", rip=0x%016" PRIx64 ", rsp=0x%016" PRIx64 ", module=%s\n",
-	           static_cast<uint32_t>(exception_record->ExceptionCode),
-	           reinterpret_cast<uint64_t>(exception_record->ExceptionAddress), rip, context->Rsp,
-	           module_name[0] != '\0' ? module_name : "(unknown)");
-	std::fflush(stderr);
+	char message[512];
+	std::snprintf(message, sizeof(message),
+	              "Fatal win exception: code=0x%08" PRIx32 ", addr=0x%016" PRIx64
+	              ", rip=0x%016" PRIx64 ", rsp=0x%016" PRIx64 ", module=%s",
+	              static_cast<uint32_t>(exception_record->ExceptionCode),
+	              reinterpret_cast<uint64_t>(exception_record->ExceptionAddress), rip, context->Rsp,
+	              module_name[0] != '\0' ? module_name : "(unknown)");
+	LogFatalToFile(message);
 }
 
 static bool IsFatalUnhandledWinException(uint32_t code) {

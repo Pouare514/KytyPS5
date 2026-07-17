@@ -578,8 +578,12 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, VkRenderP
 	                                                      frag_shader_stage_info};
 	const uint32_t                  shader_stage_count = ps_active ? 2u : 1u;
 
-	VkVertexInputAttributeDescription input_attr[ShaderVertexInputInfo::RES_MAX];
-	VkVertexInputBindingDescription   input_desc[ShaderVertexInputInfo::RES_MAX];
+	VkVertexInputAttributeDescription input_attr[ShaderVertexInputInfo::RES_MAX]  = {};
+	VkVertexInputBindingDescription   input_desc[ShaderVertexInputInfo::RES_MAX] = {};
+	uint32_t                          attr_count                                 = 0;
+
+	EXIT_IF(vs_input_info->buffers_num < 0 ||
+	        vs_input_info->buffers_num > ShaderVertexInputInfo::RES_MAX);
 
 	for (int bi = 0; bi < vs_input_info->buffers_num; bi++) {
 		const auto& b          = vs_input_info->buffers[bi];
@@ -589,17 +593,21 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, VkRenderP
 		    (b.fetch_index == 0 ? VK_VERTEX_INPUT_RATE_VERTEX : VK_VERTEX_INPUT_RATE_INSTANCE);
 
 		for (int ai = 0; ai < b.attr_num; ai++) {
-			auto index                 = b.attr_indices[ai];
-			input_attr[index].binding  = bi;
-			input_attr[index].location = index;
-			input_attr[index].offset   = b.attr_offsets[ai];
+			const auto index = b.attr_indices[ai];
+			EXIT_IF(index < 0 || index >= ShaderVertexInputInfo::RES_MAX);
+			EXIT_IF(attr_count >= ShaderVertexInputInfo::RES_MAX);
+
+			auto& attr    = input_attr[attr_count++];
+			attr.binding  = bi;
+			attr.location = static_cast<uint32_t>(index);
+			attr.offset   = b.attr_offsets[ai];
 
 			uint32_t attr_size       = 4;
 			auto     registers_num   = vs_input_info->resources_dst[index].registers_num;
 			auto     used_components = (vs_input_info->resource_fetch_components[index] > 0
 			                                ? vs_input_info->resource_fetch_components[index]
 			                                : registers_num);
-			GetInputFormat(vs_input_info->resources[index], &input_attr[index].format, &attr_size,
+			GetInputFormat(vs_input_info->resources[index], &attr.format, &attr_size,
 			               static_cast<uint32_t>(used_components));
 
 			if (graphics_debug_dump_enabled()) {
@@ -609,8 +617,8 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, VkRenderP
 					LOGF("VertexInputState[%u]: attr=%u binding=%u offset=%u stride=%u fmt=%d "
 					     "src_fmt=%u dst=v%u regs=%u"
 					     " fetched_components=%u attr_size=%u swizzle=%u,%u,%u,%u\n",
-					     log_id, index, input_attr[index].binding, input_attr[index].offset,
-					     input_desc[bi].stride, static_cast<int>(input_attr[index].format),
+					     log_id, index, attr.binding, attr.offset,
+					     input_desc[bi].stride, static_cast<int>(attr.format),
 					     static_cast<uint32_t>(vs_input_info->resources[index].Format()),
 					     static_cast<uint32_t>(vs_input_info->resources_dst[index].register_start),
 					     static_cast<uint32_t>(registers_num),
@@ -710,10 +718,15 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, VkRenderP
 	vertex_input_info.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
 	vertex_input_info.pNext = nullptr;
 	vertex_input_info.flags = 0;
-	vertex_input_info.vertexBindingDescriptionCount   = vs_input_info->buffers_num;
+	vertex_input_info.vertexBindingDescriptionCount   = static_cast<uint32_t>(vs_input_info->buffers_num);
 	vertex_input_info.pVertexBindingDescriptions      = input_desc;
-	vertex_input_info.vertexAttributeDescriptionCount = vs_input_info->resources_num;
+	vertex_input_info.vertexAttributeDescriptionCount = attr_count;
 	vertex_input_info.pVertexAttributeDescriptions    = input_attr;
+
+	if (boot_trace_log()) {
+		LOGF("PipelineTrace: vertex_input buffers=%d attrs=%" PRIu32 " resources_num=%d\n",
+		     vs_input_info->buffers_num, attr_count, vs_input_info->resources_num);
+	}
 
 	VkPipelineInputAssemblyStateCreateInfo input_assembly {};
 	input_assembly.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -880,15 +893,21 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, VkRenderP
 
 	EXIT_IF(pipeline->pipeline_layout != nullptr);
 
-	if (graphics_debug_dump_enabled()) {
+	if (graphics_debug_dump_enabled() || boot_trace_log()) {
 		LOGF("PipelineTrace: vkCreatePipelineLayout begin VS=0x%08" PRIx32 "/0x%08" PRIx32
 		     " PS=0x%08" PRIx32 "/0x%08" PRIx32 " set_layouts=%" PRIu32 " push_constants=%" PRIu32
 		     "\n",
 		     vs_hash0, vs_crc32, ps_hash0, ps_crc32, set_layouts_num, push_constant_info_num);
+		for (uint32_t i = 0; i < push_constant_info_num; i++) {
+			LOGF("PipelineTrace: push_range[%" PRIu32 "] offset=%" PRIu32 " size=%" PRIu32
+			     " stages=0x%08" PRIx32 "\n",
+			     i, push_constant_info[i].offset, push_constant_info[i].size,
+			     static_cast<uint32_t>(push_constant_info[i].stageFlags));
+		}
 	}
 	result = vkCreatePipelineLayout(gctx->device, &pipeline_layout_info, nullptr,
 	                                &pipeline->pipeline_layout);
-	if (graphics_debug_dump_enabled()) {
+	if (graphics_debug_dump_enabled() || boot_trace_log()) {
 		LOGF("PipelineTrace: vkCreatePipelineLayout done result=%s layout=%p\n",
 		     string_VkResult(result), static_cast<void*>(pipeline->pipeline_layout));
 	}
@@ -975,20 +994,20 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, VkRenderP
 
 	EXIT_IF(pipeline->pipeline != nullptr);
 
-	if (graphics_debug_dump_enabled()) {
+	if (graphics_debug_dump_enabled() || boot_trace_log()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=0x%08" PRIx32 "/0x%08" PRIx32
 		     " PS=0x%08" PRIx32 "/0x%08" PRIx32 " topology=%" PRIu32 " color_mask=0x%08" PRIx32
 		     " depth=%s blend=%s dyn_states=%" PRIu32 " viewport=%f,%f %fx%f"
-		     " scissor=%d,%d %ux%u\n",
+		     " scissor=%d,%d %ux%u attrs=%" PRIu32 "\n",
 		     vs_hash0, vs_crc32, ps_hash0, ps_crc32, static_cast<uint32_t>(static_params.topology),
 		     static_params.color_mask[0], (static_params.with_depth ? "true" : "false"),
 		     (static_params.blend_enable[0] ? "true" : "false"), dynamic_states_count, viewport.x,
 		     viewport.y, viewport.width, viewport.height, scissor.offset.x, scissor.offset.y,
-		     scissor.extent.width, scissor.extent.height);
+		     scissor.extent.width, scissor.extent.height, attr_count);
 	}
 	result = vkCreateGraphicsPipelines(gctx->device, nullptr, 1, &pipeline_info, nullptr,
 	                                   &pipeline->pipeline);
-	if (graphics_debug_dump_enabled()) {
+	if (graphics_debug_dump_enabled() || boot_trace_log()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     string_VkResult(result), static_cast<void*>(pipeline->pipeline));
 	}

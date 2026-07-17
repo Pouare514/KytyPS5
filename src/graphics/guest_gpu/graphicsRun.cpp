@@ -1921,6 +1921,10 @@ void GraphicsRunWait() {
 	GraphicsRunSubmissionLock lock;
 }
 
+bool GraphicsRunGpuIsReady() noexcept {
+	return g_gpu != nullptr;
+}
+
 GraphicsRunSubmissionLock::GraphicsRunSubmissionLock() {
 	if (g_gpu == nullptr || g_current_run_cp != nullptr || g_submission_pause_depth == UINT32_MAX) {
 		EXIT("cannot acquire GPU submission lock in the current state\n");

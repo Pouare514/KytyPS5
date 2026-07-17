@@ -3,8 +3,14 @@
 
 namespace Common {
 
-// Disables known Medal Vulkan layers for this process only (orphaned registry entries).
+// Disables known third-party Vulkan layers for this process (Medal, NVIDIA capture, Steam, etc.).
+void DisableKnownVulkanLayers();
+
+// Backward-compatible alias.
 void DisableMedalVulkanLayer();
+
+// Returns getenv("VK_LOADER_LAYERS_DISABLE") after DisableKnownVulkanLayers (may be null).
+const char* GetVulkanLayersDisableEnv();
 
 } // namespace Common
 

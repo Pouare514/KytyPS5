@@ -13,6 +13,22 @@
             "externalConsole": false
         },
         {
+            "name": "Debug kyty_emulator (Minecraft Legends)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}\\build\\windows-debug\\kyty_emulator.exe",
+            "args": [
+                "--game", "D:/PS5/Minecraft Legends 01.013 PPSA05510/eboot.bin",
+                "--printf-direction", "File",
+                "--printf-output-file", "_kyty_debug.txt",
+                "--vulkan-validation", "false"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}\\build\\windows-debug\\install",
+            "environment": [],
+            "externalConsole": true
+        },
+        {
             "name": "Debug kyty_emulator",
             "type": "cppvsdbg",
             "request": "launch",

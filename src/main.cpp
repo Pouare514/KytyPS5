@@ -3,6 +3,8 @@
 #include "common/commonSubsystem.h"
 #include "common/dateTime.h"
 #include "common/debug.h"
+#include "common/emulatorConfig.h"
+#include "common/fatalLog.h"
 #include "common/file.h"
 #include "common/magicEnum.h"
 #include "common/platform/sysDbg.h"
@@ -237,7 +239,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 int main(int argc, char* argv[]) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	Common::InstallCrashDiagnostics();
-	Common::DisableMedalVulkanLayer();
+	Common::DisableKnownVulkanLayers();
 #endif
 
 	auto& slist = *SubsystemsList::Instance();
@@ -275,6 +277,10 @@ int main(int argc, char* argv[]) {
 		PrintUsage();
 		slist.DestroyAll(false);
 		return 0;
+	}
+
+	if (!options.config.printf_output_file.empty()) {
+		Common::SetFatalLogMirrorPath(options.config.printf_output_file.string().c_str());
 	}
 
 	Run(options);

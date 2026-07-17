@@ -621,7 +621,11 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo* info,
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
 
-		LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i, attrib[in.semantic]);
+		static std::atomic<uint32_t> attrib_log_count {0};
+		if (attrib_log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
+			     attrib[in.semantic]);
+		}
 
 		size_t   index       = attrib[in.semantic] & 0x1fu;
 		uint32_t format      = (attrib[in.semantic] >> 5u) & 0x1ffu;

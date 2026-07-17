@@ -26,6 +26,7 @@
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "common/vulkanLayerWorkaround.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/utils.h"
@@ -781,9 +782,19 @@ static void VulkanGetExtensions(SDL_Window* window, VulkanExtensions* r) {
 
 	EXIT_NOT_IMPLEMENTED(available_layers_count != r->available_layers.size());
 
+	{
+		const char* disable_env = Common::GetVulkanLayersDisableEnv();
+		std::printf("VulkanLayerTrace: VK_LOADER_LAYERS_DISABLE=%s\n",
+		            disable_env != nullptr ? disable_env : "(unset)");
+		LOGF("VulkanLayerTrace: VK_LOADER_LAYERS_DISABLE=%s\n",
+		     disable_env != nullptr ? disable_env : "(unset)");
+	}
+
 	for (const auto& l: r->available_layers) {
-		LOGF("Vulkan available layer: %s, specVersion = %u, implVersion = %u, %s\n", l.layerName,
-		     l.specVersion, l.implementationVersion, l.description);
+		std::printf("VulkanLayerTrace: available layer: %s (spec=%u impl=%u)\n", l.layerName,
+		            l.specVersion, l.implementationVersion);
+		LOGF("VulkanLayerTrace: available layer: %s, specVersion = %u, implVersion = %u, %s\n",
+		     l.layerName, l.specVersion, l.implementationVersion, l.description);
 	}
 
 	r->required_layers = {"VK_LAYER_KHRONOS_validation"};

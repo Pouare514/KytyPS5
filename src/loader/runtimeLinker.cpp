@@ -739,6 +739,54 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			dump_guest_qwords("vorbis len", info->rcx);
 		}
 
+		if (info->access_violation_vaddr == UINT64_MAX) {
+			LOGF("guest registers equal to -1:");
+			if (info->rax == UINT64_MAX) {
+				LOGF("\trax\n");
+			}
+			if (info->rbx == UINT64_MAX) {
+				LOGF("\trbx\n");
+			}
+			if (info->rcx == UINT64_MAX) {
+				LOGF("\trcx\n");
+			}
+			if (info->rdx == UINT64_MAX) {
+				LOGF("\trdx\n");
+			}
+			if (info->rsi == UINT64_MAX) {
+				LOGF("\trsi\n");
+			}
+			if (info->rdi == UINT64_MAX) {
+				LOGF("\trdi\n");
+			}
+			if (info->r8 == UINT64_MAX) {
+				LOGF("\tr8\n");
+			}
+			if (info->r9 == UINT64_MAX) {
+				LOGF("\tr9\n");
+			}
+			if (info->r10 == UINT64_MAX) {
+				LOGF("\tr10\n");
+			}
+			if (info->r11 == UINT64_MAX) {
+				LOGF("\tr11\n");
+			}
+			if (info->r12 == UINT64_MAX) {
+				LOGF("\tr12\n");
+			}
+			if (info->r13 == UINT64_MAX) {
+				LOGF("\tr13\n");
+			}
+			if (info->r14 == UINT64_MAX) {
+				LOGF("\tr14\n");
+			}
+			if (info->r15 == UINT64_MAX) {
+				LOGF("\tr15\n");
+			}
+		}
+
+		WriteStubbedImportReport("_ImportReport.txt");
+
 		EXIT("Access violation: %s [%016" PRIx64 "] %s\n",
 		     Common::EnumName(info->access_violation_type).c_str(), info->access_violation_vaddr,
 		     (info->access_violation_vaddr == g_invalid_memory ? "(Unpatched object)" : ""));
@@ -1910,6 +1958,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	Libs::LibKernel::Memory::RegisterProgramMemory(
 	    program->base_vaddr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
+	Libs::LibKernel::Memory::RegisterProgramFlexibleQuota(
+	    program->base_size, Common::PathToString(program->file_name.filename()).c_str());
 
 	LOGF("base_vaddr             = 0x%016" PRIx64 "\n"
 	     "base_size              = 0x%016" PRIx64 "\n"
@@ -1999,6 +2049,8 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 	if (program->base_vaddr != 0 || program->mapped_size != 0) {
 		EXIT_IF(program->base_vaddr == 0 || program->mapped_size == 0);
 		Libs::LibKernel::Memory::UnregisterProgramMemory(program->base_vaddr, program->mapped_size);
+		Libs::LibKernel::Memory::UnregisterProgramFlexibleQuota(
+		    program->base_size, Common::PathToString(program->file_name.filename()).c_str());
 		EXIT_IF(!Common::VirtualMemory::Free(program->base_vaddr));
 	}
 

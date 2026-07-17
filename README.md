@@ -171,9 +171,11 @@ This happens when a third-party Vulkan layer (commonly [Medal](https://medal.tv/
 Windows but its manifest JSON file is missing, often after an update or partial uninstall. Orphaned
 registry entries can remain even after Medal is removed.
 
-**Automatic fix (kyty_emulator):** the emulator sets `VK_LOADER_LAYERS_DISABLE` to include
-`VK_LAYER_MEDAL_capture` and `VK_LAYER_MEDAL_HOOK` at startup. Medal stays enabled for other
-applications; only this process skips the broken layers.
+**Automatic fix (kyty_emulator / launcher):** at startup the process sets `VK_LOADER_LAYERS_DISABLE`
+to skip known third-party layers (Medal, NVIDIA capture `*nvspcap*`, Steam overlay, Discord, OBS).
+Other applications are unaffected; only this process skips them.
+
+Boot logs include `VulkanLayerTrace:` lines listing available layers and the effective disable list.
 
 **Option A — Disable Vulkan validation** (fastest if issues persist):
 
@@ -190,9 +192,27 @@ Reinstall or update Medal, disable Vulkan capture in Medal settings, or uninstal
 **Option C — Manual layer disable** (only if automatic disable is insufficient):
 
 ```powershell
-$env:VK_LOADER_LAYERS_DISABLE = "VK_LAYER_MEDAL_capture,VK_LAYER_MEDAL_HOOK"
+$env:VK_LOADER_LAYERS_DISABLE = "VK_LAYER_MEDAL_capture,VK_LAYER_MEDAL_HOOK,*nvspcap*,~implicit~"
 .\build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
 ```
+
+#### NVIDIA / Steam overlay and crash `0xC0000409`
+
+GeForce Experience / NVIDIA App in-game overlay and other implicit Vulkan layers can hook
+`vkQueuePresentKHR` and trigger native crashes (`-1073740791` / `0xC0000409`).
+
+**Quick test:**
+
+1. Disable **In-Game Overlay** in NVIDIA App / GeForce Experience.
+2. Or run with all implicit layers disabled:
+
+```powershell
+$env:VK_LOADER_LAYERS_DISABLE = "~implicit~"
+.\build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame" --vulkan-validation false
+```
+
+Fatal crash details are appended to `_kyty_fatal.txt` (and the `--printf-output-file` if set):
+`Fatal win exception: rip=..., module=...` or `Security failure: retaddr=..., module=...`.
 
 **Registry cleanup:** if Medal errors still appear, remove stale keys under
 `HKCU\Software\Khronos\Vulkan\ImplicitLayers` that point to `%LocalAppData%\Medal\`.
@@ -217,7 +237,7 @@ echo $LASTEXITCODE
 | Exit code | Meaning |
 |-----------|---------|
 | `0` | Clean exit |
-| `-1073740791` (`0xC0000409`) | Stack buffer overrun — check `_kyty_stderr.txt` for `Security failure:` (retaddr) or `_kyty.txt` for `Fatal win exception:` |
+| `-1073740791` (`0xC0000409`) | Stack buffer overrun — check `_kyty_fatal.txt`, `_kyty_stderr.txt` for `Security failure:` (retaddr) or `_kyty.txt` for `Fatal win exception:` |
 
 Compare with `--vulkan-validation true` to see whether the Vulkan validation layer is involved.
 Recent builds print `Fatal win exception: code=..., rip=..., module=...` before an unhandled crash,

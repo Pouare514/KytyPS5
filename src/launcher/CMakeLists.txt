@@ -19,7 +19,10 @@ add_executable(launcher WIN32
 )
 
 if(WIN32)
-	target_sources(launcher PRIVATE "${CMAKE_SOURCE_DIR}/common/discreteGpuHint.cpp")
+	target_sources(launcher PRIVATE
+		"${CMAKE_SOURCE_DIR}/common/discreteGpuHint.cpp"
+		"${CMAKE_SOURCE_DIR}/common/vulkanLayerWorkaround.cpp"
+	)
 endif()
 
 

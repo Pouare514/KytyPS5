@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/objects/label.h"
 #include "graphics/host_gpu/objects/textureCommon.h"
 #include "graphics/host_gpu/renderer/bufferCache.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/image.h"
 #include "graphics/host_gpu/renderer/imageView.h"
@@ -2561,6 +2562,7 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 			     info.stencil_address, info.stencil_size);
 		}
+	}
 	const bool coherent_guest_stencil =
 	    has_stencil &&
 	    IsCoherentGuestImageSource(stencil_source, info.stencil_address, info.stencil_size);
@@ -2750,7 +2752,8 @@ TextureCache::RegisterVideoOutSurfaces(GraphicContext*                  ctx,
 	return result;
 }
 
-void TextureCache::RefreshVideoOut(VideoOutVulkanImage* image, bool render_target) {
+void TextureCache::RefreshVideoOut(VideoOutVulkanImage* image, bool render_target,
+                                   bool for_present) {
 	if (image == nullptr) {
 		EXIT("TextureCache: invalid video-out refresh, image=%p\n",
 		     static_cast<const void*>(image));
@@ -2764,10 +2767,23 @@ void TextureCache::RefreshVideoOut(VideoOutVulkanImage* image, bool render_targe
 		     static_cast<const void*>(image));
 	}
 	auto& cached = **it;
+	const auto& info = cached.video_out;
 	if (cached.gpu_modified) {
+		if (boot_trace_log()) {
+			LOGF("VideoOutTrace: Refresh skip gpu_modified addr=0x%016" PRIx64
+			     " render_target=%d for_present=%d\n",
+			     info.address, render_target ? 1 : 0, for_present ? 1 : 0);
+		}
 		return;
 	}
-	const auto& info         = cached.video_out;
+	if (for_present && !m_memory_tracker.IsRegionCpuModified(info.address, info.size) &&
+	    !cached.buffer_modified) {
+		if (boot_trace_log()) {
+			LOGF("VideoOutTrace: Refresh skip present gpu addr=0x%016" PRIx64 "\n",
+			     info.address);
+		}
+		return;
+	}
 	const bool  image_dirty  = m_memory_tracker.IsRegionCpuModified(info.address, info.size);
 	const bool  buffer_dirty = cached.buffer_modified ||
 	                           m_buffer_cache.IsRegionCpuModified(info.address, info.size) ||
@@ -2775,6 +2791,10 @@ void TextureCache::RefreshVideoOut(VideoOutVulkanImage* image, bool render_targe
 	if (!image_dirty && !buffer_dirty) {
 		if (info.compression == VideoOutCompression::Uncompressed ||
 		    CanUseVideoOutNativeWithoutUpload(info.compression, render_target, false, false)) {
+			if (boot_trace_log()) {
+				LOGF("VideoOutTrace: Refresh noop addr=0x%016" PRIx64 " render_target=%d\n",
+				     info.address, render_target ? 1 : 0);
+			}
 			return;
 		}
 		EXIT("TextureCache: compressed video-out read requires native GPU contents, "
@@ -2797,6 +2817,11 @@ void TextureCache::RefreshVideoOut(VideoOutVulkanImage* image, bool render_targe
 			     source.cpu_current, source.address, source.size, cached.buffer_modified);
 		}
 		cached.buffer_modified = false;
+	}
+	if (boot_trace_log()) {
+		LOGF("VideoOutTrace: Refresh upload guest addr=0x%016" PRIx64 " image_dirty=%d"
+		     " buffer_dirty=%d render_target=%d\n",
+		     info.address, image_dirty, buffer_dirty, render_target ? 1 : 0);
 	}
 	m_memory_tracker.ForEachUploadRange(
 	    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
@@ -3108,7 +3133,8 @@ void TextureCache::MarkGpuWritten(VulkanImage* image) {
 				    m_buffer_cache.IsRegionCpuModified(cached->Address(i), cached->Size(i));
 				const bool gpu_modified =
 				    m_buffer_cache.IsRegionGpuModified(cached->Address(i), cached->Size(i));
-				if (cpu_modified || gpu_modified) {
+				if (cpu_modified ||
+				    (gpu_modified && cached->kind != CachedImage::Kind::VideoOut)) {
 					EXIT(
 					    "TextureCache: GPU-written image aliases a dirty buffer, addr=0x%016" PRIx64
 					    " size=0x%016" PRIx64 " cpu_modified=%d gpu_modified=%d\n",
@@ -3148,6 +3174,10 @@ void TextureCache::MarkGpuWritten(VulkanImage* image) {
 				m_memory_tracker.MarkRegionAsGpuModified(cached->Address(i), cached->Size(i));
 			}
 			cached->gpu_modified = true;
+			if (cached->kind == CachedImage::Kind::VideoOut && boot_trace_log()) {
+				LOGF("VideoOutTrace: MarkGpuWritten addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     cached->Address(0), cached->Size(0));
+			}
 		}
 		return;
 	}

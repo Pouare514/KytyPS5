@@ -14,9 +14,20 @@ namespace Common {
 
 namespace {
 
-constexpr const char* kMedalVulkanLayerNames[] = {
+constexpr const char* kKnownVulkanLayerDisableGlobs[] = {
     "VK_LAYER_MEDAL_capture",
     "VK_LAYER_MEDAL_HOOK",
+    "VK_LAYER_NV_present",
+    "*nvspcap*",
+    "*Steam*Overlay*",
+    "*steam*overlay*",
+    "VK_LAYER_VALVE_steam_overlay",
+    "*EOS_Overlay*",
+    "VK_LAYER_OW_OVERLAY",
+    "*Discord*",
+    "*discord*",
+    "*obs*",
+    "*OBS*",
 };
 constexpr const char* kLoaderLayersDisable = "VK_LOADER_LAYERS_DISABLE";
 
@@ -43,14 +54,15 @@ bool LayerListContains(std::string_view list, std::string_view layer) {
 
 } // namespace
 
-void DisableMedalVulkanLayer() {
+void DisableKnownVulkanLayers() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	std::string value;
-	if (const char* existing = std::getenv(kLoaderLayersDisable); existing != nullptr && existing[0] != '\0') {
+	if (const char* existing = std::getenv(kLoaderLayersDisable);
+	    existing != nullptr && existing[0] != '\0') {
 		value = existing;
 	}
 
-	for (const char* layer : kMedalVulkanLayerNames) {
+	for (const char* layer : kKnownVulkanLayerDisableGlobs) {
 		if (!LayerListContains(value, layer)) {
 			if (!value.empty()) {
 				value += ',';
@@ -63,8 +75,20 @@ void DisableMedalVulkanLayer() {
 		(void)::_putenv_s(kLoaderLayersDisable, value.c_str());
 	}
 #else
-	(void)kMedalVulkanLayerNames;
+	(void)kKnownVulkanLayerDisableGlobs;
 	(void)kLoaderLayersDisable;
+#endif
+}
+
+void DisableMedalVulkanLayer() {
+	DisableKnownVulkanLayers();
+}
+
+const char* GetVulkanLayersDisableEnv() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return std::getenv(kLoaderLayersDisable);
+#else
+	return nullptr;
 #endif
 }
 

@@ -27,6 +27,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/utils.h"
@@ -399,7 +400,7 @@ PreparedFrame* WindowPrepareFrame(CommandBuffer* buffer, VideoOutVulkanImage* im
 
 	auto*             frame = GetPreparedFramePool()->Acquire();
 	Common::LockGuard render_lock(g_render_ctx->GetMutex());
-	g_render_ctx->GetTextureCache()->RefreshVideoOut(image);
+	g_render_ctx->GetTextureCache()->RefreshVideoOut(image, true, true);
 	ConfigurePreparedFrame(frame, image->extent, image->format);
 	const std::array copies {ImageImageCopy {
 	    .src_image = image, .width = image->extent.width, .height = image->extent.height}};
@@ -523,8 +524,19 @@ void WindowPresentFrame(PreparedFrame* frame) {
 		queue.mutex->Unlock();
 	}
 	switch (result) {
-		case VK_SUCCESS: break;
-		case VK_SUBOPTIMAL_KHR: LOGF("vkQueuePresentKHR returned VK_SUBOPTIMAL_KHR\n"); break;
+		case VK_SUCCESS:
+			if (boot_trace_log()) {
+				LOGF("PresentTrace: vkQueuePresentKHR success image_index=%u present_frame=%u\n",
+				     swapchain->current_index, present_frame);
+			}
+			break;
+		case VK_SUBOPTIMAL_KHR:
+			LOGF("vkQueuePresentKHR returned VK_SUBOPTIMAL_KHR\n");
+			if (boot_trace_log()) {
+				LOGF("PresentTrace: vkQueuePresentKHR suboptimal image_index=%u\n",
+				     swapchain->current_index);
+			}
+			break;
 		case VK_ERROR_OUT_OF_DATE_KHR:
 			LOGF("vkQueuePresentKHR returned VK_ERROR_OUT_OF_DATE_KHR\n");
 			VulkanRecreateSwapchain();

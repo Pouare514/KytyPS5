@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/textureCache.h"
@@ -690,6 +691,10 @@ void FlipQueue::Complete(uint64_t request_id) {
 	}
 	request->state = RequestState::Ready;
 	m_submit_cond_var.Signal();
+	if (Graphics::boot_trace_log()) {
+		LOGF("FlipTrace: Complete id=%" PRIu64 " index=%d state=Ready\n", request_id,
+		     request->index);
+	}
 }
 
 void FlipQueue::WaitForSubmitSlot() {
@@ -737,6 +742,9 @@ bool FlipQueue::Flip(uint32_t micros) {
 
 		if (m_requests.empty()) {
 			m_mutex.Unlock();
+			if (Graphics::boot_trace_log()) {
+				LOGF("FlipTrace: Flip skipped reason=queue_empty\n");
+			}
 			return false;
 		}
 	}
@@ -744,7 +752,14 @@ bool FlipQueue::Flip(uint32_t micros) {
 		EXIT("video-out flip queue processing is already active\n");
 	}
 	if (m_requests.front().state != RequestState::Ready) {
+		const auto state = m_requests.front().state;
+		const auto id      = m_requests.front().id;
+		const auto index   = m_requests.front().index;
 		m_mutex.Unlock();
+		if (Graphics::boot_trace_log()) {
+			LOGF("FlipTrace: Flip skipped id=%" PRIu64 " index=%d reason=not_ready state=%d\n", id,
+			     index, static_cast<int>(state));
+		}
 		return false;
 	}
 	m_processing = true;
@@ -753,6 +768,10 @@ bool FlipQueue::Flip(uint32_t micros) {
 	if (!IsFlipDue(r.cfg)) {
 		Common::LockGuard lock(m_mutex);
 		m_processing = false;
+		if (Graphics::boot_trace_log()) {
+			LOGF("FlipTrace: Flip skipped id=%" PRIu64 " index=%d reason=not_due flip_rate=%d\n",
+			     r.id, r.index, r.cfg->flip_rate);
+		}
 		return false;
 	}
 
@@ -804,6 +823,10 @@ bool FlipQueue::Flip(uint32_t micros) {
 	    Config::GetPrintfDirection() != Config::OutputDirection::Silent) {
 		LOGF("Flip done: %d\n", r.index);
 	}
+	if (Graphics::boot_trace_log()) {
+		LOGF("FlipTrace: presented index=%d id=%" PRIu64 " flip_count=%" PRIu64 "\n", r.index, r.id,
+		     r.cfg->flip_status.count);
+	}
 
 	return true;
 }
@@ -822,7 +845,11 @@ bool VideoOutFlipWindow(uint32_t micros) {
 
 	WaitForNextVblank();
 
-	return g_video_out_context->GetFlipQueue().Flip(micros);
+	const bool presented = g_video_out_context->GetFlipQueue().Flip(micros);
+	if (Graphics::boot_trace_log()) {
+		LOGF("FlipTrace: VideoOutFlipWindow presented=%s\n", presented ? "true" : "false");
+	}
+	return presented;
 }
 
 void VideoOutBeginVblank() {

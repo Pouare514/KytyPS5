@@ -27,6 +27,7 @@ struct ScissorRect {
 uint32_t                 render_target_mask_slot(uint32_t mask, uint32_t slot);
 uint32_t                 render_target_first_bound_slot(const HW::Context& hw);
 bool                     graphics_debug_dump_enabled();
+bool                     boot_trace_log(uint32_t max_count = 256);
 void                     uc_print(const char* func, const HW::UserConfig& uc);
 void                     uc_check(const HW::UserConfig& uc);
 void                     sh_print(const char* func, const HW::Shader& uc);

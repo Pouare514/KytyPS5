@@ -65,7 +65,8 @@ constexpr int      PAGE_TABLE_POOL_ENTRIES =
     static_cast<int>(PAGE_TABLE_POOL_SIZE / PAGE_TABLE_GRANULARITY);
 constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 4ull * 1024ull * 1024ull * 1024ull;
 
-static uint64_t g_flexible_memory_size = DEFAULT_FLEXIBLE_MEMORY_SIZE;
+static uint64_t g_flexible_memory_size           = DEFAULT_FLEXIBLE_MEMORY_SIZE;
+static uint64_t g_flexible_program_code_bytes  = 0;
 
 static Graphics::GpuResourceManager& GetGpuResources() {
 	return *Graphics::g_render_ctx->GetGpuResources();
@@ -1149,6 +1150,16 @@ static void                     MemoryPoolSubtractCommitted(uint64_t len);
 // Keep host mappings, physical blocks, placeholders, and virtual ranges in step.
 static std::recursive_mutex g_memory_operation_mutex;
 
+static bool MemoryBootTrace() {
+	static std::atomic<uint32_t> count {0};
+	return count.fetch_add(1, std::memory_order_relaxed) < 256;
+}
+
+static bool MemoryGpuUnmappedTrace() {
+	static std::atomic<uint32_t> count {0};
+	return count.fetch_add(1, std::memory_order_relaxed) < 64;
+}
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	return g_direct_memory_backing->TryWriteBacking(vaddr, data, size);
 }
@@ -2010,10 +2021,21 @@ void PhysicalMemory::SetVirtualRangeMemoryType(uint64_t vaddr, uint64_t len, int
 	}
 }
 
+static bool CountsTowardFlexibleProgramQuota(const char* name) {
+	if (name == nullptr) {
+		return true;
+	}
+
+	const auto lower = Common::ToLower(name);
+	return !Common::EndsWith(lower, "libc.prx") && !Common::EndsWith(lower, "libkernel.prx") &&
+	       !Common::EndsWith(lower, "libkernel_sys.prx");
+}
+
 uint64_t FlexibleMemory::Available() {
 	Common::LockGuard lock(m_mutex);
 
-	return (Size() >= m_allocated_total ? Size() - m_allocated_total : 0);
+	const uint64_t used = m_allocated_total + g_flexible_program_code_bytes;
+	return (Size() >= used ? Size() - used : 0);
 }
 
 void PooledMemory::AddFreeUnlocked(uint64_t start, uint64_t size) {
@@ -2654,7 +2676,11 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
 	PRINT_NAME();
 
-	return PhysicalMemory::Size();
+	const auto size = PhysicalMemory::Size();
+	LOGF("\t direct memory size = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n", size,
+	     size / (1024ull * 1024ull));
+
+	return size;
 }
 
 int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t search_end,
@@ -2853,10 +2879,12 @@ int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, i
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
-	LOGF("\t len          = 0x%016" PRIx64 "\n"
-	     "\t alignment    = 0x%016" PRIx64 "\n"
-	     "\t memory_type  = %d\n",
-	     len, alignment, memory_type);
+	if (PRINT_NAME_ENABLED) {
+		LOGF("\t len          = 0x%016" PRIx64 "\n"
+		     "\t alignment    = 0x%016" PRIx64 "\n"
+		     "\t memory_type  = %d\n",
+		     len, alignment, memory_type);
+	}
 
 	if (len == 0 || phys_addr_out == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -3179,19 +3207,21 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 		shared_reason = DirectMemoryBacking::GetFailureReasonName(shared_failure);
 	}
 
-	LOGF("\t in_addr  = 0x%016" PRIx64 "\n"
-	     "\t out_addr = 0x%016" PRIx64 "\n"
-	     "\t dmem     = 0x%016" PRIx64 "\n"
-	     "\t size     = 0x%016" PRIx64 "\n"
-	     "\t mode     = %s\n"
-	     "\t flags    = 0x%08" PRIx32 "\n"
-	     "\t align    = 0x%016" PRIx64 "\n"
-	     "\t gpu_mode = %s\n"
-	     "\t shared   = %s\n"
-	     "\t reason   = %s\n",
-	     in_addr, out_addr, static_cast<uint64_t>(direct_memory_start), len,
-	     Common::EnumName(mode).c_str(), static_cast<uint32_t>(flags), alignment,
-	     Common::EnumName(gpu_mode).c_str(), shared_backing ? "yes" : "no", shared_reason);
+	if (PRINT_NAME_ENABLED) {
+		LOGF("\t in_addr  = 0x%016" PRIx64 "\n"
+		     "\t out_addr = 0x%016" PRIx64 "\n"
+		     "\t dmem     = 0x%016" PRIx64 "\n"
+		     "\t size     = 0x%016" PRIx64 "\n"
+		     "\t mode     = %s\n"
+		     "\t flags    = 0x%08" PRIx32 "\n"
+		     "\t align    = 0x%016" PRIx64 "\n"
+		     "\t gpu_mode = %s\n"
+		     "\t shared   = %s\n"
+		     "\t reason   = %s\n",
+		     in_addr, out_addr, static_cast<uint64_t>(direct_memory_start), len,
+		     Common::EnumName(mode).c_str(), static_cast<uint32_t>(flags), alignment,
+		     Common::EnumName(gpu_mode).c_str(), shared_backing ? "yes" : "no", shared_reason);
+	}
 
 	if (out_addr == 0) {
 		if (consumed_reserved) {
@@ -3322,6 +3352,8 @@ static bool ReserveFixedHostRange(uint64_t start, uint64_t size, bool* placehold
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	constexpr uint64_t PAGE_SIZE = 0x4000;
+
 	SYSTEM_INFO system_info {};
 	GetSystemInfo(&system_info);
 	const uint64_t granularity = system_info.dwAllocationGranularity;
@@ -3330,6 +3362,11 @@ static bool ReserveFixedHostRange(uint64_t start, uint64_t size, bool* placehold
 		if (VirtualQuery(reinterpret_cast<const void*>(start), &info, sizeof(info)) != 0 &&
 		    info.State == MEM_FREE && info.RegionSize >= size &&
 		    VirtualMemory::ReserveFixed(start, size)) {
+			if (MemoryBootTrace()) {
+				LOGF("MemoryTrace: ReserveFixedHostRange ok bulk start=0x%016" PRIx64
+				     " size=0x%016" PRIx64 "\n",
+				     start, size);
+			}
 			return true;
 		}
 	}
@@ -3349,7 +3386,6 @@ static bool ReserveFixedHostRange(uint64_t start, uint64_t size, bool* placehold
 
 	bool host_mutated = false;
 	for (uint64_t addr = start; addr < start + size; addr += PAGE_SIZE) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		MEMORY_BASIC_INFORMATION info {};
 		if (VirtualQuery(reinterpret_cast<const void*>(addr), &info, sizeof(info)) != 0) {
 			if (info.State == MEM_COMMIT) {
@@ -3360,6 +3396,11 @@ static bool ReserveFixedHostRange(uint64_t start, uint64_t size, bool* placehold
 					LOGF_COLOR(Log::Color::Red,
 					           "\t reserve-fixed replace: decommit failed at 0x%016" PRIx64 "\n",
 					           addr);
+					if (MemoryBootTrace()) {
+						LOGF("MemoryTrace: ReserveFixedHostRange decommit failed start=0x%016" PRIx64
+						     " addr=0x%016" PRIx64 "\n",
+						     start, addr);
+					}
 					return false;
 				}
 				host_mutated = true;
@@ -3369,11 +3410,24 @@ static bool ReserveFixedHostRange(uint64_t start, uint64_t size, bool* placehold
 				continue;
 			}
 		}
-		return true;
+		if (MemoryBootTrace()) {
+			LOGF("MemoryTrace: ReserveFixedHostRange page state failed start=0x%016" PRIx64
+			     " addr=0x%016" PRIx64 "\n",
+			     start, addr);
+		}
+		return false;
 	}
 
-	return false;
+	if (MemoryBootTrace()) {
+		LOGF("MemoryTrace: ReserveFixedHostRange ok pages start=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     start, size);
+	}
+	return true;
 #else
+	constexpr uint64_t PAGE_SIZE = 0x4000;
+
+	bool host_mutated = false;
 	for (uint64_t addr = start; addr < start + size; addr += PAGE_SIZE) {
 		if (!VirtualMemory::ReserveFixed(addr, PAGE_SIZE)) {
 			if (host_mutated) {
@@ -3499,6 +3553,14 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size, bool* p
 		       chunk.gpu_mode != GpuAccessMode::NoAccess &&
 		       IsGpuAddressRange(chunk.range.start, chunk.range.size);
 	});
+	if (MemoryBootTrace() || (gpu_unmapped && MemoryGpuUnmappedTrace())) {
+		LOGF("MemoryTrace: ReplaceFixedRangeWithReserved start=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " gpu_unmapped=%d chunks=%zu\n",
+		     start, size, gpu_unmapped ? 1 : 0, chunks.size());
+	}
+	if (gpu_unmapped && Graphics::GraphicsRunGpuIsReady()) {
+		Graphics::GraphicsRunWait();
+	}
 	for (const auto& chunk: chunks) {
 		if (IsCommittedRangeType(chunk.range.type)) {
 			UnmapGpuRange(chunk.range.start, chunk.range.size, chunk.gpu_mode);
@@ -3645,6 +3707,12 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size, bool* p
 		}
 	}
 
+	if (MemoryBootTrace() || (gpu_unmapped && MemoryGpuUnmappedTrace())) {
+		LOGF("MemoryTrace: ReplaceFixedRangeWithReserved done start=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " placeholder_backed=%d\n",
+		     start, size, *placeholder_backed ? 1 : 0);
+	}
+
 	return true;
 }
 
@@ -3714,6 +3782,11 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 	LOGF("\t out_addr  = 0x%016" PRIx64 "\n"
 	     "\t placeholder = %s\n",
 	     out_addr, placeholder_backed ? "yes" : "no");
+	if (placeholder_backed && (MemoryBootTrace() || MemoryGpuUnmappedTrace())) {
+		LOGF("MemoryTrace: KernelReserveVirtualRange out=0x%016" PRIx64 " len=0x%016" PRIx64
+		     " placeholder=yes map_fixed=%d range_added=%d\n",
+		     out_addr, len, (flags & MAP_FIXED) != 0 ? 1 : 0, range_already_added ? 1 : 0);
+	}
 
 	return OK;
 }
@@ -3850,7 +3923,12 @@ int KYTY_SYSV_ABI KernelAvailableFlexibleMemorySize(size_t* size) {
 
 	*size = g_flexible_memory->Available();
 
-	LOGF("\t *size = 0x%016" PRIx64 "\n", *size);
+	LOGF("\t configured = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n"
+	     "\t program_code = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n"
+	     "\t *size = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n",
+	     FlexibleMemory::Size(), FlexibleMemory::Size() / (1024ull * 1024ull),
+	     g_flexible_program_code_bytes, g_flexible_program_code_bytes / (1024ull * 1024ull), *size,
+	     *size / (1024ull * 1024ull));
 
 	return OK;
 }
@@ -3864,7 +3942,8 @@ int KYTY_SYSV_ABI KernelConfiguredFlexibleMemorySize(uint64_t* size) {
 
 	*size = FlexibleMemory::Size();
 
-	LOGF("\t *size = 0x%016" PRIx64 "\n", *size);
+	LOGF("\t *size = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n", *size,
+	     *size / (1024ull * 1024ull));
 
 	return OK;
 }
@@ -3902,6 +3981,22 @@ void RegisterProgramMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mo
 	}
 }
 
+void RegisterProgramFlexibleQuota(uint64_t size, const char* name) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+
+	if (CountsTowardFlexibleProgramQuota(name)) {
+		g_flexible_program_code_bytes += size;
+	}
+}
+
+void UnregisterProgramFlexibleQuota(uint64_t size, const char* name) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+
+	if (CountsTowardFlexibleProgramQuota(name)) {
+		g_flexible_program_code_bytes -= size;
+	}
+}
+
 void UpdateProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 	RequireProgramMemory(vaddr, size);
@@ -3911,7 +4006,9 @@ void UpdateProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory:
 void UnregisterProgramMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
-	for (const auto& range: RequireProgramMemory(vaddr, size)) {
+	const auto program_ranges = RequireProgramMemory(vaddr, size);
+
+	for (const auto& range: program_ranges) {
 		const auto gpu_mode = GetGpuAccessMode(range.protection);
 		if (gpu_mode != GpuAccessMode::NoAccess) {
 			if (!GetGpuResources().IsMapped(range.start, range.size)) {

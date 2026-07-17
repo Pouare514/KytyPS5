@@ -46,7 +46,8 @@ public:
 	FindDepthTarget(CommandBuffer* command, GraphicContext* ctx, const DepthTargetInfo& info);
 	[[nodiscard]] std::vector<VideoOutVulkanImage*>
 	     RegisterVideoOutSurfaces(GraphicContext* ctx, const std::vector<VideoOutInfo>& infos);
-	void RefreshVideoOut(VideoOutVulkanImage* image, bool render_target = false);
+	void RefreshVideoOut(VideoOutVulkanImage* image, bool render_target = false,
+	                     bool for_present = false);
 	void UnregisterVideoOutSurfaces(const std::vector<VideoOutVulkanImage*>& images);
 	[[nodiscard]] bool ClearColorImageFromBuffer(CommandBuffer* command, uint64_t vaddr,
 	                                             uint64_t size, uint32_t packed_clear);

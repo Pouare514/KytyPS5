@@ -58,6 +58,11 @@ bool graphics_debug_dump_enabled() {
 	       Config::GetPrintfDirection() != Config::OutputDirection::Silent;
 }
 
+bool boot_trace_log(uint32_t max_count) {
+	static std::atomic<uint32_t> count {0};
+	return count.fetch_add(1, std::memory_order_relaxed) < max_count;
+}
+
 void uc_print(const char* func, const HW::UserConfig& uc) {
 	LOGF("%s\n", func);
 
