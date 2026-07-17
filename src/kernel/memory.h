@@ -99,6 +99,7 @@ uint64_t GetDefaultFlexibleMemorySize();
 uint64_t GetFlexibleMemorySize();
 void     SetFlexibleMemorySize(uint64_t size);
 void     SyncFlexibleMemoryFromProcParam(uint64_t flex_scalar);
+void     ApplyMemoryRegionsFromProcParam(uint64_t flex_scalar);
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;

@@ -1411,6 +1411,7 @@ void RuntimeLinker::Execute() {
 		}
 	}
 	StartAllModules();
+	EnsureApplicationHeapApi();
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
@@ -1874,10 +1875,20 @@ uint8_t* RuntimeLinker::TlsGetAddr(Program* program) {
 		const auto tcb_offset =
 		    program->tls.tcb_offset != 0 ? program->tls.tcb_offset : program->tls.image_size;
 		const auto alloc_size = AlignUp(tcb_offset, TCB_ALIGN) + TCB_SIZE;
-		tls.ptr               = reinterpret_cast<uint8_t*>(
-		    Common::VirtualMemory::Alloc(0, alloc_size, Common::VirtualMemory::Mode::ReadWrite));
+
+		void* allocated = nullptr;
+		if (program->rt != nullptr) {
+			allocated = program->rt->ApplicationHeapMalloc(alloc_size);
+		}
+		if (allocated == nullptr) {
+			allocated = reinterpret_cast<void*>(
+			    Common::VirtualMemory::Alloc(0, alloc_size, Common::VirtualMemory::Mode::ReadWrite));
+			tls.vm_alloc = true;
+		} else {
+			tls.vm_alloc = false;
+		}
+		tls.ptr       = reinterpret_cast<uint8_t*>(allocated);
 		tls.free_func = nullptr;
-		tls.vm_alloc  = true;
 
 		EXIT_IF(tls.ptr == nullptr);
 
@@ -1931,7 +1942,8 @@ namespace {
 constexpr uint64_t FLEXIBLE_MEMORY_BASE        = 64ull * 1024ull * 1024ull;
 constexpr uint32_t ORBIS_PROC_PARAM_MAGIC      = 0x13bccf52u;
 constexpr uint64_t ORBIS_PROC_PARAM_STRUCT_SIZE = 0x60;
-constexpr uint64_t PROC_PARAM_SYNTH_SIZE       = 0x90;
+constexpr uint64_t ORBIS_LIBC_PARAM_STRUCT_SIZE = 0x50;
+constexpr uint64_t PROC_PARAM_SYNTH_SIZE        = 0x100;
 
 #pragma pack(push, 1)
 struct GuestKernelMemParam {
@@ -1961,6 +1973,20 @@ struct GuestProcParam {
 	uint64_t unknown1;
 };
 static_assert(sizeof(GuestProcParam) == 0x60);
+
+struct GuestLibcParam {
+	uint64_t size;
+	uint64_t unknown_08;
+	uint64_t heap_size;
+	uint64_t unknown_18;
+	uint64_t unknown_20;
+	uint64_t unknown_28;
+	uint64_t unknown_30;
+	uint64_t unknown_38;
+	uint64_t unknown_40;
+	uint64_t need_sce_libc;
+};
+static_assert(sizeof(GuestLibcParam) == 0x50);
 #pragma pack(pop)
 
 static uint64_t GetProgramSdkVersion(const Program* program) {
@@ -1988,6 +2014,31 @@ static bool MakeGuestRegionWritable(uint64_t vaddr, uint64_t size) {
 	Libs::LibKernel::Memory::UpdateProgramMemoryProtection(vaddr, size,
 	                                                       Common::VirtualMemory::Mode::ReadWrite);
 	return true;
+}
+
+static void WireGuestLibcParam(GuestProcParam* proc, uint64_t proc_vaddr, uint64_t synth_size) {
+	const auto libc_vaddr =
+	    AlignUp(proc_vaddr + sizeof(GuestProcParam) + sizeof(GuestKernelMemParam) + sizeof(uint64_t),
+	            8ull);
+	const auto heap_scalar_vaddr = libc_vaddr + sizeof(GuestLibcParam);
+
+	if (heap_scalar_vaddr + sizeof(uint64_t) > proc_vaddr + synth_size) {
+		LOGF("WireGuestLibcParam: proc_param segment too small for libc_param\n");
+		return;
+	}
+
+	auto* libc         = reinterpret_cast<GuestLibcParam*>(libc_vaddr);
+	auto* heap_scalar  = reinterpret_cast<uint64_t*>(heap_scalar_vaddr);
+
+	libc->size          = ORBIS_LIBC_PARAM_STRUCT_SIZE;
+	libc->heap_size     = heap_scalar_vaddr;
+	libc->need_sce_libc = 1;
+	*heap_scalar        = UINT64_MAX;
+
+	proc->libc_param = libc_vaddr;
+
+	LOGF("WireGuestLibcParam: libc_param=0x%016" PRIx64 " heap_size_ptr=0x%016" PRIx64 "\n",
+	     libc_vaddr, heap_scalar_vaddr);
 }
 
 void SynthesizeProgramProcParam(Program* program) {
@@ -2019,7 +2070,10 @@ void SynthesizeProgramProcParam(Program* program) {
 			     " (was 0x%016" PRIx64 ")\n",
 			     mem->flexible_memory_size, *flex_ptr);
 			*flex_ptr = flex_scalar;
-			Libs::LibKernel::Memory::SyncFlexibleMemoryFromProcParam(flex_scalar);
+			Libs::LibKernel::Memory::ApplyMemoryRegionsFromProcParam(flex_scalar);
+			if (proc->libc_param == 0) {
+				WireGuestLibcParam(proc, proc_vaddr, synth_size);
+			}
 			return;
 		}
 	}
@@ -2041,11 +2095,21 @@ void SynthesizeProgramProcParam(Program* program) {
 	mem->flexible_memory_size  = scalar_vaddr;
 	*scalar                    = flex_scalar;
 
-	Libs::LibKernel::Memory::SyncFlexibleMemoryFromProcParam(flex_scalar);
+	Libs::LibKernel::Memory::ApplyMemoryRegionsFromProcParam(flex_scalar);
+	WireGuestLibcParam(proc, proc_vaddr, synth_size);
 
 	LOGF("SynthesizeProgramProcParam: proc=0x%016" PRIx64 " mem_param=0x%016" PRIx64
 	     " flex_scalar=0x%016" PRIx64 " configured=0x%016" PRIx64 " sdk=0x%016" PRIx64 "\n",
 	     proc_vaddr, mem_vaddr, flex_scalar, configured, proc->sdk_version);
+
+	const auto* dump = reinterpret_cast<const uint8_t*>(proc_vaddr);
+	for (size_t row = 0; row < 0x100; row += 16) {
+		LOGF("  proc_param+%04zx: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		     row, dump[row + 0], dump[row + 1], dump[row + 2], dump[row + 3], dump[row + 4],
+		     dump[row + 5], dump[row + 6], dump[row + 7], dump[row + 8], dump[row + 9],
+		     dump[row + 10], dump[row + 11], dump[row + 12], dump[row + 13], dump[row + 14],
+		     dump[row + 15]);
+	}
 }
 
 } // namespace
@@ -2090,10 +2154,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	EXIT_IF(program->base_vaddr == 0);
 	EXIT_IF(program->base_size_aligned < program->base_size);
 	Libs::LibKernel::Memory::RegisterProgramMemory(
-	    program->base_vaddr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
+	    program->base_vaddr, program->base_size_aligned,
+	    Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
 	Libs::LibKernel::Memory::RegisterProgramFlexibleQuota(
-	    program->mapped_size, Common::PathToString(program->file_name.filename()).c_str());
+	    program->base_size_aligned, Common::PathToString(program->file_name.filename()).c_str());
 
 	LOGF("base_vaddr             = 0x%016" PRIx64 "\n"
 	     "base_size              = 0x%016" PRIx64 "\n"
@@ -2185,9 +2250,10 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 
 	if (program->base_vaddr != 0 || program->mapped_size != 0) {
 		EXIT_IF(program->base_vaddr == 0 || program->mapped_size == 0);
-		Libs::LibKernel::Memory::UnregisterProgramMemory(program->base_vaddr, program->mapped_size);
+		Libs::LibKernel::Memory::UnregisterProgramMemory(program->base_vaddr,
+		                                                 program->base_size_aligned);
 		Libs::LibKernel::Memory::UnregisterProgramFlexibleQuota(
-		    program->mapped_size, Common::PathToString(program->file_name.filename()).c_str());
+		    program->base_size_aligned, Common::PathToString(program->file_name.filename()).c_str());
 		EXIT_IF(!Common::VirtualMemory::Free(program->base_vaddr));
 	}
 
@@ -2530,8 +2596,6 @@ void RuntimeLinker::SetupTlsHandler(Program* program) {
 	                                    Common::VirtualMemory::Mode::Execute)) {
 		EXIT("failed to protect program TLS handler\n");
 	}
-	Libs::LibKernel::Memory::UpdateProgramMemoryProtection(
-	    program->tls.handler_vaddr, Jit::SafeCall::GetSize(), Common::VirtualMemory::Mode::Execute);
 	Common::VirtualMemory::FlushInstructionCache(program->tls.handler_vaddr,
 	                                             Jit::SafeCall::GetSize());
 }
@@ -2558,6 +2622,70 @@ void RuntimeLinker::SetApplicationHeapApi(void* const api[10]) {
 	m_application_heap_free   = reinterpret_cast<application_heap_free_func_t>(api[1]);
 	m_application_heap_posix_memalign =
 	    reinterpret_cast<application_heap_posix_memalign_func_t>(api[6]);
+}
+
+bool RuntimeLinker::IsApplicationHeapApiSet() const {
+	return m_application_heap_malloc != nullptr;
+}
+
+void RuntimeLinker::EnsureApplicationHeapApi() {
+	{
+		Common::LockGuard lock(m_mutex);
+
+		if (m_application_heap_malloc != nullptr) {
+			LOGF("EnsureApplicationHeapApi: set (malloc=0x%016" PRIx64 " free=0x%016" PRIx64
+			     " memalign=0x%016" PRIx64 ")\n",
+			     reinterpret_cast<uint64_t>(reinterpret_cast<void*>(m_application_heap_malloc)),
+			     reinterpret_cast<uint64_t>(reinterpret_cast<void*>(m_application_heap_free)),
+			     reinterpret_cast<uint64_t>(
+			         reinterpret_cast<void*>(m_application_heap_posix_memalign)));
+			return;
+		}
+	}
+
+	LOGF_COLOR(Log::Color::Yellow,
+	           "EnsureApplicationHeapApi: NOT set after StartAllModules, probing libc.prx\n");
+
+	using malloc_init_func_t = KYTY_SYSV_ABI int (*)();
+
+	std::vector<uint64_t> init_funcs;
+	{
+		Common::LockGuard lock(m_mutex);
+
+		for (auto* program: m_programs) {
+			if (program == nullptr || program->elf == nullptr || !program->elf->IsShared() ||
+			    program->export_symbols == nullptr) {
+				continue;
+			}
+
+			const auto file = Common::ToLower(Common::PathToString(program->file_name.filename()));
+			if (!Common::EndsWith(file, "libc.prx")) {
+				continue;
+			}
+
+			static constexpr const char* kMallocInitNids[] = {"EHsF2i9FXPM", "_malloc_init"};
+			for (const char* nid: kMallocInitNids) {
+				const auto* rec = program->export_symbols->FindByNid(nid, SymbolType::Func);
+				if (rec != nullptr && rec->vaddr != 0) {
+					init_funcs.push_back(rec->vaddr);
+				}
+			}
+		}
+	}
+
+	for (const auto vaddr: init_funcs) {
+		LOGF("EnsureApplicationHeapApi: calling malloc_init at 0x%016" PRIx64 "\n", vaddr);
+		const auto ret = reinterpret_cast<malloc_init_func_t>(vaddr)();
+		LOGF("EnsureApplicationHeapApi: malloc_init returned %d, heap_api %s\n", ret,
+		     IsApplicationHeapApiSet() ? "set" : "still unset");
+		if (IsApplicationHeapApiSet()) {
+			return;
+		}
+	}
+
+	if (!IsApplicationHeapApiSet()) {
+		LOGF_COLOR(Log::Color::Red, "EnsureApplicationHeapApi: heap API still unset\n");
+	}
 }
 
 void* RuntimeLinker::ApplicationHeapMemalign(uint64_t alignment, uint64_t size) {

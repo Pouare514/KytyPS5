@@ -1472,6 +1472,25 @@ void SyncFlexibleMemoryFromProcParam(uint64_t flex_scalar) {
 	}
 }
 
+void ApplyMemoryRegionsFromProcParam(uint64_t flex_scalar) {
+	constexpr uint64_t flexible_base = 64ull * 1024ull * 1024ull;
+	const auto         configured    = flex_scalar + flexible_base;
+
+	SyncFlexibleMemoryFromProcParam(flex_scalar);
+
+	const auto direct = PhysicalMemory::Size();
+	if (direct + configured != PS5_TOTAL_MEMORY_SIZE) {
+		LOGF("ApplyMemoryRegionsFromProcParam: direct 0x%016" PRIx64 " + flex 0x%016" PRIx64
+		     " != total 0x%016" PRIx64 "\n",
+		     direct, configured, PS5_TOTAL_MEMORY_SIZE);
+	}
+
+	LOGF("ApplyMemoryRegionsFromProcParam: direct=0x%016" PRIx64 " (%" PRIu64 " MiB)"
+	     " flexible=0x%016" PRIx64 " (%" PRIu64 " MiB) scalar=0x%016" PRIx64 "\n",
+	     direct, direct / (1024ull * 1024ull), configured, configured / (1024ull * 1024ull),
+	     flex_scalar);
+}
+
 bool PhysicalMemory::Alloc(uint64_t search_start, uint64_t search_end, size_t len, size_t alignment,
                            uint64_t* phys_addr_out, int memory_type, bool pool_expansion) {
 	if (phys_addr_out == nullptr) {
@@ -2074,7 +2093,7 @@ static bool CountsTowardFlexibleMappingQuota(const char* name) {
 		return true;
 	}
 
-	if (std::strcmp(name, "SceKernelInternalMemory") == 0 || std::strcmp(name, "stack") == 0) {
+	if (std::strcmp(name, "SceKernelInternalMemory") == 0) {
 		return false;
 	}
 
@@ -3973,12 +3992,28 @@ int KYTY_SYSV_ABI KernelAvailableFlexibleMemorySize(size_t* size) {
 
 	*size = g_flexible_memory->Available();
 
+	uint64_t flex_mappings = 0;
+	for (const auto& block: g_flexible_memory->GetBlocks()) {
+		if (CountsTowardFlexibleMappingQuota(block.name)) {
+			flex_mappings += block.map_size;
+		}
+	}
+
 	LOGF("\t configured = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n"
 	     "\t program_code = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n"
+	     "\t flex_mappings = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n"
 	     "\t *size = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n",
 	     FlexibleMemory::Size(), FlexibleMemory::Size() / (1024ull * 1024ull),
-	     g_flexible_program_code_bytes, g_flexible_program_code_bytes / (1024ull * 1024ull), *size,
-	     *size / (1024ull * 1024ull));
+	     g_flexible_program_code_bytes, g_flexible_program_code_bytes / (1024ull * 1024ull),
+	     flex_mappings, flex_mappings / (1024ull * 1024ull), *size, *size / (1024ull * 1024ull));
+
+	static std::atomic<uint32_t> flex_detail_log_count {0};
+	if (flex_detail_log_count.fetch_add(1) < 8) {
+		for (const auto& block: g_flexible_memory->GetBlocks()) {
+			LOGF("\t flex block: 0x%016" PRIx64 " size=0x%016" PRIx64 " name=%s\n", block.map_vaddr,
+			     block.map_size, block.name);
+		}
+	}
 
 	return OK;
 }
@@ -4036,6 +4071,8 @@ void RegisterProgramFlexibleQuota(uint64_t size, const char* name) {
 
 	if (CountsTowardFlexibleProgramQuota(name)) {
 		g_flexible_program_code_bytes += size;
+		LOGF("RegisterProgramFlexibleQuota: %s +0x%016" PRIx64 " total=0x%016" PRIx64 "\n", name,
+		     size, g_flexible_program_code_bytes);
 	}
 }
 

@@ -657,9 +657,15 @@ uint64_t KYTY_SYSV_ABI LibcInternalExtUnknownQBS714Jr3g(uint64_t arg0, uint64_t 
 	return 0;
 }
 
+int KYTY_SYSV_ABI LibcInternalExtMallocInit() {
+	PRINT_NAME();
+	return 0;
+}
+
 LIB_DEFINE(InitLibcInternalExt_1) {
 	LIB_FUNC("NWtTN10cJzE", LibcInternalExt::LibcHeapGetTraceInfo);
 	LIB_FUNC("qBS714-Jr3g", LibcInternalExt::LibcInternalExtUnknownQBS714Jr3g);
+	LIB_FUNC("EHsF2i9FXPM", LibcInternalExt::LibcInternalExtMallocInit);
 }
 
 } // namespace LibcInternalExt

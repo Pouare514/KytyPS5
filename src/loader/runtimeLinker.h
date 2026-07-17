@@ -162,6 +162,7 @@ public:
 	void  StopAllModules();
 	void  DeleteTlss(int thread_id);
 	void  SetApplicationHeapApi(void* const api[10]);
+	bool  IsApplicationHeapApiSet() const;
 	void* ApplicationHeapMalloc(uint64_t size);
 	void* ApplicationHeapMemalign(uint64_t alignment, uint64_t size);
 
@@ -188,6 +189,7 @@ private:
 	static void Relocate(Program* program);
 	static void DeleteProgram(Program* program);
 	static void SetupTlsHandler(Program* program);
+	void        EnsureApplicationHeapApi();
 	void        PreloadAdjacentPrograms();
 
 	Program* FindProgram(const ModuleId& m, const LibraryId& l);
