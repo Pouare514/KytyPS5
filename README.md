@@ -208,17 +208,29 @@ If the game window closes without a clean exit message, capture a diagnostic log
 
 ```powershell
 .\build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame" `
-  --vulkan-validation false --printf-direction File --printf-output-file _kyty.txt
+  --vulkan-validation false --printf-direction File --printf-output-file _kyty.txt 2> _kyty_stderr.txt
 echo $LASTEXITCODE
 ```
 
 | Exit code | Meaning |
 |-----------|---------|
 | `0` | Clean exit |
-| `-1073740791` (`0xC0000409`) | Stack buffer overrun — check `_kyty.txt` for `Fatal win exception:` (module + RIP) |
+| `-1073740791` (`0xC0000409`) | Stack buffer overrun — check `_kyty_stderr.txt` for `Security failure:` (retaddr) or `_kyty.txt` for `Fatal win exception:` |
 
 Compare with `--vulkan-validation true` to see whether the Vulkan validation layer is involved.
-Recent builds print `Fatal win exception: code=..., rip=..., module=...` before an unhandled crash.
+Recent builds print `Fatal win exception: code=..., rip=..., module=...` before an unhandled crash,
+and `Security failure: code=..., retaddr=...` when the MSVC `/GS` cookie trips before `__fastfail`.
+
+#### Hybrid laptop GPU (Intel + NVIDIA / AMD)
+
+On startup, KytyPS5 prints `Vulkan selected device: ...`. If you have a discrete GPU (e.g. RTX 4080)
+but see Intel integrated graphics instead, Windows may be running the emulator on the wrong GPU.
+
+**Automatic fix:** recent builds export `NvOptimusEnablement` / `AmdPowerXpressRequestHighPerformance`
+so the discrete GPU is preferred.
+
+**Manual fix:** Windows Settings → System → Display → Graphics → add `kyty_emulator.exe` →
+**High performance** (NVIDIA / AMD).
 
 ### AI Use
 

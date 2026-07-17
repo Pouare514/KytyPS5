@@ -18,6 +18,10 @@ add_executable(launcher WIN32
 	${launcher_forms}
 )
 
+if(WIN32)
+	target_sources(launcher PRIVATE "${CMAKE_SOURCE_DIR}/common/discreteGpuHint.cpp")
+endif()
+
 
 target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets)
 if(WIN32)

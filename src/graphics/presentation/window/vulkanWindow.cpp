@@ -539,6 +539,7 @@ static void VulkanFindPhysicalDevice(VkInstance instance, VkSurfaceKHR surface,
 		vkGetPhysicalDeviceProperties(best_device, &selected);
 		LOGF("Vulkan selected device: %s (vendor=0x%04x score=%d)\n", selected.deviceName,
 		     selected.vendorID, best_score);
+		std::printf("Vulkan selected device: %s\n", selected.deviceName);
 	}
 }
 
