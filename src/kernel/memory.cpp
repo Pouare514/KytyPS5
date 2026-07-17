@@ -575,6 +575,7 @@ enum class VirtualRangeType {
 	Pooled,
 	Stack,
 	Code,
+	SystemModule,
 };
 
 static bool IsReservedRangeType(VirtualRangeType type) {
@@ -834,6 +835,18 @@ public:
 		}
 
 		return used;
+	}
+
+	uint64_t SumBytesOfType(VirtualRangeType type) {
+		Common::LockGuard lock(m_mutex);
+
+		uint64_t sum = 0;
+		for (const auto& range: m_ranges) {
+			if (range.type == type) {
+				sum += range.size;
+			}
+		}
+		return sum;
 	}
 
 private:
@@ -3893,6 +3906,26 @@ bool KernelHandleReservedRangeAccessViolation(uint64_t vaddr) {
 	EXIT("AMM virtual-memory unmap is unsupported: addr=0x%016" PRIx64 "\n", vaddr);
 }
 
+static const char* VirtualRangeTypeName(VirtualRangeType type) {
+	switch (type) {
+		case VirtualRangeType::Code: return "Code";
+		case VirtualRangeType::SystemModule: return "SystemModule";
+		case VirtualRangeType::Flexible: return "Flexible";
+		case VirtualRangeType::Stack: return "Stack";
+		case VirtualRangeType::Direct: return "Direct";
+		case VirtualRangeType::Pooled: return "Pooled";
+		case VirtualRangeType::PoolReserved: return "PoolReserved";
+		default: return "Reserved";
+	}
+}
+
+static uint64_t SumVirtualCodeBytes() {
+	if (g_virtual_ranges == nullptr) {
+		return 0;
+	}
+	return g_virtual_ranges->SumBytesOfType(VirtualRangeType::Code);
+}
+
 int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info,
                                      uint64_t info_size) {
 	PRINT_NAME();
@@ -3930,18 +3963,22 @@ int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryIn
 	CopyVirtualRangeName(info->name, candidate.name);
 
 	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	if (log_count.fetch_add(1) < 32 &&
+	    (candidate.type == VirtualRangeType::Code || candidate.type == VirtualRangeType::SystemModule ||
+	     candidate.type == VirtualRangeType::Flexible || candidate.type == VirtualRangeType::Stack)) {
 		LOGF("\t start       = 0x%016" PRIx64 "\n"
 		     "\t end         = 0x%016" PRIx64 "\n"
-		     "\t offset      = 0x%016" PRIx64 "\n"
+		     "\t size        = 0x%016" PRIx64 "\n"
+		     "\t type        = %s\n"
 		     "\t protection  = 0x%08" PRIx32 "\n"
-		     "\t memory_type = %d\n"
 		     "\t flexible    = %d\n"
 		     "\t direct      = %d\n"
+		     "\t stack       = %d\n"
 		     "\t name        = %s\n",
-		     static_cast<uint64_t>(info->start), static_cast<uint64_t>(info->end), info->offset,
-		     info->protection, info->memory_type, static_cast<int>(info->is_flexible),
-		     static_cast<int>(info->is_direct), info->name);
+		     static_cast<uint64_t>(info->start), static_cast<uint64_t>(info->end),
+		     candidate.size, VirtualRangeTypeName(candidate.type), info->protection,
+		     static_cast<int>(info->is_flexible), static_cast<int>(info->is_direct),
+		     static_cast<int>(info->is_stack), info->name);
 	}
 
 	return OK;
@@ -3999,13 +4036,25 @@ int KYTY_SYSV_ABI KernelAvailableFlexibleMemorySize(size_t* size) {
 		}
 	}
 
+	const auto configured = FlexibleMemory::Size();
+	const auto delta      = (configured >= *size ? configured - *size : 0ull);
+
 	LOGF("\t configured = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n"
 	     "\t program_code = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n"
 	     "\t flex_mappings = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n"
+	     "\t delta (configured - available) = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n"
 	     "\t *size = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n",
-	     FlexibleMemory::Size(), FlexibleMemory::Size() / (1024ull * 1024ull),
-	     g_flexible_program_code_bytes, g_flexible_program_code_bytes / (1024ull * 1024ull),
-	     flex_mappings, flex_mappings / (1024ull * 1024ull), *size, *size / (1024ull * 1024ull));
+	     configured, configured / (1024ull * 1024ull), g_flexible_program_code_bytes,
+	     g_flexible_program_code_bytes / (1024ull * 1024ull), flex_mappings,
+	     flex_mappings / (1024ull * 1024ull), delta, delta / (1024ull * 1024ull), *size,
+	     *size / (1024ull * 1024ull));
+
+	static std::atomic<bool> virtual_code_sum_logged {false};
+	if (!virtual_code_sum_logged.exchange(true) && g_virtual_ranges != nullptr) {
+		LOGF("SumVirtualCodeBytes: code=0x%016" PRIx64 " system_module=0x%016" PRIx64 "\n",
+		     SumVirtualCodeBytes(),
+		     g_virtual_ranges->SumBytesOfType(VirtualRangeType::SystemModule));
+	}
 
 	static std::atomic<uint32_t> flex_detail_log_count {0};
 	if (flex_detail_log_count.fetch_add(1) < 8) {
@@ -4041,11 +4090,17 @@ static int ProgramProtection(VirtualMemory::Mode mode) {
 	return protection;
 }
 
-static std::vector<VirtualRanges::Range> RequireProgramMemory(uint64_t vaddr, uint64_t size) {
+static bool IsRegisteredProgramMemoryType(VirtualRangeType type) {
+	return type == VirtualRangeType::Code || type == VirtualRangeType::SystemModule;
+}
+
+static std::vector<VirtualRanges::Range> RequireRegisteredProgramMemory(uint64_t vaddr,
+                                                                        uint64_t size) {
 	std::vector<VirtualRanges::Range> ranges;
 	if (g_virtual_ranges == nullptr || !g_virtual_ranges->QuerySpan(vaddr, size, &ranges) ||
-	    std::any_of(ranges.begin(), ranges.end(),
-	                [](const auto& range) { return range.type != VirtualRangeType::Code; })) {
+	    std::any_of(ranges.begin(), ranges.end(), [](const auto& range) {
+		    return !IsRegisteredProgramMemoryType(range.type);
+	    })) {
 		EXIT("program-memory range is not fully mapped: addr=0x%016" PRIx64 " size=0x%016" PRIx64
 		     "\n",
 		     vaddr, size);
@@ -4062,6 +4117,20 @@ void RegisterProgramMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mo
 	    !g_virtual_ranges->Add(vaddr, size, 0, ProgramProtection(mode), 0, VirtualRangeType::Code,
 	                           name)) {
 		EXIT("failed to register program memory: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
+}
+
+void RegisterSystemModuleMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+                                const char* name) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+
+	if (g_virtual_ranges == nullptr || vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr ||
+	    name == nullptr ||
+	    !g_virtual_ranges->Add(vaddr, size, 0, ProgramProtection(mode), 0,
+	                           VirtualRangeType::SystemModule, name)) {
+		EXIT("failed to register system module memory: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     "\n",
 		     vaddr, size);
 	}
 }
@@ -4086,14 +4155,14 @@ void UnregisterProgramFlexibleQuota(uint64_t size, const char* name) {
 
 void UpdateProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
-	RequireProgramMemory(vaddr, size);
+	RequireRegisteredProgramMemory(vaddr, size);
 	g_virtual_ranges->Protect(vaddr, size, ProgramProtection(mode));
 }
 
 void UnregisterProgramMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
-	const auto program_ranges = RequireProgramMemory(vaddr, size);
+	const auto program_ranges = RequireRegisteredProgramMemory(vaddr, size);
 
 	for (const auto& range: program_ranges) {
 		const auto gpu_mode = GetGpuAccessMode(range.protection);

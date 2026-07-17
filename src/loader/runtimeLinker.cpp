@@ -1389,7 +1389,6 @@ void RuntimeLinker::Execute() {
 	KYTY_PROFILER_THREAD("Thread_Main");
 
 	Libs::LibKernel::PthreadInitSelfForMainThread();
-	auto* main_stack_top = Libs::LibKernel::PthreadCreateMainGuestStack();
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	// Guest code has no Windows stack probes and may jump over the guard page. Module
@@ -1416,6 +1415,7 @@ void RuntimeLinker::Execute() {
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
 	if (auto entry = GetEntry(); entry != 0) {
+		auto* main_stack_top = Libs::LibKernel::PthreadCreateMainGuestStack();
 		auto* params = reinterpret_cast<EntryParams*>(
 		    (reinterpret_cast<uintptr_t>(main_stack_top) - 0x100u) & ~static_cast<uintptr_t>(0x0f));
 		std::memset(params, 0, sizeof(EntryParams));
@@ -1989,6 +1989,47 @@ struct GuestLibcParam {
 static_assert(sizeof(GuestLibcParam) == 0x50);
 #pragma pack(pop)
 
+static bool IsSystemModuleFilename(const std::string& name) {
+	const auto lower = Common::ToLower(name);
+	return Common::EndsWith(lower, "libc.prx") || Common::EndsWith(lower, "libkernel.prx") ||
+	       Common::EndsWith(lower, "libkernel_sys.prx");
+}
+
+static void RegisterLoadedProgramMemory(Program* program) {
+	const auto module_name = Common::PathToString(program->file_name.filename());
+	if (IsSystemModuleFilename(module_name)) {
+		Libs::LibKernel::Memory::RegisterSystemModuleMemory(
+		    program->base_vaddr, program->base_size_aligned,
+		    Common::VirtualMemory::Mode::ExecuteReadWrite, module_name.c_str());
+	} else {
+		Libs::LibKernel::Memory::RegisterProgramMemory(
+		    program->base_vaddr, program->base_size_aligned,
+		    Common::VirtualMemory::Mode::ExecuteReadWrite, module_name.c_str());
+	}
+	Libs::LibKernel::Memory::RegisterProgramFlexibleQuota(program->base_size_aligned,
+	                                                     module_name.c_str());
+}
+
+static bool PatchFlexibleScalarInProcParam(GuestProcParam* proc, uint64_t flex_scalar) {
+	if (proc == nullptr || proc->mem_param == 0) {
+		return false;
+	}
+
+	auto* mem = reinterpret_cast<GuestKernelMemParam*>(proc->mem_param);
+	if (mem->size < offsetof(GuestKernelMemParam, flexible_memory_size) + sizeof(uint64_t) ||
+	    mem->flexible_memory_size == 0) {
+		return false;
+	}
+
+	auto* flex_ptr = reinterpret_cast<uint64_t*>(mem->flexible_memory_size);
+	LOGF("SynthesizeProgramProcParam: patching flex scalar at 0x%016" PRIx64 " (was 0x%016" PRIx64
+	     ")\n",
+	     mem->flexible_memory_size, *flex_ptr);
+	*flex_ptr = flex_scalar;
+	Libs::LibKernel::Memory::ApplyMemoryRegionsFromProcParam(flex_scalar);
+	return true;
+}
+
 static uint64_t GetProgramSdkVersion(const Program* program) {
 	if (program == nullptr || program->elf == nullptr) {
 		return 0x05000000ull;
@@ -2053,6 +2094,12 @@ void SynthesizeProgramProcParam(Program* program) {
 	const auto proc_vaddr = program->proc_param_vaddr;
 	const auto synth_size = std::max(program->proc_param_size, PROC_PARAM_SYNTH_SIZE);
 
+	std::vector<uint8_t> elf_backup(synth_size);
+	std::memcpy(elf_backup.data(), reinterpret_cast<void*>(proc_vaddr), synth_size);
+	const auto* elf_proc = reinterpret_cast<const GuestProcParam*>(elf_backup.data());
+	const bool  elf_template =
+	    elf_proc->magic == ORBIS_PROC_PARAM_MAGIC && elf_proc->size >= sizeof(GuestProcParam);
+
 	if (!MakeGuestRegionWritable(proc_vaddr, synth_size)) {
 		LOGF("SynthesizeProgramProcParam: failed to make proc_param writable at 0x%016" PRIx64 "\n",
 		     proc_vaddr);
@@ -2061,39 +2108,53 @@ void SynthesizeProgramProcParam(Program* program) {
 
 	auto* proc = reinterpret_cast<GuestProcParam*>(proc_vaddr);
 
-	if (proc->mem_param != 0) {
-		auto* mem = reinterpret_cast<GuestKernelMemParam*>(proc->mem_param);
-		if (mem->size >= offsetof(GuestKernelMemParam, flexible_memory_size) + sizeof(uint64_t) &&
-		    mem->flexible_memory_size != 0) {
-			auto* flex_ptr = reinterpret_cast<uint64_t*>(mem->flexible_memory_size);
-			LOGF("SynthesizeProgramProcParam: patching existing flex scalar at 0x%016" PRIx64
-			     " (was 0x%016" PRIx64 ")\n",
-			     mem->flexible_memory_size, *flex_ptr);
-			*flex_ptr = flex_scalar;
-			Libs::LibKernel::Memory::ApplyMemoryRegionsFromProcParam(flex_scalar);
+	if (elf_template) {
+		std::memcpy(proc, elf_backup.data(), synth_size);
+		LOGF("SynthesizeProgramProcParam: merging ELF proc_param template at 0x%016" PRIx64
+		     " sdk=0x%016" PRIx64 "\n",
+		     proc_vaddr, proc->sdk_version);
+		if (proc->sdk_version == 0) {
+			proc->sdk_version = GetProgramSdkVersion(program);
+		}
+		if (proc->main_thread_stack_size == 0) {
+			proc->main_thread_stack_size = 0x200000ull;
+		}
+		if (PatchFlexibleScalarInProcParam(proc, flex_scalar)) {
 			if (proc->libc_param == 0) {
 				WireGuestLibcParam(proc, proc_vaddr, synth_size);
+			} else {
+				LOGF("WireGuestLibcParam: preserved ELF libc_param=0x%016" PRIx64 "\n",
+				     proc->libc_param);
 			}
 			return;
 		}
+		LOGF("SynthesizeProgramProcParam: ELF template missing mem_param flex chain, synthesizing\n");
 	}
 
-	const auto mem_vaddr   = proc_vaddr + sizeof(GuestProcParam);
+	if (PatchFlexibleScalarInProcParam(proc, flex_scalar)) {
+		if (proc->libc_param == 0) {
+			WireGuestLibcParam(proc, proc_vaddr, synth_size);
+		}
+		return;
+	}
+
+	const auto mem_vaddr    = proc_vaddr + sizeof(GuestProcParam);
 	const auto scalar_vaddr = mem_vaddr + sizeof(GuestKernelMemParam);
 
 	auto* mem    = reinterpret_cast<GuestKernelMemParam*>(mem_vaddr);
 	auto* scalar = reinterpret_cast<uint64_t*>(scalar_vaddr);
 
 	std::memset(proc, 0, synth_size);
-	proc->size        = ORBIS_PROC_PARAM_STRUCT_SIZE;
-	proc->magic       = ORBIS_PROC_PARAM_MAGIC;
-	proc->entry_count = 1;
-	proc->sdk_version = GetProgramSdkVersion(program);
-	proc->mem_param   = mem_vaddr;
+	proc->size                  = ORBIS_PROC_PARAM_STRUCT_SIZE;
+	proc->magic                 = ORBIS_PROC_PARAM_MAGIC;
+	proc->entry_count           = 1;
+	proc->sdk_version           = GetProgramSdkVersion(program);
+	proc->main_thread_stack_size = 0x200000ull;
+	proc->mem_param             = mem_vaddr;
 
-	mem->size                  = sizeof(GuestKernelMemParam);
-	mem->flexible_memory_size  = scalar_vaddr;
-	*scalar                    = flex_scalar;
+	mem->size                 = sizeof(GuestKernelMemParam);
+	mem->flexible_memory_size = scalar_vaddr;
+	*scalar                   = flex_scalar;
 
 	Libs::LibKernel::Memory::ApplyMemoryRegionsFromProcParam(flex_scalar);
 	WireGuestLibcParam(proc, proc_vaddr, synth_size);
@@ -2153,12 +2214,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	EXIT_IF(program->base_vaddr == 0);
 	EXIT_IF(program->base_size_aligned < program->base_size);
-	Libs::LibKernel::Memory::RegisterProgramMemory(
-	    program->base_vaddr, program->base_size_aligned,
-	    Common::VirtualMemory::Mode::ExecuteReadWrite,
-	    Common::PathToString(program->file_name.filename()).c_str());
-	Libs::LibKernel::Memory::RegisterProgramFlexibleQuota(
-	    program->base_size_aligned, Common::PathToString(program->file_name.filename()).c_str());
+	RegisterLoadedProgramMemory(program);
 
 	LOGF("base_vaddr             = 0x%016" PRIx64 "\n"
 	     "base_size              = 0x%016" PRIx64 "\n"
