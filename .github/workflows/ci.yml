@@ -27,7 +27,7 @@ jobs:
 
       - name: Configure
         run: |
-          cmake -S src -B _Build/ci `
+          cmake -S src -B build/ci `
             -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_COMPILER=clang-cl `
@@ -35,8 +35,8 @@ jobs:
             -DKYTY_BUILD_LAUNCHER=OFF
 
       - name: Build tests
-        run: cmake --build _Build/ci --parallel
+        run: cmake --build build/ci --parallel
 
       - name: Run tests
-        working-directory: _Build/ci
+        working-directory: build/ci
         run: ctest --output-on-failure --parallel

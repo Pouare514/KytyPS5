@@ -109,18 +109,18 @@ git submodule update --init --recursive
 Configure the project. Replace the Qt path with the version installed on your system:
 
 ```powershell
-cmake -S src -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64"
+cmake -S src -B build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64"
 ```
 
 Build the launcher and stage a runnable installation:
 
 ```powershell
-cmake --build _Build/windows --target launcher
-cmake --install _Build/windows --prefix _Build/windows/install
+cmake --build build/windows --target launcher
+cmake --install build/windows --prefix build/windows/install
 ```
 
 The finished application and its runtime dependencies will be placed in
-`_Build/windows/install`.
+`build/windows/install`.
 
 ### Visual Studio Code
 
@@ -145,7 +145,7 @@ Update your graphics driver before reporting rendering problems.
 To use the graphical launcher:
 
 ```powershell
-.\_Build\windows\install\launcher.exe
+.\build\windows\install\launcher.exe
 ```
 
 On first launch, add one or more game folders in the global settings. The launcher searches those
@@ -155,7 +155,7 @@ from the game list.
 The emulator can also be started directly with a legally obtained game directory or ELF file:
 
 ```powershell
-.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
+.\build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
 ```
 
 Run `kyty_emulator.exe --help` to see the available graphics, logging, validation, profiling, and

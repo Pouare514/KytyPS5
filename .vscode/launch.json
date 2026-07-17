@@ -5,10 +5,10 @@
             "name": "Debug launcher UI",
             "type": "cppvsdbg",
             "request": "launch",
-            "program": "${workspaceFolder}\\_Build\\vscode-clang\\launcher\\launcher.exe",
+            "program": "${workspaceFolder}\\build\\vscode-clang\\launcher\\launcher.exe",
             "args": [],
             "stopAtEntry": false,
-            "cwd": "${workspaceFolder}\\_Build\\vscode-clang\\launcher",
+            "cwd": "${workspaceFolder}\\build\\vscode-clang\\launcher",
             "environment": [],
             "externalConsole": false
         },
@@ -16,14 +16,14 @@
             "name": "Debug kyty_emulator",
             "type": "cppvsdbg",
             "request": "launch",
-            "program": "${workspaceFolder}\\_Build\\vscode-clang\\kyty_emulator.exe",
+            "program": "${workspaceFolder}\\build\\vscode-clang\\kyty_emulator.exe",
             "args": [
                 "--game", "D:/gamesps5/PPSA07429",
                 "--printf-direction", "File",
                 "--graphics-debug-dump", "True"
             ],
             "stopAtEntry": false,
-            "cwd": "${workspaceFolder}\\_Build\\vscode-clang",
+            "cwd": "${workspaceFolder}\\build\\vscode-clang",
             "environment": [],
             "externalConsole": true
         },

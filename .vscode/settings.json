@@ -1,6 +1,6 @@
 ﻿{
     "cmake.sourceDirectory": "${workspaceFolder}/src",
-    "cmake.buildDirectory": "${workspaceFolder}/_Build/vscode-clang",
+    "cmake.buildDirectory": "${workspaceFolder}/build/vscode-clang",
     "cmake.generator": "Ninja",
     "cmake.environment": {
         "CC": "clang-cl",

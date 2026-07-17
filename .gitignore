@@ -1,5 +1,106 @@
-# Visual Studio 2015 cache/options directory
-.vs/
-.idea/
+# --- Build outputs -----------------------------------------------------------
+
 build/
-_Build/vscode-clang/
+_Build/
+
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.cmake
+CTestTestfile.cmake
+Testing/
+_deps/
+*.ninja
+*.ninja_deps
+*.ninja_log
+compile_commands.json
+
+# --- Compiled objects / link artifacts (out-of-tree safety) ------------------
+
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.ipdb
+*.iobj
+*.pch
+
+# --- Visual Studio / MSVC ----------------------------------------------------
+
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+x64/
+x86/
+[Dd]ebug/
+[Rr]elease/
+[Rr]elWithDebInfo/
+[Mm]inSizeRel/
+ipch/
+
+# --- JetBrains / VS Code (local IDE state) -----------------------------------
+
+.idea/
+.vscode/ipch/
+.vscode/.browse.VC.db
+.vscode/*.local.json
+*.code-workspace
+
+# --- Qt ----------------------------------------------------------------------
+
+*_autogen/
+moc_*.cpp
+moc_*.h
+ui_*.h
+qrc_*.cpp
+*.qmlc
+*.jsc
+
+# --- OS junk -----------------------------------------------------------------
+
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- Logs, dumps, emulator scratch -------------------------------------------
+
+*.log
+_ImportReport.txt
+*_pipeline_*.log
+*_buffer_*.log
+
+# --- Python (aqtinstall, tooling) ----------------------------------------------
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.Python
+
+# --- Package managers --------------------------------------------------------
+
+vcpkg_installed/
+conan/
+
+# --- Editor / temp -----------------------------------------------------------
+
+*.tmp
+*.swp
+*.swo
+*~
+.#*
