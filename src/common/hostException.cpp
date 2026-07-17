@@ -1,6 +1,7 @@
 #include "common/hostException.h"
 
 #include <atomic>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 
@@ -48,6 +49,48 @@ public:
 	KYTY_CLASS_NO_COPY(FilterScope);
 };
 
+static void LogFatalWinException(PEXCEPTION_POINTERS exception) {
+	auto* exception_record = exception->ExceptionRecord;
+	auto* context          = exception->ContextRecord;
+
+	char      module_name[MAX_PATH] = {};
+	const auto rip                  = context->Rip;
+	HMODULE     owner_module        = nullptr;
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       reinterpret_cast<LPCSTR>(rip), &owner_module) != 0 &&
+	    owner_module != nullptr) {
+		(void)GetModuleFileNameA(owner_module, module_name, MAX_PATH);
+	}
+
+	printf("Fatal win exception: code=0x%08" PRIx32 ", addr=0x%016" PRIx64
+	       ", rip=0x%016" PRIx64 ", rsp=0x%016" PRIx64 ", module=%s\n",
+	       static_cast<uint32_t>(exception_record->ExceptionCode),
+	       reinterpret_cast<uint64_t>(exception_record->ExceptionAddress), rip, context->Rsp,
+	       module_name[0] != '\0' ? module_name : "(unknown)");
+	std::fflush(stdout);
+}
+
+static bool IsFatalUnhandledWinException(uint32_t code) {
+	switch (code) {
+		case static_cast<uint32_t>(0xC0000409): // STATUS_STACK_BUFFER_OVERRUN
+		case static_cast<uint32_t>(0xC0000374): // STATUS_HEAP_CORRUPTION
+		case static_cast<uint32_t>(0xC00000FD): // STATUS_STACK_OVERFLOW / EXCEPTION_STACK_OVERFLOW
+		case static_cast<uint32_t>(EXCEPTION_ACCESS_VIOLATION):
+		case static_cast<uint32_t>(EXCEPTION_ILLEGAL_INSTRUCTION):
+			return true;
+		default: return false;
+	}
+}
+
+static LONG WINAPI UnhandledTopLevelFilter(PEXCEPTION_POINTERS exception) {
+	if (exception != nullptr && exception->ExceptionRecord != nullptr &&
+	    exception->ExceptionRecord->ExceptionCode != 0xe06d7363) {
+		LogFatalWinException(exception);
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 	FilterScope filter_scope;
 
@@ -81,15 +124,12 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
 		if (exception_record->ExceptionCode == 0xe06d7363) {
-			printf("C++ exception (0xe06d7363) — often Medal/third-party hooks; see README "
-			       "Troubleshooting\n");
+			// MSVC C++ exception (first chance) — let the runtime / catch handlers deal with it.
+			return EXCEPTION_CONTINUE_SEARCH;
 		}
-		printf("Unhandled win exception: code=0x%08" PRIx32 ", addr=0x%016" PRIx64
-		       ", rip=0x%016" PRIx64 ", rsp=0x%016" PRIx64 ", rbp=0x%016" PRIx64 "\n",
-		       static_cast<uint32_t>(exception_record->ExceptionCode),
-		       reinterpret_cast<uint64_t>(exception_record->ExceptionAddress),
-		       exception->ContextRecord->Rip, exception->ContextRecord->Rsp,
-		       exception->ContextRecord->Rbp);
+		if (IsFatalUnhandledWinException(exception_record->ExceptionCode)) {
+			LogFatalWinException(exception);
+		}
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
@@ -119,7 +159,13 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 		FailFast("host exception callback is null");
 	}
 
-	return handler(info) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+	const auto result =
+	    handler(info) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+	if (result == EXCEPTION_CONTINUE_SEARCH &&
+	    IsFatalUnhandledWinException(exception_record->ExceptionCode)) {
+		LogFatalWinException(exception);
+	}
+	return result;
 }
 
 #endif
@@ -143,6 +189,8 @@ bool InstallHandler(Handler handler) {
 		printf("AddVectoredExceptionHandler() failed\n");
 		return false;
 	}
+
+	(void)SetUnhandledExceptionFilter(UnhandledTopLevelFilter);
 
 	g_install_state.store(2, std::memory_order_release);
 	return true;

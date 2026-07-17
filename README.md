@@ -198,6 +198,28 @@ $env:VK_LOADER_LAYERS_DISABLE = "VK_LAYER_MEDAL_capture,VK_LAYER_MEDAL_HOOK"
 Recent builds log general loader errors without exiting, but disabling the broken layer or
 validation avoids the noise entirely.
 
+#### `C++ exception (0xe06d7363)` or game closes without `GameMainLoop: exit...`
+
+`0xe06d7363` is the Windows code for MSVC C++ `throw`. KytyPS5 no longer logs these on first
+chance — they are usually caught internally (Vulkan validation, shader compiler, Qt) and are not
+fatal by themselves.
+
+If the game window closes without a clean exit message, capture a diagnostic log:
+
+```powershell
+.\build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame" `
+  --vulkan-validation false --printf-direction File --printf-output-file _kyty.txt
+echo $LASTEXITCODE
+```
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | Clean exit |
+| `-1073740791` (`0xC0000409`) | Stack buffer overrun — check `_kyty.txt` for `Fatal win exception:` (module + RIP) |
+
+Compare with `--vulkan-validation true` to see whether the Vulkan validation layer is involved.
+Recent builds print `Fatal win exception: code=..., rip=..., module=...` before an unhandled crash.
+
 ### AI Use
 
 AI tools may be used for research, reverse engineering, and development assistance. Contributors
