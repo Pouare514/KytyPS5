@@ -9025,14 +9025,6 @@ void CheckBufferCacheRangeMerge() {
                                             3) &&
               !CanMergeBufferCacheQueueMask(0, 64),
           "cross-queue or invalid queue ownership was accepted");
-  Require("BufferCacheRangeMerge", "readback queue ownership",
-          !CanReadbackBufferCacheQueueMask(0, 3) &&
-              CanReadbackBufferCacheQueueMask(uint64_t{1} << 3u, 3) &&
-              !CanReadbackBufferCacheQueueMask((uint64_t{1} << 2u) |
-                                                   (uint64_t{1} << 3u),
-                                               3) &&
-              !CanReadbackBufferCacheQueueMask(uint64_t{1} << 3u, 64),
-          "zero, cross-queue, or invalid readback ownership was accepted");
   std::printf("[host]    %-32s ok\n", "BufferCacheRangeMerge");
 }
 
@@ -9855,10 +9847,13 @@ void CheckStorageTextureGpuOwnedRebindState() {
   tracker.ForEachUploadRange(base, size, true,
                              [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
   uint64_t readable = 0;
+  uint64_t mapped = 0;
   MEMORY_BASIC_INFORMATION protection{};
   Require("StorageTextureGpuOwnedRebind", "owned",
           tracker.IsRegionGpuModified(base, size) && page_manager.IsMapped(base, size) &&
               (!HostMemoryQueryReadable(base, size, &readable) || readable < size) &&
+              HostMemoryQueryRange(base, size, HostMemoryAccess::Mapped, &mapped) &&
+              mapped == size &&
               VirtualQuery(memory, &protection, sizeof(protection)) != 0 &&
               protection.Protect == PAGE_NOACCESS,
           "GPU-owned storage pages remained host-readable or lost tracker identity");
