@@ -576,6 +576,7 @@ enum class VirtualRangeType {
 	Pooled,
 	Stack,
 	Code,
+	Data,
 	SystemModule,
 };
 
@@ -848,6 +849,33 @@ public:
 			}
 		}
 		return sum;
+	}
+
+	void CollectRangesInInterval(uint64_t query_start, uint64_t query_size,
+	                           std::vector<Range>* out) {
+		EXIT_IF(out == nullptr);
+
+		Common::LockGuard lock(m_mutex);
+		out->clear();
+		if (query_start == 0 || query_size == 0 || query_size > UINT64_MAX - query_start) {
+			return;
+		}
+
+		const auto query_end = query_start + query_size;
+		for (const auto& range: m_ranges) {
+			const auto range_end = End(range.start, range.size);
+			if (range_end <= query_start || range.start >= query_end) {
+				continue;
+			}
+
+			Range piece = range;
+			piece.start = std::max(range.start, query_start);
+			piece.size  = std::min(range_end, query_end) - piece.start;
+			out->push_back(piece);
+		}
+
+		std::sort(out->begin(), out->end(),
+		          [](const Range& left, const Range& right) { return left.start < right.start; });
 	}
 
 private:
@@ -1170,6 +1198,35 @@ static std::atomic<uint64_t>    g_memory_pool_committed     = 0;
 static void                     MemoryPoolSubtractCommitted(uint64_t len);
 // Keep host mappings, physical blocks, placeholders, and virtual ranges in step.
 static std::recursive_mutex g_memory_operation_mutex;
+
+static uint64_t SumVirtualCodeBytes();
+static uint64_t SumVirtualDataBytes();
+
+namespace {
+
+std::atomic<bool>     g_nd_memory_trace_active {false};
+std::atomic<bool>     g_nd_memory_trace_summary_done {false};
+std::atomic<uint32_t> g_nd_vq_trace_count {0};
+std::atomic<uint64_t> g_nd_vq_rx_sum {0};
+std::atomic<uint64_t> g_nd_vq_rw_sum {0};
+constexpr uint32_t    ND_VQ_TRACE_LIMIT = 256;
+
+void LogNdMemoryTraceSummary(const char* reason) {
+	if (g_nd_memory_trace_summary_done.exchange(true)) {
+		return;
+	}
+	g_nd_memory_trace_active = false;
+	LOGF("NdMemoryTrace summary (%s): vq_calls=%u rx_sum=0x%016" PRIx64 " rw_sum=0x%016" PRIx64
+	     " code_vmm=0x%016" PRIx64 " data_vmm=0x%016" PRIx64 "\n",
+	     reason, g_nd_vq_trace_count.load(), g_nd_vq_rx_sum.load(), g_nd_vq_rw_sum.load(),
+	     SumVirtualCodeBytes(), SumVirtualDataBytes());
+}
+
+} // namespace
+
+bool IsNdMemoryValidationTraceActive() {
+	return g_nd_memory_trace_active.load();
+}
 
 static bool MemoryBootTrace() {
 	static std::atomic<uint32_t> count {0};
@@ -2863,6 +2920,13 @@ int KYTY_SYSV_ABI KernelGetPageTableStats(int* cpu_total, int* cpu_available, in
 	           "\t[Ok]\n",
 	           *cpu_total, *cpu_available, *gpu_total, *gpu_available);
 
+	if (g_nd_memory_trace_active.load()) {
+		LOGF("NdMemoryTrace PageTableStats: cpu_used=%" PRIu64 " cpu_avail=%d gpu_used=%" PRIu64
+		     " gpu_avail=%d\n",
+		     cpu_used, *cpu_available, gpu_used, *gpu_available);
+		LogNdMemoryTraceSummary("page_table_stats");
+	}
+
 	return OK;
 }
 
@@ -3927,6 +3991,7 @@ bool KernelHandleReservedRangeAccessViolation(uint64_t vaddr) {
 static const char* VirtualRangeTypeName(VirtualRangeType type) {
 	switch (type) {
 		case VirtualRangeType::Code: return "Code";
+		case VirtualRangeType::Data: return "Data";
 		case VirtualRangeType::SystemModule: return "SystemModule";
 		case VirtualRangeType::Flexible: return "Flexible";
 		case VirtualRangeType::Stack: return "Stack";
@@ -3942,6 +4007,13 @@ static uint64_t SumVirtualCodeBytes() {
 		return 0;
 	}
 	return g_virtual_ranges->SumBytesOfType(VirtualRangeType::Code);
+}
+
+static uint64_t SumVirtualDataBytes() {
+	if (g_virtual_ranges == nullptr) {
+		return 0;
+	}
+	return g_virtual_ranges->SumBytesOfType(VirtualRangeType::Data);
 }
 
 int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info,
@@ -3980,23 +4052,45 @@ int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryIn
 	info->is_gpu_prt   = IsInPrtAperture(vaddr);
 	CopyVirtualRangeName(info->name, candidate.name);
 
-	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 32 &&
-	    (candidate.type == VirtualRangeType::Code || candidate.type == VirtualRangeType::SystemModule ||
-	     candidate.type == VirtualRangeType::Flexible || candidate.type == VirtualRangeType::Stack)) {
-		LOGF("\t start       = 0x%016" PRIx64 "\n"
-		     "\t end         = 0x%016" PRIx64 "\n"
-		     "\t size        = 0x%016" PRIx64 "\n"
-		     "\t type        = %s\n"
-		     "\t protection  = 0x%08" PRIx32 "\n"
-		     "\t flexible    = %d\n"
-		     "\t direct      = %d\n"
-		     "\t stack       = %d\n"
-		     "\t name        = %s\n",
-		     static_cast<uint64_t>(info->start), static_cast<uint64_t>(info->end),
-		     candidate.size, VirtualRangeTypeName(candidate.type), info->protection,
-		     static_cast<int>(info->is_flexible), static_cast<int>(info->is_direct),
-		     static_cast<int>(info->is_stack), info->name);
+	if (g_nd_memory_trace_active.load()) {
+		const uint32_t call_index = g_nd_vq_trace_count.fetch_add(1);
+		const bool     has_exec   = (candidate.protection & PROT_CPU_EXEC) != 0;
+		const bool     has_write  = (candidate.protection & PROT_CPU_WRITE) != 0;
+		if (has_exec) {
+			g_nd_vq_rx_sum.fetch_add(candidate.size);
+		} else if (has_write) {
+			g_nd_vq_rw_sum.fetch_add(candidate.size);
+		}
+		if (call_index < 64) {
+			LOGF("NdMemoryTrace VQ[%u]: addr=0x%016" PRIx64 " flags=%d size=0x%016" PRIx64
+			     " prot=0x%08" PRIx32 " type=%s committed=%d name=%s\n",
+			     call_index, vaddr, flags, candidate.size, info->protection,
+			     VirtualRangeTypeName(candidate.type), static_cast<int>(info->is_committed),
+			     info->name);
+		}
+		if (call_index + 1 >= ND_VQ_TRACE_LIMIT) {
+			LogNdMemoryTraceSummary("vq_limit");
+		}
+	} else {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 32 &&
+		    (candidate.type == VirtualRangeType::Code || candidate.type == VirtualRangeType::Data ||
+		     candidate.type == VirtualRangeType::SystemModule ||
+		     candidate.type == VirtualRangeType::Flexible || candidate.type == VirtualRangeType::Stack)) {
+			LOGF("\t start       = 0x%016" PRIx64 "\n"
+			     "\t end         = 0x%016" PRIx64 "\n"
+			     "\t size        = 0x%016" PRIx64 "\n"
+			     "\t type        = %s\n"
+			     "\t protection  = 0x%08" PRIx32 "\n"
+			     "\t flexible    = %d\n"
+			     "\t direct      = %d\n"
+			     "\t stack       = %d\n"
+			     "\t name        = %s\n",
+			     static_cast<uint64_t>(info->start), static_cast<uint64_t>(info->end),
+			     candidate.size, VirtualRangeTypeName(candidate.type), info->protection,
+			     static_cast<int>(info->is_flexible), static_cast<int>(info->is_direct),
+			     static_cast<int>(info->is_stack), info->name);
+		}
 	}
 
 	return OK;
@@ -4047,6 +4141,16 @@ int KYTY_SYSV_ABI KernelAvailableFlexibleMemorySize(size_t* size) {
 
 	*size = g_flexible_memory->Available();
 
+	static std::atomic<bool> nd_trace_armed {false};
+	if (!nd_trace_armed.exchange(true)) {
+		g_nd_memory_trace_summary_done = false;
+		g_nd_vq_trace_count            = 0;
+		g_nd_vq_rx_sum                 = 0;
+		g_nd_vq_rw_sum                 = 0;
+		g_nd_memory_trace_active       = true;
+		LOGF("NdMemoryTrace: armed for InitializeMemory validation window\n");
+	}
+
 	uint64_t flex_mappings = 0;
 	for (const auto& block: g_flexible_memory->GetBlocks()) {
 		if (CountsFlexibleMappingBytes(block.name, block.map_size)) {
@@ -4069,8 +4173,9 @@ int KYTY_SYSV_ABI KernelAvailableFlexibleMemorySize(size_t* size) {
 
 	static std::atomic<bool> virtual_code_sum_logged {false};
 	if (!virtual_code_sum_logged.exchange(true) && g_virtual_ranges != nullptr) {
-		LOGF("SumVirtualCodeBytes: code=0x%016" PRIx64 " system_module=0x%016" PRIx64 "\n",
-		     SumVirtualCodeBytes(),
+		LOGF("SumVirtualCodeBytes: code=0x%016" PRIx64 " data=0x%016" PRIx64
+		     " system_module=0x%016" PRIx64 "\n",
+		     SumVirtualCodeBytes(), SumVirtualDataBytes(),
 		     g_virtual_ranges->SumBytesOfType(VirtualRangeType::SystemModule));
 	}
 
@@ -4109,7 +4214,89 @@ static int ProgramProtection(VirtualMemory::Mode mode) {
 }
 
 static bool IsRegisteredProgramMemoryType(VirtualRangeType type) {
-	return type == VirtualRangeType::Code || type == VirtualRangeType::SystemModule;
+	return type == VirtualRangeType::Code || type == VirtualRangeType::Data ||
+	       type == VirtualRangeType::SystemModule;
+}
+
+static void RegisterProgramRange(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+                                 const char* name, VirtualRangeType type) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+
+	if (g_virtual_ranges == nullptr || vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr ||
+	    name == nullptr ||
+	    !g_virtual_ranges->Add(vaddr, size, 0, ProgramProtection(mode), 0, type, name)) {
+		EXIT("failed to register program range: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " type=%s\n",
+		     vaddr, size, VirtualRangeTypeName(type));
+	}
+}
+
+void RegisterProgramMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+                           const char* name) {
+	RegisterProgramRange(vaddr, size, mode, name, VirtualRangeType::Code);
+}
+
+void RegisterProgramDataMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+                               const char* name) {
+	RegisterProgramRange(vaddr, size, mode, name, VirtualRangeType::Data);
+}
+
+void RegisterProgramSegmentMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+                                  const char* name, bool system_module) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+
+	if (g_virtual_ranges != nullptr && g_virtual_ranges->HasOverlap(vaddr, size)) {
+		LOGF("RegisterProgramSegmentMemory: skip overlap addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " name=%s\n",
+		     vaddr, size, name);
+		return;
+	}
+
+	const bool is_executable = Common::VirtualMemory::IsExecute(mode);
+	if (system_module) {
+		RegisterProgramRange(vaddr, size, mode, name,
+		                     is_executable ? VirtualRangeType::SystemModule
+		                                   : VirtualRangeType::Data);
+	} else {
+		RegisterProgramRange(vaddr, size, mode, name,
+		                     is_executable ? VirtualRangeType::Code : VirtualRangeType::Data);
+	}
+}
+
+void FillProgramMemoryGaps(uint64_t vaddr, uint64_t size, const char* name) {
+	if (vaddr == 0 || size == 0 || name == nullptr) {
+		return;
+	}
+
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	if (g_virtual_ranges == nullptr) {
+		return;
+	}
+
+	std::vector<VirtualRanges::Range> ranges;
+	g_virtual_ranges->CollectRangesInInterval(vaddr, size, &ranges);
+
+	const auto image_end = vaddr + size;
+	uint64_t   cursor    = vaddr;
+	for (const auto& range: ranges) {
+		if (range.start > cursor) {
+			RegisterProgramRange(cursor, range.start - cursor, VirtualMemory::Mode::ReadWrite, name,
+			                     VirtualRangeType::Data);
+		}
+		cursor = std::max(cursor, range.start + range.size);
+	}
+	if (ranges.empty()) {
+		RegisterProgramRange(vaddr, size, VirtualMemory::Mode::ReadWrite, name,
+		                     VirtualRangeType::Data);
+	} else if (cursor < image_end) {
+		RegisterProgramRange(cursor, image_end - cursor, VirtualMemory::Mode::ReadWrite, name,
+		                     VirtualRangeType::Data);
+	}
+}
+
+void RegisterSystemModuleMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+                                const char* name) {
+	RegisterProgramRange(vaddr, size, mode, name, VirtualRangeType::SystemModule);
 }
 
 static std::vector<VirtualRanges::Range> RequireRegisteredProgramMemory(uint64_t vaddr,
@@ -4124,33 +4311,6 @@ static std::vector<VirtualRanges::Range> RequireRegisteredProgramMemory(uint64_t
 		     vaddr, size);
 	}
 	return ranges;
-}
-
-void RegisterProgramMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
-                           const char* name) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
-
-	if (g_virtual_ranges == nullptr || vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr ||
-	    name == nullptr ||
-	    !g_virtual_ranges->Add(vaddr, size, 0, ProgramProtection(mode), 0, VirtualRangeType::Code,
-	                           name)) {
-		EXIT("failed to register program memory: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-		     vaddr, size);
-	}
-}
-
-void RegisterSystemModuleMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
-                                const char* name) {
-	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
-
-	if (g_virtual_ranges == nullptr || vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr ||
-	    name == nullptr ||
-	    !g_virtual_ranges->Add(vaddr, size, 0, ProgramProtection(mode), 0,
-	                           VirtualRangeType::SystemModule, name)) {
-		EXIT("failed to register system module memory: addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     "\n",
-		     vaddr, size);
-	}
 }
 
 void RegisterProgramFlexibleQuota(uint64_t size, const char* name) {

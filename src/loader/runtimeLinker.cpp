@@ -1968,7 +1968,7 @@ constexpr uint64_t FLEXIBLE_MEMORY_BASE        = 64ull * 1024ull * 1024ull;
 constexpr uint32_t ORBIS_PROC_PARAM_MAGIC      = 0x13bccf52u;
 constexpr uint64_t ORBIS_PROC_PARAM_STRUCT_SIZE = 0x60;
 constexpr uint64_t ORBIS_LIBC_PARAM_STRUCT_SIZE = 0x50;
-constexpr uint64_t PROC_PARAM_SYNTH_SIZE        = 0x100;
+constexpr uint64_t PROC_PARAM_SYNTH_SIZE        = 0x120;
 
 #pragma pack(push, 1)
 struct GuestKernelMemParam {
@@ -2022,20 +2022,37 @@ static bool IsSystemModuleFilename(const std::string& name) {
 
 static void RegisterLoadedProgramMemory(Program* program) {
 	const auto module_name = Common::PathToString(program->file_name.filename());
-	if (IsSystemModuleFilename(module_name)) {
-		Libs::LibKernel::Memory::RegisterSystemModuleMemory(
-		    program->base_vaddr, program->base_size_aligned,
-		    Common::VirtualMemory::Mode::ExecuteReadWrite, module_name.c_str());
-	} else {
-		Libs::LibKernel::Memory::RegisterProgramMemory(
-		    program->base_vaddr, program->base_size_aligned,
-		    Common::VirtualMemory::Mode::ExecuteReadWrite, module_name.c_str());
-	}
 	Libs::LibKernel::Memory::RegisterProgramFlexibleQuota(program->base_size_aligned,
 	                                                     module_name.c_str());
 }
 
-static bool PatchFlexibleScalarInProcParam(GuestProcParam* proc, uint64_t flex_scalar) {
+static void WireGuestMemParamExtended(GuestKernelMemParam* mem, uint64_t proc_vaddr,
+                                      uint64_t synth_size) {
+	if (mem == nullptr ||
+	    mem->size < offsetof(GuestKernelMemParam, extended_memory_2) + sizeof(uint64_t)) {
+		return;
+	}
+
+	const auto ext1_vaddr = proc_vaddr + 0x100;
+	const auto ext2_vaddr = proc_vaddr + 0x108;
+	if (ext2_vaddr + sizeof(uint32_t) > proc_vaddr + synth_size) {
+		LOGF("WireGuestMemParamExtended: proc_param segment too small\n");
+		return;
+	}
+
+	auto* ext1 = reinterpret_cast<uint32_t*>(ext1_vaddr);
+	auto* ext2 = reinterpret_cast<uint32_t*>(ext2_vaddr);
+	*ext1      = 1;
+	*ext2      = 1;
+	mem->extended_memory_1 = ext1_vaddr;
+	mem->extended_memory_2 = ext2_vaddr;
+
+	LOGF("WireGuestMemParamExtended: ext1=0x%016" PRIx64 " ext2=0x%016" PRIx64 "\n", ext1_vaddr,
+	     ext2_vaddr);
+}
+
+static bool PatchFlexibleScalarInProcParam(GuestProcParam* proc, uint64_t flex_scalar,
+                                           uint64_t proc_vaddr, uint64_t synth_size) {
 	if (proc == nullptr || proc->mem_param == 0) {
 		return false;
 	}
@@ -2051,6 +2068,7 @@ static bool PatchFlexibleScalarInProcParam(GuestProcParam* proc, uint64_t flex_s
 	     ")\n",
 	     mem->flexible_memory_size, *flex_ptr);
 	*flex_ptr = flex_scalar;
+	WireGuestMemParamExtended(mem, proc_vaddr, synth_size);
 	Libs::LibKernel::Memory::ApplyMemoryRegionsFromProcParam(flex_scalar);
 	return true;
 }
@@ -2140,6 +2158,9 @@ void SynthesizeProgramProcParam(Program* program) {
 	const auto* elf_proc = reinterpret_cast<const GuestProcParam*>(elf_backup.data());
 	const bool  elf_template =
 	    elf_proc->magic == ORBIS_PROC_PARAM_MAGIC && elf_proc->size >= sizeof(GuestProcParam);
+	LOGF("SynthesizeProgramProcParam: backup magic=0x%08" PRIx32 " size=0x%016" PRIx64
+	     " elf_template=%d\n",
+	     elf_proc->magic, elf_proc->size, elf_template ? 1 : 0);
 
 	if (!MakeGuestRegionWritable(proc_vaddr, synth_size)) {
 		LOGF("SynthesizeProgramProcParam: failed to make proc_param writable at 0x%016" PRIx64 "\n",
@@ -2160,7 +2181,7 @@ void SynthesizeProgramProcParam(Program* program) {
 		if (proc->main_thread_stack_size == 0) {
 			proc->main_thread_stack_size = 0x200000ull;
 		}
-		if (PatchFlexibleScalarInProcParam(proc, flex_scalar)) {
+		if (PatchFlexibleScalarInProcParam(proc, flex_scalar, proc_vaddr, synth_size)) {
 			if (proc->libc_param == 0) {
 				WireGuestLibcParam(proc, proc_vaddr, synth_size);
 			} else {
@@ -2172,7 +2193,7 @@ void SynthesizeProgramProcParam(Program* program) {
 		LOGF("SynthesizeProgramProcParam: ELF template missing mem_param flex chain, synthesizing\n");
 	}
 
-	if (PatchFlexibleScalarInProcParam(proc, flex_scalar)) {
+	if (PatchFlexibleScalarInProcParam(proc, flex_scalar, proc_vaddr, synth_size)) {
 		if (proc->libc_param == 0) {
 			WireGuestLibcParam(proc, proc_vaddr, synth_size);
 		}
@@ -2196,6 +2217,7 @@ void SynthesizeProgramProcParam(Program* program) {
 	mem->size                 = sizeof(GuestKernelMemParam);
 	mem->flexible_memory_size = scalar_vaddr;
 	*scalar                   = flex_scalar;
+	WireGuestMemParamExtended(mem, proc_vaddr, synth_size);
 
 	Libs::LibKernel::Memory::ApplyMemoryRegionsFromProcParam(flex_scalar);
 	WireGuestLibcParam(proc, proc_vaddr, synth_size);
@@ -2278,6 +2300,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			uint64_t segment_file_size   = phdr[i].p_filesz;
 			uint64_t segment_memory_size = GetAlignedSize(phdr + i);
 			auto     mode                = GetMode(phdr[i].p_flags);
+			const auto module_name       = Common::PathToString(program->file_name.filename());
 
 			LOGF("[%d] addr        = 0x%016" PRIx64 "\n"
 			     "[%d] file_size   = %" PRIu64 "\n"
@@ -2285,6 +2308,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			     "[%d] mode        = %s\n",
 			     i, segment_addr, i, segment_file_size, i, segment_memory_size, i,
 			     Common::EnumName(mode).c_str());
+
+			Libs::LibKernel::Memory::RegisterProgramSegmentMemory(
+			    segment_addr, segment_memory_size, mode, module_name.c_str(),
+			    IsSystemModuleFilename(module_name));
 
 			program->elf->LoadSegment(segment_addr, phdr[i].p_offset, segment_file_size);
 
@@ -2339,6 +2366,13 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				LOGF("proc_param loaded from ELF: file_size = 0x%016" PRIx64 "\n", phdr[i].p_filesz);
 			}
 		}
+	}
+
+	{
+		const auto module_name = Common::PathToString(program->file_name.filename());
+		Libs::LibKernel::Memory::FillProgramMemoryGaps(program->base_vaddr,
+		                                               program->base_size_aligned,
+		                                               module_name.c_str());
 	}
 
 	if (!is_shared) {

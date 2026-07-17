@@ -1351,6 +1351,8 @@ int KYTY_SYSV_ABI KernelGetModuleInfoForUnwind(uint64_t addr, int flags,
 
 	uint64_t image_start = UINT64_MAX;
 	uint64_t image_end   = 0;
+	uint64_t exec_start  = UINT64_MAX;
+	uint64_t exec_size   = 0;
 
 	for (int i = 0; i < ehdr->e_phnum; i++) {
 		if (phdr[i].p_memsz == 0) {
@@ -1362,6 +1364,11 @@ int KYTY_SYSV_ABI KernelGetModuleInfoForUnwind(uint64_t addr, int flags,
 			const auto end   = start + phdr[i].p_memsz;
 			image_start      = std::min(image_start, start);
 			image_end        = std::max(image_end, end);
+
+			if ((phdr[i].p_flags & Loader::PF_X) != 0) {
+				exec_start = std::min(exec_start, start);
+				exec_size += phdr[i].p_memsz;
+			}
 		}
 
 		if (phdr[i].p_type == PT_GNU_EH_FRAME) {
@@ -1402,11 +1409,6 @@ int KYTY_SYSV_ABI KernelGetModuleInfoForUnwind(uint64_t addr, int flags,
 		}
 	}
 
-	if (image_start != UINT64_MAX && image_end > image_start) {
-		info->seg0_addr = image_start;
-		info->seg0_size = image_end - image_start;
-	}
-
 	if (info->eh_frame_addr != 0 && info->eh_frame_size == 0) {
 		for (int i = 0; i < ehdr->e_phnum; i++) {
 			if (phdr[i].p_memsz == 0 ||
@@ -1421,6 +1423,20 @@ int KYTY_SYSV_ABI KernelGetModuleInfoForUnwind(uint64_t addr, int flags,
 				break;
 			}
 		}
+	}
+
+	if (exec_size > 0) {
+		info->seg0_addr = exec_start;
+		info->seg0_size = exec_size;
+	} else if (image_start != UINT64_MAX && image_end > image_start) {
+		info->seg0_addr = image_start;
+		info->seg0_size = image_end - image_start;
+	}
+
+	if (Memory::IsNdMemoryValidationTraceActive()) {
+		LOGF("NdMemoryTrace GetModuleInfoForUnwind: addr=0x%016" PRIx64 " name=%s seg0_addr=0x%016"
+		     PRIx64 " seg0_size=0x%016" PRIx64 "\n",
+		     addr, info->name, info->seg0_addr, info->seg0_size);
 	}
 
 	return OK;
@@ -1449,6 +1465,11 @@ static int KYTY_SYSV_ABI KernelGetModuleInfoFromAddr(uint64_t addr, int n, Modul
 	r->handle = p->unique_id;
 
 	LOGF("\thandle: %d\n", r->handle);
+
+	if (Memory::IsNdMemoryValidationTraceActive()) {
+		LOGF("NdMemoryTrace GetModuleInfoFromAddr: addr=0x%016" PRIx64 " handle=%d\n", addr,
+		     r->handle);
+	}
 
 	return 0;
 }
