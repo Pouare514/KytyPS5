@@ -9367,9 +9367,20 @@ void CheckSampledDepthResource() {
           "dynamic-storage mip depth resource was accepted");
   resource = basic;
   resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
-  Require("SampledDepthResource", "array rejected",
-          !IsSupportedSampledDepthResource(resource),
-          "array depth resource was accepted");
+  Require("SampledDepthResource", "singleton array accepted",
+          IsSupportedSampledDepthResource(resource),
+          "array depth resource was rejected");
+  const auto singleton_array_view = ResolveTargetTextureView(
+      resource, Prospero::ImageType::kColor2DArray, 0, 1);
+  Require("SampledDepthResource", "singleton array view",
+          singleton_array_view.type == VK_IMAGE_VIEW_TYPE_2D_ARRAY &&
+              singleton_array_view.base_layer == 0 &&
+              singleton_array_view.layer_count == 1,
+          "singleton depth array did not preserve the shader array view type");
+  Require("SampledDepthResource", "array type mismatch rejected",
+          ResolveTargetTextureView(resource, Prospero::ImageType::kColor2D, 0, 1)
+                  .type == VK_IMAGE_VIEW_TYPE_MAX_ENUM,
+          "array shader resource accepted a non-array descriptor view");
   resource = basic;
   resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
   Require("SampledDepthResource", "integer rejected",
@@ -9448,6 +9459,16 @@ void CheckSampledDepthDescriptor() {
                                   descriptor.TileMode()) == 1408 &&
               IsSupportedDepthTargetDescriptor(descriptor, image),
           "valid padded-pitch depth texture was rejected");
+
+  descriptor.fields[3] =
+      (descriptor.fields[3] & ~(0xfu << 28u)) |
+      (Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) << 28u);
+  Require("SampledDepthDescriptor", "singleton array descriptor",
+          IsSupportedDepthTargetDescriptor(descriptor, image),
+          "valid singleton-array depth texture was rejected");
+  descriptor.fields[3] =
+      (descriptor.fields[3] & ~(0xfu << 28u)) |
+      (Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) << 28u);
 
   image.guest_pitch = 1344;
   Require("SampledDepthDescriptor", "target pitch mismatch",

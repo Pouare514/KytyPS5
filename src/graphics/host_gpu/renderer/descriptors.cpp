@@ -299,13 +299,7 @@ static bool IsSupportedSampledColorResource(const ShaderRecompiler::IR::ImageRes
 	       !resource.written && !resource.atomic && !resource.depth_compare;
 }
 
-struct TargetTextureViewInfo {
-	VkImageViewType type        = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
-	uint32_t        base_layer  = 0;
-	uint32_t        layer_count = 0;
-};
-
-static TargetTextureViewInfo
+TargetTextureViewInfo
 ResolveTargetTextureView(const ShaderRecompiler::IR::ImageResource& resource,
                          Prospero::ImageType type, uint32_t base_layer, uint32_t image_layers) {
 	switch (type) {
@@ -343,12 +337,15 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor,
 	const auto width  = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height = static_cast<uint32_t>(descriptor.Height5()) + 1u;
 	const auto pitch  = TileGetTexturePitch(descriptor.Format(), width, 1, descriptor.TileMode());
+	const auto type   = static_cast<Prospero::ImageType>(descriptor.Type());
+	const bool supported_type = type == Prospero::ImageType::kColor2D ||
+	                            type == Prospero::ImageType::kColor2DArray;
 	return image.type == VulkanImageType::DepthStencil && image.layers == 1 &&
 	       width == image.extent.width && height == image.extent.height &&
 	       descriptor.Depth() == 0 && descriptor.BaseLevel() == 0 && descriptor.LastLevel() == 0 &&
 	       descriptor.MaxMip() == 0 && descriptor.MinLod() == 0 && descriptor.BaseArray5() == 0 &&
 	       descriptor.TileMode() == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
-	       descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
+	       supported_type &&
 	       descriptor.BCSwizzle() == 0 && !descriptor.MsaaDepth() && pitch >= width &&
 	       pitch == image.guest_pitch;
 }
@@ -356,11 +353,13 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor,
 static bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor) {
 	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
-	constexpr uint32_t field3_base          = 0x91800000u;
+	constexpr uint32_t field3_common        = 0x01800000u;
 	constexpr uint32_t field5_expected      = 0x00700000u;
+	const uint32_t field3_expected =
+	    (descriptor.Type() << 28u) | field3_common | descriptor.DstSelXYZW();
 	return (descriptor.fields[1] & field1_reserved_mask) == 0 &&
 	       (descriptor.fields[2] & field2_reserved_mask) == 0 &&
-	       descriptor.fields[3] == (field3_base | descriptor.DstSelXYZW()) &&
+	       descriptor.fields[3] == field3_expected &&
 	       descriptor.fields[4] == 0 && descriptor.fields[5] == field5_expected &&
 	       descriptor.fields[6] == 0 && descriptor.fields[7] == 0;
 }
@@ -591,10 +590,19 @@ NativeTexture(uint64_t submit_id, CommandBuffer* command_buffer,
 				if (uint_reinterpret || uint_storage_reinterpret) {
 					image = nullptr;
 				} else {
+					const auto depth_view = ResolveTargetTextureView(
+					    resource, type, descriptor.BaseArray5(), image->layers);
 					ValidateDepthTargetBinding(resource, descriptor, image, view_format, size.size);
+					if (depth_view.type == VK_IMAGE_VIEW_TYPE_MAX_ENUM) {
+						EXIT("unsupported sampled depth target view: dimension=%u descriptor_type=%u "
+						     "base_array=%u image_layers=%u\n",
+						     static_cast<uint32_t>(resource.dimension), descriptor.Type(),
+						     descriptor.BaseArray5(), image->layers);
+					}
 					image_view = g_render_ctx->GetTextureCache()->GetDepthTargetSampledView(
 					    g_render_ctx->GetGraphicCtx(), static_cast<DepthStencilVulkanImage*>(image),
-					    view_format, swizzle, 0, 1, VK_IMAGE_VIEW_TYPE_2D, 0, 1);
+					    view_format, swizzle, 0, 1, depth_view.type, depth_view.base_layer,
+					    depth_view.layer_count);
 				}
 			} else {
 				if (!(storage ? IsSupportedStorageImageResource(resource)

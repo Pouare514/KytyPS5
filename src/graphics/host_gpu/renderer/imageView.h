@@ -155,7 +155,8 @@ namespace Libs::Graphics {
 [[nodiscard]] inline bool
 IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
 	return resource.kind == ShaderRecompiler::IR::ResourceKind::Image &&
-	       resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
+	       (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
+	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray) &&
 	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
 	       !resource.written && !resource.atomic;
 }
