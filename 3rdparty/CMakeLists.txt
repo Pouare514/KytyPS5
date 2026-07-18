@@ -5,6 +5,12 @@ add_subdirectory(cpuinfo)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 add_subdirectory(SDL2)
 
+add_library(Vulkan-Headers INTERFACE)
+add_library(Vulkan::Headers ALIAS Vulkan-Headers)
+target_include_directories(Vulkan-Headers INTERFACE
+	"${CMAKE_CURRENT_SOURCE_DIR}/Vulkan-Headers/include"
+)
+
 set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
 set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
 set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
