@@ -450,7 +450,25 @@ uint32_t EmitVertexParameterComponentU32(EmitterState* state, const InputBinding
                                          uint32_t component) {
 	const auto count = VertexParameterComponentCount(*state, input);
 	const auto kind  = VertexParameterScalarKind(*state, input.location);
-	if (component >= count) {
+	uint32_t source_component = component;
+	if (input.location < ShaderVertexInputInfo::RES_MAX &&
+	    input.location < static_cast<uint32_t>(state->vertex_input_info->resources_num)) {
+		const auto& descriptor = state->vertex_input_info->resources[input.location];
+		const auto selection =
+		    DecodeVertexDstSelector(GetDstSel(descriptor.DstSelXYZW(), component & 3u));
+		if (selection.kind == VertexDstSelectKind::Zero) {
+			return ConstantU32(state, 0u);
+		}
+		if (selection.kind == VertexDstSelectKind::One) {
+			return ConstantU32(state,
+			                   kind == VertexInputScalarKind::Float ? 0x3f800000u : 1u);
+		}
+		if (selection.kind == VertexDstSelectKind::Reserved) {
+			EXIT("reserved vertex destination selector\n");
+		}
+		source_component = selection.source_component;
+	}
+	if (source_component >= count) {
 		return VertexInputDefaultComponentU32(state, kind, component);
 	}
 
@@ -462,7 +480,7 @@ uint32_t EmitVertexParameterComponentU32(EmitterState* state, const InputBinding
 		const auto pointer_type = VertexParameterScalarPointerType(*state, kind);
 		const auto pointer      = state->builder.AllocateId();
 		state->builder.AddFunction({OpAccessChain, pointer_type, pointer, input.variable_id,
-		                            ConstantU32(state, component)});
+		                            ConstantU32(state, source_component)});
 		state->builder.AddFunction({OpLoad, scalar_type, raw, pointer});
 	}
 
