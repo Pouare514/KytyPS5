@@ -1,0 +1,118 @@
+P69 JB ABI scratch
+payload VideoOut stub symbols: 169
+Kyty VideoOut LIB_FUNC: 38
+Kyty GraphicsDriver LIB_FUNC: 164
+
+=== AgcDriver in ps5-payload-sdk sce_stubs ===
+ABSENT (only libSceGnmDriver + libSceGnmDriverForNeoMode + libSceVideoOut)
+→ no public JB Agc NID table; Kyty Gen5 AgcDriver NIDs remain sole source
+
+=== hbldr / TLOU Flip core vs stub ===
+core present in stub: ['sceVideoOutAddFlipEvent', 'sceVideoOutClose', 'sceVideoOutGetBufferLabelAddress', 'sceVideoOutGetFlipStatus', 'sceVideoOutGetOutputStatus', 'sceVideoOutOpen', 'sceVideoOutRegisterBuffers2', 'sceVideoOutSetBufferAttribute2', 'sceVideoOutSetFlipRate', 'sceVideoOutSubmitFlip', 'sceVideoOutUnregisterBuffers']
+core missing from stub: []
+
+=== Kyty VideoOut NIDs (name) ===
+  Up36PTk687E  VideoOutOpen
+  uquVH4-Du78  VideoOutClose
+  PjS5uASwcV8  VideoOutSetBufferAttribute2
+  rKBUtgRrtbk  VideoOutRegisterBuffers2
+  HuViW4HnrOw  VideoOutSubmitChangeBufferAttribute2
+  N5KDtkIjjJ4  VideoOutUnregisterBuffers
+  CBiu4mCE1DA  VideoOutSetFlipRate
+  HXzjK9yI30k  VideoOutAddFlipEvent
+  Xru92wHJRmg  VideoOutAddVblankEvent
+  keipklF0pMY  VideoOutAddPreVblankStartEvent
+  -Ozn0F1AFRg  VideoOutDeleteFlipEvent
+  oNOQn3knW6s  VideoOutDeleteVblankEvent
+  elWQ9vERF-Q  VideoOutDeletePreVblankStartEvent
+  U46NwOiJpys  VideoOutSubmitFlip
+  SbU3dwp80lQ  VideoOutGetFlipStatus
+  zgXifHT9ErY  VideoOutIsFlipPending
+  1FZBKy8HeNU  VideoOutGetVblankStatus
+  MTxxrOCeSig  VideoOutSetWindowModeMargins
+  kmSe30JTs+E  VideoOutAddOutputModeEvent
+  U2JJtSqNKZI  VideoOutGetEventId
+  rWUTcKdkUzQ  VideoOutGetEventData
+  Mt4QHHkxkOc  VideoOutGetEventCount
+  j6RaAUlaLv0  VideoOutWaitVblank
+  utPrVdxio-8  VideoOutGetOutputStatus
+  +I4K03i3EL0  VideoOutInitializeOutputOptions
+  Nv8c-Kb+DUM  VideoOutIsOutputSupported
+  w0hLuNarQxY  VideoOutConfigureOutput
+  eb-gvTYQcoY  VideoOutLatencyControlWaitBeforeInput
+  MCJ8SkzsQxY  VideoOutLatencyMeasureSetStartPoint
+  DYhhWbJSeRg  VideoOutColorSettingsSetGamma
+  pv9CI5VC+R0  VideoOutAdjustColor
+  OcQybQejHEY  VideoOutGetBufferLabelAddress
+  kGVLc3htQE8  VideoOutGetDeviceCapabilityInfo
+  6kPnj51T62Y  VideoOutGetResolutionStatus
+  T4ucGB8CsnM  VideoOutUnknownNidStub0
+  5tRaBjtdTzY  VideoOutUnknownNidStub1
+  kP2L8t3j-aM  VideoOutAddVrrStatusFlagsPrivilege
+  LibwuIonIBw  VideoOutGetVrrStatus
+
+=== Non-privilege stub VideoOut not mapped to Kyty sce* name ===
+  sceVideoOutAddBuffer
+  sceVideoOutAddBufferAttributeOption
+  sceVideoOutAddDisplayPositionEvent
+  sceVideoOutAddDriver
+  sceVideoOutAddSetModeEvent
+  sceVideoOutAddStereoBuffer
+  sceVideoOutClearFlipMaster
+  sceVideoOutConfigureLayout
+  sceVideoOutConfigureOutputEx
+  sceVideoOutControlHdcpEncryption
+  sceVideoOutCursorDisable
+  sceVideoOutCursorEnable
+  sceVideoOutCursorIsUpdatePending
+  sceVideoOutCursorSet2xMagnify
+  sceVideoOutCursorSetHotSpot
+  sceVideoOutCursorSetImageAddress
+  sceVideoOutCursorSetPosition
+  sceVideoOutCursorSetPositionStereo
+  sceVideoOutDeleteDisplayPositionEvent
+  sceVideoOutDeleteDriver
+  sceVideoOutDeleteOutputModeEvent
+  sceVideoOutDeleteSetModeEvent
+  sceVideoOutDriverAddEvent
+  sceVideoOutDriverDecrementBufferLabel
+  sceVideoOutDriverDeleteEvent
+  sceVideoOutDriverGetBufferLabelAddress
+  sceVideoOutDriverGetEopHandle
+  sceVideoOutDriverGetFinishedEopHandle
+  sceVideoOutDriverGetLatestEopHandle
+  sceVideoOutDriverIncrementBufferLabel
+  sceVideoOutDriverResetBufferLabel
+  sceVideoOutDriverTriggerEvent
+  sceVideoOutGetBufferInformation
+  sceVideoOutGetCoredumpOutputMode
+  sceVideoOutGetMonitorInfo
+  sceVideoOutGetPipelineStatus
+  sceVideoOutGetPortStatusInfo
+  sceVideoOutGetStatusForWebcore
+  sceVideoOutHdmiMonitorInfoIsSupportedHdcpVersion
+  sceVideoOutLockBuffer
+  sceVideoOutRazorAddCallback
+  sceVideoOutRazorRecallCallbacks
+  sceVideoOutRazorRemoveCallback
+  sceVideoOutRegisterBufferAttribute
+  sceVideoOutRegisterBuffers
+  sceVideoOutRegisterStereoBuffers
+  sceVideoOutRemoveBuffer
+  sceVideoOutRemoveBufferAttributeOption
+  sceVideoOutSetAlphaControl
+  sceVideoOutSetBlankAfterResume
+  sceVideoOutSetBufferAttribute
+  sceVideoOutSetContentType
+  sceVideoOutSetDisplayEventPosition
+  sceVideoOutSetFlipMaster
+  sceVideoOutSetGlobalBlendSpace
+  sceVideoOutSubmitChangeBufferAttribute
+  sceVideoOutSubmitEopFlip
+  sceVideoOutSysAddSetModeEvent
+  sceVideoOutSysAddSetModeEvent2
+  sceVideoOutSysAddVblankEvent
+... total unmapped non-priv: 105
+
+=== Verdict ===
+No AgcDriver gap from JB (stubs don't ship Agc). Flip path symbols used by TLOU/hbldr exist in both stub names and Kyty HLE. Unmapped stub symbols are mostly legacy/PS4-era or privilege APIs; not a proven TLOU Mixed predicate miss.

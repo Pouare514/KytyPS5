@@ -106,6 +106,26 @@ function Invoke-RunPhase {
     } else {
         Clear-EnvVar 'KYTY_PHASE66_MENU_RECYCLE'
     }
+    if ($PhaseNum -eq 68) {
+        Set-Item -Path 'Env:KYTY_PHASE68_SHARPEMU_WAIT' -Value '1'
+    } else {
+        Clear-EnvVar 'KYTY_PHASE68_SHARPEMU_WAIT'
+    }
+    if ($PhaseNum -eq 69) {
+        Set-Item -Path 'Env:KYTY_PHASE69_NDJOB_READY' -Value '1'
+    } else {
+        Clear-EnvVar 'KYTY_PHASE69_NDJOB_READY'
+    }
+    if ($PhaseNum -eq 70) {
+        Set-Item -Path 'Env:KYTY_PHASE70_NDJOB_FIELD' -Value '1'
+    } else {
+        Clear-EnvVar 'KYTY_PHASE70_NDJOB_FIELD'
+    }
+    if ($PhaseNum -eq 71) {
+        Set-Item -Path 'Env:KYTY_PHASE71_CTX_FIELD' -Value '1'
+    } else {
+        Clear-EnvVar 'KYTY_PHASE71_CTX_FIELD'
+    }
     Clear-EnvVar 'KYTY_PHASE41_LIVE_KEEP1'
     Clear-EnvVar 'KYTY_PHASE41_RECALL_KEEP1'
     Clear-EnvVar 'KYTY_PHASE51_FAILFAST'
@@ -218,6 +238,52 @@ function Invoke-TriagePhase {
     }
     if ($PhaseNum -eq 66) {
         $richHeat = Get-LastMatchLine -Lines $lines -Pattern 'phase66 heatmap .*recycle_n='
+        if ($richHeat) {
+            $heatmapLine = $richHeat
+        }
+    }
+    if ($PhaseNum -eq 68) {
+        # Prefer P63 guest_real heatmap + phase68 evidence lines.
+        $richHeat = Get-LastMatchLine -Lines $lines -Pattern 'phase63 heatmap .*submit_guest_real='
+        if ($richHeat) {
+            $heatmapLine = $richHeat
+        }
+        if (-not $heatmapLine) {
+            $heatmapLine = Get-LastMatchLine -Lines $lines -Pattern 'phase68 wait_ack|phase68 submit_state'
+        }
+    }
+    if ($PhaseNum -eq 69) {
+        $richHeat = Get-LastMatchLine -Lines $lines -Pattern 'phase69 heatmap .*hle_n='
+        if (-not $richHeat) {
+            $richHeat = Get-LastMatchLine -Lines $lines -Pattern 'phase69 heatmap .*dump_n='
+        }
+        if (-not $richHeat) {
+            $richHeat = Get-LastMatchLine -Lines $lines -Pattern 'phase69 heatmap .*cause='
+        }
+        if ($richHeat) {
+            $heatmapLine = $richHeat
+        }
+    }
+    if ($PhaseNum -eq 70) {
+        $richHeat = Get-LastMatchLine -Lines $lines -Pattern 'phase70 heatmap .*hle_n='
+        if (-not $richHeat) {
+            $richHeat = Get-LastMatchLine -Lines $lines -Pattern 'phase70 heatmap .*dump_n='
+        }
+        if (-not $richHeat) {
+            $richHeat = Get-LastMatchLine -Lines $lines -Pattern 'phase70 heatmap .*cause='
+        }
+        if ($richHeat) {
+            $heatmapLine = $richHeat
+        }
+    }
+    if ($PhaseNum -eq 71) {
+        $richHeat = Get-LastMatchLine -Lines $lines -Pattern 'phase71 heatmap .*hle_n='
+        if (-not $richHeat) {
+            $richHeat = Get-LastMatchLine -Lines $lines -Pattern 'phase71 heatmap .*dump_n='
+        }
+        if (-not $richHeat) {
+            $richHeat = Get-LastMatchLine -Lines $lines -Pattern 'phase71 heatmap .*cause='
+        }
         if ($richHeat) {
             $heatmapLine = $richHeat
         }
@@ -427,6 +493,185 @@ function Invoke-TriagePhase {
         $verdict['LastRecycle'] = $recycleLine
     }
 
+    if ($PhaseNum -eq 68) {
+        $submitGuestReal = $null
+        if ($heatmapLine -and ($heatmapLine -match 'submit_guest_real=(\d+)')) {
+            $submitGuestReal = [int]$Matches[1]
+        }
+        $submitStateN = @(Select-String -InputObject ($lines -join "`n") -Pattern 'phase68 submit_state' -AllMatches).Count
+        if ($submitStateN -eq 0) {
+            $submitStateN = ($lines | Where-Object { $_ -match 'phase68 submit_state' }).Count
+        }
+        $waitAckN = ($lines | Where-Object { $_ -match 'phase68 wait_ack' }).Count
+        $lastSubmit = Get-LastMatchLine -Lines $lines -Pattern 'phase68 submit_state'
+        $lastAck = Get-LastMatchLine -Lines $lines -Pattern 'phase68 wait_ack'
+        $cause68 = 'still_opaque_wait_port'
+        if ($null -ne $submitGuestReal -and $submitGuestReal -gt 0) {
+            $cause68 = 'guest_submit_armed'
+        } elseif ($waitAckN -gt 0 -and $submitStateN -gt 0) {
+            $cause68 = 'wait_ack_active'
+        } elseif ($submitStateN -gt 0) {
+            $cause68 = 'submit_state_only'
+        }
+        $verdict.Cause = $cause68
+        $verdict['Phase68Cause'] = $cause68
+        $verdict['SubmitGuestReal'] = $submitGuestReal
+        $verdict['Phase68SubmitStateN'] = $submitStateN
+        $verdict['Phase68WaitAckN'] = $waitAckN
+        $verdict['LastPhase68Submit'] = $lastSubmit
+        $verdict['LastPhase68Ack'] = $lastAck
+    }
+
+    if ($PhaseNum -eq 69) {
+        $dumpN = $null
+        $staticStreak = $null
+        $fieldStatic = $null
+        $hleN = $null
+        $hleOn = $null
+        $guestRealPost = $null
+        if ($heatmapLine) {
+            if ($heatmapLine -match 'dump_n=(\d+)') { $dumpN = [int]$Matches[1] }
+            if ($heatmapLine -match 'static_streak=(\d+)') { $staticStreak = [int]$Matches[1] }
+            if ($heatmapLine -match 'field_static=(\d+)') { $fieldStatic = [int]$Matches[1] }
+            if ($heatmapLine -match 'hle_n=(\d+)') { $hleN = [int]$Matches[1] }
+            if ($heatmapLine -match 'hle_on=(\d+)') { $hleOn = [int]$Matches[1] }
+            if ($heatmapLine -match 'guest_real_post=(\d+)') { $guestRealPost = [int]$Matches[1] }
+        }
+        $lastDump = Get-LastMatchLine -Lines $lines -Pattern 'phase69 ndjob_dump '
+        $lastHle = Get-LastMatchLine -Lines $lines -Pattern 'phase69 ndjob_hle '
+        $lastDumpStatic = Get-LastMatchLine -Lines $lines -Pattern 'phase69 ndjob_dump .*static=1'
+        # Evidence counts beat a stale early heatmap (dump_n=0 / hle_n=0).
+        $hleCount = ($lines | Where-Object { $_ -match 'phase69 ndjob_hle ' }).Count
+        $dumpCount = ($lines | Where-Object { $_ -match 'phase69 ndjob_dump ' }).Count
+        if ($null -eq $hleN -or $hleN -eq 0) { $hleN = $hleCount }
+        if ($null -eq $dumpN -or $dumpN -eq 0) { $dumpN = $dumpCount }
+        if ($null -eq $fieldStatic -or $fieldStatic -eq 0) {
+            if ($lastDumpStatic) { $fieldStatic = 1 }
+        }
+        $cause69 = 'still_opaque_predicate'
+        if ($null -ne $guestRealPost -and $guestRealPost -gt 0) {
+            $cause69 = 'guest_submit_armed'
+        } elseif ($hleN -gt 0) {
+            $cause69 = 'ndjob_hle_no_submit'
+        } elseif ($fieldStatic -eq 1) {
+            $cause69 = 'ndjob_field_static'
+        }
+        $verdict.Cause = $cause69
+        $verdict['Phase69Cause'] = $cause69
+        $verdict['DumpN'] = $dumpN
+        $verdict['StaticStreak'] = $staticStreak
+        $verdict['FieldStatic'] = $fieldStatic
+        $verdict['HleN'] = $hleN
+        $verdict['HleOn'] = $hleOn
+        $verdict['GuestRealPost'] = $guestRealPost
+        $verdict['LastNdJobDump'] = $lastDump
+        $verdict['LastNdJobHle'] = $lastHle
+    }
+
+    if ($PhaseNum -eq 70) {
+        $dumpN = $null
+        $staticStreak = $null
+        $fieldStatic = $null
+        $hleN = $null
+        $hleOn = $null
+        $guestRealPost = $null
+        $byteVal = $null
+        if ($heatmapLine) {
+            if ($heatmapLine -match 'dump_n=(\d+)') { $dumpN = [int]$Matches[1] }
+            if ($heatmapLine -match 'static_streak=(\d+)') { $staticStreak = [int]$Matches[1] }
+            if ($heatmapLine -match 'field_static=(\d+)') { $fieldStatic = [int]$Matches[1] }
+            if ($heatmapLine -match 'hle_n=(\d+)') { $hleN = [int]$Matches[1] }
+            if ($heatmapLine -match 'hle_on=(\d+)') { $hleOn = [int]$Matches[1] }
+            if ($heatmapLine -match 'guest_real_post=(\d+)') { $guestRealPost = [int]$Matches[1] }
+            if ($heatmapLine -match 'byte=0x([0-9a-fA-F]+)') { $byteVal = $Matches[1] }
+        }
+        $lastDump = Get-LastMatchLine -Lines $lines -Pattern 'phase70 field_dump '
+        $lastHle = Get-LastMatchLine -Lines $lines -Pattern 'phase70 ndjob_hle '
+        $lastDumpStatic = Get-LastMatchLine -Lines $lines -Pattern 'phase70 field_dump .*static=1'
+        $hleCount = ($lines | Where-Object { $_ -match 'phase70 ndjob_hle ' }).Count
+        $dumpCount = ($lines | Where-Object { $_ -match 'phase70 field_dump ' }).Count
+        if ($null -eq $hleN -or $hleN -eq 0) { $hleN = $hleCount }
+        if ($null -eq $dumpN -or $dumpN -eq 0) { $dumpN = $dumpCount }
+        if ($null -eq $fieldStatic -or $fieldStatic -eq 0) {
+            if ($lastDumpStatic) { $fieldStatic = 1 }
+        }
+        $cause70 = 'still_opaque_predicate'
+        if ($null -ne $guestRealPost -and $guestRealPost -gt 0) {
+            $cause70 = 'guest_submit_armed'
+        } elseif ($hleN -gt 0) {
+            $cause70 = 'field_hle_no_submit'
+        } elseif ($fieldStatic -eq 1) {
+            $cause70 = 'field_still_static'
+        }
+        $verdict.Cause = $cause70
+        $verdict['Phase70Cause'] = $cause70
+        $verdict['DumpN'] = $dumpN
+        $verdict['StaticStreak'] = $staticStreak
+        $verdict['FieldStatic'] = $fieldStatic
+        $verdict['HleN'] = $hleN
+        $verdict['HleOn'] = $hleOn
+        $verdict['GuestRealPost'] = $guestRealPost
+        $verdict['Byte'] = $byteVal
+        $verdict['LastFieldDump'] = $lastDump
+        $verdict['LastFieldHle'] = $lastHle
+    }
+
+    if ($PhaseNum -eq 71) {
+        $dumpN = $null
+        $staticStreak = $null
+        $fieldStatic = $null
+        $hleN = $null
+        $hleOn = $null
+        $baseOk = $null
+        $guestRealPost = $null
+        $f24Val = $null
+        $f8Val = $null
+        if ($heatmapLine) {
+            if ($heatmapLine -match 'dump_n=(\d+)') { $dumpN = [int]$Matches[1] }
+            if ($heatmapLine -match 'static_streak=(\d+)') { $staticStreak = [int]$Matches[1] }
+            if ($heatmapLine -match 'field_static=(\d+)') { $fieldStatic = [int]$Matches[1] }
+            if ($heatmapLine -match 'hle_n=(\d+)') { $hleN = [int]$Matches[1] }
+            if ($heatmapLine -match 'hle_on=(\d+)') { $hleOn = [int]$Matches[1] }
+            if ($heatmapLine -match 'base_ok=(\d+)') { $baseOk = [int]$Matches[1] }
+            if ($heatmapLine -match 'guest_real_post=(\d+)') { $guestRealPost = [int]$Matches[1] }
+            if ($heatmapLine -match 'f24=0x([0-9a-fA-F]+)') { $f24Val = $Matches[1] }
+            if ($heatmapLine -match 'f8=0x([0-9a-fA-F]+)') { $f8Val = $Matches[1] }
+        }
+        $lastDump = Get-LastMatchLine -Lines $lines -Pattern 'phase71 ctx_dump '
+        $lastHle = Get-LastMatchLine -Lines $lines -Pattern 'phase71 ctx_hle '
+        $lastDumpStatic = Get-LastMatchLine -Lines $lines -Pattern 'phase71 ctx_dump .*static=1'
+        $hleCount = ($lines | Where-Object { $_ -match 'phase71 ctx_hle ' }).Count
+        $dumpCount = ($lines | Where-Object { $_ -match 'phase71 ctx_dump ' }).Count
+        if ($null -eq $hleN -or $hleN -eq 0) { $hleN = $hleCount }
+        if ($null -eq $dumpN -or $dumpN -eq 0) { $dumpN = $dumpCount }
+        if ($null -eq $fieldStatic -or $fieldStatic -eq 0) {
+            if ($lastDumpStatic) { $fieldStatic = 1 }
+        }
+        $cause71 = 'still_opaque_predicate'
+        if ($null -ne $guestRealPost -and $guestRealPost -gt 0) {
+            $cause71 = 'guest_submit_armed'
+        } elseif ($hleN -gt 0) {
+            $cause71 = 'field_hle_no_submit'
+        } elseif ($fieldStatic -eq 1) {
+            $cause71 = 'field_still_static'
+        } elseif ($null -ne $baseOk -and $baseOk -eq 0 -and $dumpN -gt 0) {
+            $cause71 = 'ctx_base_unresolved'
+        }
+        $verdict.Cause = $cause71
+        $verdict['Phase71Cause'] = $cause71
+        $verdict['DumpN'] = $dumpN
+        $verdict['StaticStreak'] = $staticStreak
+        $verdict['FieldStatic'] = $fieldStatic
+        $verdict['HleN'] = $hleN
+        $verdict['HleOn'] = $hleOn
+        $verdict['BaseOk'] = $baseOk
+        $verdict['GuestRealPost'] = $guestRealPost
+        $verdict['F24'] = $f24Val
+        $verdict['F8'] = $f8Val
+        $verdict['LastCtxDump'] = $lastDump
+        $verdict['LastCtxHle'] = $lastHle
+    }
+
     $jsonFile = Join-Path $RepoRoot ("_kyty_tlou_p{0}_verdict.json" -f $PhaseNum)
     ($verdict | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $jsonFile -Encoding UTF8
 
@@ -487,6 +732,48 @@ function Invoke-TriagePhase {
         Write-Host ("  GUEST_FLIP = {0}" -f $verdict.GuestFlipSeen)
         Write-Host ("  HOST_FLIP  = {0}" -f $verdict.HostFlipActive)
         Write-Host ("  LAST_RECYC = {0}" -f $verdict.LastRecycle)
+    }
+    if ($PhaseNum -eq 68) {
+        Write-Host ("  P68_CAUSE  = {0}" -f $verdict.Phase68Cause)
+        Write-Host ("  SUBMIT_GR  = {0}" -f $verdict.SubmitGuestReal)
+        Write-Host ("  STATE_N    = {0}" -f $verdict.Phase68SubmitStateN)
+        Write-Host ("  WAIT_ACK_N = {0}" -f $verdict.Phase68WaitAckN)
+        Write-Host ("  LAST_STATE = {0}" -f $verdict.LastPhase68Submit)
+        Write-Host ("  LAST_ACK   = {0}" -f $verdict.LastPhase68Ack)
+    }
+    if ($PhaseNum -eq 69) {
+        Write-Host ("  DUMP_N     = {0}" -f $verdict.DumpN)
+        Write-Host ("  STATIC_STR = {0}" -f $verdict.StaticStreak)
+        Write-Host ("  FIELD_STAT = {0}" -f $verdict.FieldStatic)
+        Write-Host ("  HLE_N      = {0}" -f $verdict.HleN)
+        Write-Host ("  HLE_ON     = {0}" -f $verdict.HleOn)
+        Write-Host ("  GUEST_REAL = {0}" -f $verdict.GuestRealPost)
+        Write-Host ("  LAST_DUMP  = {0}" -f $verdict.LastNdJobDump)
+        Write-Host ("  LAST_HLE   = {0}" -f $verdict.LastNdJobHle)
+    }
+    if ($PhaseNum -eq 70) {
+        Write-Host ("  DUMP_N     = {0}" -f $verdict.DumpN)
+        Write-Host ("  STATIC_STR = {0}" -f $verdict.StaticStreak)
+        Write-Host ("  FIELD_STAT = {0}" -f $verdict.FieldStatic)
+        Write-Host ("  HLE_N      = {0}" -f $verdict.HleN)
+        Write-Host ("  HLE_ON     = {0}" -f $verdict.HleOn)
+        Write-Host ("  BYTE       = {0}" -f $verdict.Byte)
+        Write-Host ("  GUEST_REAL = {0}" -f $verdict.GuestRealPost)
+        Write-Host ("  LAST_DUMP  = {0}" -f $verdict.LastFieldDump)
+        Write-Host ("  LAST_HLE   = {0}" -f $verdict.LastFieldHle)
+    }
+    if ($PhaseNum -eq 71) {
+        Write-Host ("  DUMP_N     = {0}" -f $verdict.DumpN)
+        Write-Host ("  STATIC_STR = {0}" -f $verdict.StaticStreak)
+        Write-Host ("  FIELD_STAT = {0}" -f $verdict.FieldStatic)
+        Write-Host ("  HLE_N      = {0}" -f $verdict.HleN)
+        Write-Host ("  HLE_ON     = {0}" -f $verdict.HleOn)
+        Write-Host ("  BASE_OK    = {0}" -f $verdict.BaseOk)
+        Write-Host ("  F24        = {0}" -f $verdict.F24)
+        Write-Host ("  F8         = {0}" -f $verdict.F8)
+        Write-Host ("  GUEST_REAL = {0}" -f $verdict.GuestRealPost)
+        Write-Host ("  LAST_DUMP  = {0}" -f $verdict.LastCtxDump)
+        Write-Host ("  LAST_HLE   = {0}" -f $verdict.LastCtxHle)
     }
     Write-Host ("  JSON       = {0}" -f $jsonFile)
 

@@ -466,14 +466,26 @@ struct TextureCache::ReadbackWorker {
 	}
 
 	[[nodiscard]] ReadbackRange DownloadColorImage(CachedImage& cached) {
-		const bool storage = cached.kind == CachedImage::Kind::StorageTexture;
-		const bool target  = cached.kind == CachedImage::Kind::RenderTarget;
+		const bool storage   = cached.kind == CachedImage::Kind::StorageTexture;
+		const bool target    = cached.kind == CachedImage::Kind::RenderTarget;
+		const bool video_out = cached.kind == CachedImage::Kind::VideoOut;
+		if (video_out && cached.video_out.compression != VideoOutCompression::Uncompressed) {
+			EXIT("TextureCache: compressed video-out readback is unsupported, addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 " compression=%u\n",
+			     cached.video_out.address, cached.video_out.size,
+			     static_cast<uint32_t>(cached.video_out.compression));
+		}
 		const auto info =
 		    storage ? MakeColorImageTransferInfo(cached.info, VulkanFormat(cached.info.format),
 		                                         Prospero::NumBytesPerElement(cached.info.format))
-		            : MakeColorImageTransferInfo(cached.target);
+		    : video_out ? MakeColorImageTransferInfo(cached.video_out)
+		                : MakeColorImageTransferInfo(cached.target);
 		const bool linear = info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
-		const bool tiled_target = target && IsTiledRenderTarget(cached.target);
+		const RenderTargetInfo video_out_layout =
+		    video_out ? MakeRenderTargetInfo(cached.video_out) : RenderTargetInfo {};
+		const bool tiled_target =
+		    target ? IsTiledRenderTarget(cached.target)
+		           : (video_out && IsTiledRenderTarget(video_out_layout));
 		const bool tiled_storage =
 		    storage && info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
 		bool single_layer_storage = false;
@@ -517,16 +529,18 @@ struct TextureCache::ReadbackWorker {
 		if (tiled_target || tiled_storage) {
 			guest.resize(info.size);
 			const RenderTargetInfo layout =
-			    target ? cached.target : RenderTargetInfo {info.address,
-			                                               info.size,
-			                                               info.format,
-			                                               info.width,
-			                                               info.height,
-			                                               info.pitch,
-			                                               info.bytes_per_element,
-			                                               info.tile_mode,
-			                                               info.levels,
-			                                               1};
+			    target      ? cached.target
+			    : video_out ? video_out_layout
+			                : RenderTargetInfo {info.address,
+			                                    info.size,
+			                                    info.format,
+			                                    info.width,
+			                                    info.height,
+			                                    info.pitch,
+			                                    info.bytes_per_element,
+			                                    info.tile_mode,
+			                                    info.levels,
+			                                    1};
 			cache.m_tiler.TileImage(guest.data(), download.data(), layout);
 			Libs::LibKernel::Memory::WriteBacking(info.address, guest.data(), info.size);
 		} else {
@@ -564,8 +578,10 @@ struct TextureCache::ReadbackWorker {
 			    selected != nullptr && selected->kind == CachedImage::Kind::StorageTexture;
 			const bool depth_target =
 			    selected != nullptr && selected->kind == CachedImage::Kind::DepthTarget;
-			if ((!render_target && !storage_texture && !depth_target) || !selected->gpu_modified ||
-			    selected->buffer_modified || selected->ctx == nullptr ||
+			const bool video_out =
+			    selected != nullptr && selected->kind == CachedImage::Kind::VideoOut;
+			if ((!render_target && !storage_texture && !depth_target && !video_out) ||
+			    !selected->gpu_modified || selected->buffer_modified || selected->ctx == nullptr ||
 			    selected->image == nullptr) {
 				EXIT("TextureCache: unsupported GPU image readback owner, addr=0x%016" PRIx64
 				     " size=0x%016" PRIx64 " access=%u image=%p kind=%u gpu_modified=%d "

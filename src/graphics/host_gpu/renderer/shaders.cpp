@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/shaderSubgroup.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/BindingLayout.h"
 #include "graphics/shader/recompiler/ShaderIR.h"
 #include "graphics/shader/shader.h"
 
@@ -408,7 +409,10 @@ static void CreateLayout(vk::DescriptorSetLayout* set_layouts, uint32_t* set_lay
 		auto index = *push_constant_info_num;
 		push_constant_info[index].stageFlags = vk_stage;
 		push_constant_info[index].offset     = bindings.push_constant_offset;
-		push_constant_info[index].size       = bindings.push_constant_size;
+		// SPIR-V packs push constants as u32x4 rows; declare the Vulkan range with the
+		// same 16-byte padding so VS/PS ranges stay non-overlapping.
+		push_constant_info[index].size =
+		    ShaderRecompiler::IR::PushConstantVulkanRangeSize(bindings.push_constant_size);
 		(*push_constant_info_num)++;
 	}
 

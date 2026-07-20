@@ -469,6 +469,20 @@ static void KYTY_SYSV_ABI StackwalkX86(uint64_t rbp, void** stack, int* depth, u
 		      reinterpret_cast<uintptr_t>(frame) < stack_addr + stack_size)) {
 			break;
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		{
+			MEMORY_BASIC_INFORMATION mbi {};
+			if (VirtualQuery(frame, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
+			    (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+				break;
+			}
+			const auto region_end =
+			    reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+			if (reinterpret_cast<uint64_t>(frame) + sizeof(FrameS) > region_end) {
+				break;
+			}
+		}
+#endif
 
 		if (!(frame->ret_addr >= code_addr && frame->ret_addr < code_addr + code_size)) {
 			break;
@@ -507,6 +521,13 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
 		using CoreAccess  = Common::HostException::AccessViolationType;
 		using GpuAccess   = Libs::Graphics::PageFaultAccess;
+		// Poisoned / non-canonical guest pointers (e.g. empty NdJob head) fault at ~0.
+		// They are never GPU-tracked or demand-committed; skip recovery before diagnostics.
+		const bool unresolvable_vaddr =
+		    info->access_violation_vaddr == 0 ||
+		    info->access_violation_vaddr == UINT64_MAX ||
+		    info->access_violation_vaddr >= (1ull << 47);
+		if (!unresolvable_vaddr) {
 		const auto access = [&]() {
 			switch (info->access_violation_type) {
 				case CoreAccess::Read: return GpuAccess::Read;
@@ -580,6 +601,84 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 #endif
+		} else {
+			LOGF("MemoryTrace: AV unresolvable addr=0x%016" PRIx64 " (skip recovery)\n",
+			     info->access_violation_vaddr);
+			fprintf(stderr, "MemoryTrace: AV unresolvable addr=0x%016" PRIx64 "\n",
+			        info->access_violation_vaddr);
+			std::fflush(stderr);
+			// Minimal fatal path only: ExceptionInfo already holds registers. Any guest-memory
+			// diagnostic here can nest another AV and mask the real fault.
+			LOGF("kyty_exception_handler: rip=%016" PRIx64 "\n", info->exception_address);
+			LOGF("exception: type=%s, av_type=%s, av_addr=%016" PRIx64 ", native_code=%08" PRIx32
+			     "\n",
+			     Common::EnumName(info->type).c_str(),
+			     Common::EnumName(info->access_violation_type).c_str(),
+			     info->access_violation_vaddr, info->native_code);
+			LOGF("regs: rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64
+			     "\n",
+			     info->rax, info->rbx, info->rcx, info->rdx);
+			LOGF("regs: rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64
+			     "\n",
+			     info->rsi, info->rdi, info->rbp, info->rsp);
+			LOGF("regs: r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64
+			     "\n",
+			     info->r8, info->r9, info->r10, info->r11);
+			LOGF("regs: r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64
+			     "\n",
+			     info->r12, info->r13, info->r14, info->r15);
+			if (info->access_violation_vaddr == UINT64_MAX) {
+				LOGF("guest registers equal to -1:");
+				if (info->rax == UINT64_MAX) {
+					LOGF("\trax\n");
+				}
+				if (info->rbx == UINT64_MAX) {
+					LOGF("\trbx\n");
+				}
+				if (info->rcx == UINT64_MAX) {
+					LOGF("\trcx\n");
+				}
+				if (info->rdx == UINT64_MAX) {
+					LOGF("\trdx\n");
+				}
+				if (info->rsi == UINT64_MAX) {
+					LOGF("\trsi\n");
+				}
+				if (info->rdi == UINT64_MAX) {
+					LOGF("\trdi\n");
+				}
+				if (info->r8 == UINT64_MAX) {
+					LOGF("\tr8\n");
+				}
+				if (info->r9 == UINT64_MAX) {
+					LOGF("\tr9\n");
+				}
+				if (info->r10 == UINT64_MAX) {
+					LOGF("\tr10\n");
+				}
+				if (info->r11 == UINT64_MAX) {
+					LOGF("\tr11\n");
+				}
+				if (info->r12 == UINT64_MAX) {
+					LOGF("\tr12\n");
+				}
+				if (info->r13 == UINT64_MAX) {
+					LOGF("\tr13\n");
+				}
+				if (info->r14 == UINT64_MAX) {
+					LOGF("\tr14\n");
+				}
+				if (info->r15 == UINT64_MAX) {
+					LOGF("\tr15\n");
+				}
+			}
+			WriteStubbedImportReport("_ImportReport.txt");
+			EXIT("Access violation: %s [%016" PRIx64 "] %s\n",
+			     Common::EnumName(info->access_violation_type).c_str(),
+			     info->access_violation_vaddr,
+			     (info->access_violation_vaddr == g_invalid_memory ? "(Unpatched object)"
+			                                                       : "(non-canonical/poisoned)"));
+		}
 	}
 
 	LOGF("kyty_exception_handler: %016" PRIx64 "\n", info->exception_address);
@@ -715,7 +814,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	dump_guest_code("guest rbx[0]", info->rbx);
 	dump_guest_code("guest rcx[0]", info->rcx);
 	dump_guest_code("guest rsi[0]", info->rsi);
-	if (info->rsp != 0) {
+	if (is_readable_range(info->rsp, 16u * sizeof(uint64_t))) {
 		auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 		for (uint64_t i = 0; i < 16; i++) {
 			char name[32] {};
@@ -784,7 +883,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		dump_guest_qwords("guest r14", info->r14);
 		dump_guest_qwords("guest r15", info->r15);
 
-		if (info->exception_address == 0x000000090064364e && info->rbx != 0) {
+		if (info->exception_address == 0x000000090064364e && info->rbx != 0 &&
+		    is_readable_range(info->rbx, sizeof(uint64_t))) {
 			auto* local = reinterpret_cast<const uint64_t*>(info->rbx);
 			dump_guest_qwords("vorbis obj", local[0]);
 			dump_guest_qwords("vorbis len", info->rcx);

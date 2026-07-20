@@ -604,7 +604,12 @@ static void Phase54TagRoleOnce(PthreadPrivate* thread) {
 	}
 }
 
-static thread_local bool g_phase54_tls_just_woken = false;
+static thread_local bool     g_phase54_tls_just_woken = false;
+static thread_local uint64_t g_phase70_tls_guest_rip  = 0;
+
+static void Phase70CaptureGuestRipFromAbi() {
+	g_phase70_tls_guest_rip = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+}
 
 static void Phase54OnCondWaitExit(PthreadPrivate* thread, PthreadCondPrivate* cond_value,
                                   int wait_result) {
@@ -656,16 +661,21 @@ static void Phase54NoteCondWait(PthreadCondPrivate* cond, PthreadPrivate* thread
 		Libs::VideoOut::Phase64NoteMainCondWait(reinterpret_cast<uint64_t>(cond));
 	}
 	if (Libs::VideoOut::Phase37PostUnregisterSeen()) {
-		const uint64_t ra = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+		// Prefer ABI-entry guest RIP (tls set in PthreadCondWait*); else RA(1).
+		uint64_t guest_rip = g_phase70_tls_guest_rip;
+		if (guest_rip < 0x0000000900000000ULL || guest_rip >= 0x0000000A00000000ULL) {
+			guest_rip = reinterpret_cast<uint64_t>(__builtin_return_address(1));
+		}
+		Libs::VideoOut::Phase70NoteGuestRip(guest_rip, Phase54RoleOf(thread));
 		Libs::VideoOut::Phase65NoteCondWait(Phase54RoleOf(thread), thread->name.c_str(),
-		                                    thread->unique_id, ra);
+		                                    thread->unique_id, guest_rip);
 	}
 	static std::atomic<uint32_t> logs {0};
 	if (logs.fetch_add(1, std::memory_order_relaxed) < 128) {
 		LOGF("SubmitTrace: phase54 cond_wait role=%s cond=0x%016" PRIx64 " cycle=%" PRIu64
-		     " tid=%d name=%s\n",
+		     " tid=%d name=%s guest_rip=0x%016" PRIx64 "\n",
 		     Phase54RoleOf(thread), reinterpret_cast<uint64_t>(cond), cycle, thread->unique_id,
-		     thread->name.c_str());
+		     thread->name.c_str(), g_phase70_tls_guest_rip);
 		fprintf(stderr,
 		        "SubmitTrace: phase54 cond_wait role=%s cond=0x%016" PRIx64 " cycle=%" PRIu64 "\n",
 		        Phase54RoleOf(thread), reinterpret_cast<uint64_t>(cond), cycle);
@@ -3634,6 +3644,7 @@ static void Phase55MaybeNoteGuestCond(PthreadCond* guest_cond_before_create, Pth
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
 	// PRINT_NAME();
+	Phase70CaptureGuestRipFromAbi();
 
 	const uint64_t guest_cond_va  = reinterpret_cast<uint64_t>(cond);
 	const uint64_t guest_mutex_va = reinterpret_cast<uint64_t>(mutex);
@@ -3732,6 +3743,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex,
                                           const KernelTimespec* abstime) {
 	// PRINT_NAME();
+	Phase70CaptureGuestRipFromAbi();
 
 	const uint64_t guest_cond_va  = reinterpret_cast<uint64_t>(cond);
 	const uint64_t guest_mutex_va = reinterpret_cast<uint64_t>(mutex);
@@ -3827,6 +3839,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	PRINT_NAME();
+	Phase70CaptureGuestRipFromAbi();
 
 	const uint64_t guest_cond_va  = reinterpret_cast<uint64_t>(cond);
 	const uint64_t guest_mutex_va = reinterpret_cast<uint64_t>(mutex);

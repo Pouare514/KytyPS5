@@ -165,6 +165,16 @@ void Phase65Poll();
 // Phase 66: recycle Flip L0 after menu detection (opt-in KYTY_PHASE66_MENU_RECYCLE).
 void Phase66EmitHeatmap(const char* why);
 void Phase66Poll();
+// Phase 69: NdJob ctrl/status dump + soft ready HLE (KYTY_PHASE69_NDJOB_READY).
+void Phase69EmitHeatmap(const char* why);
+void Phase69Poll();
+// Phase 70: Mixed predicate byte + soft-HLE (KYTY_PHASE70_NDJOB_FIELD).
+void Phase70NoteGuestRip(uint64_t guest_rip, const char* role);
+void Phase70EmitHeatmap(const char* why);
+void Phase70Poll();
+// Phase 71: CTX_FIELD Mixed +0x24 soft-HLE (KYTY_PHASE71_CTX_FIELD).
+void Phase71EmitHeatmap(const char* why);
+void Phase71Poll();
 
 KYTY_SYSV_ABI int  VideoOutOpen(int user_id, int bus_type, int index, const void* param);
 KYTY_SYSV_ABI int  VideoOutClose(int handle);

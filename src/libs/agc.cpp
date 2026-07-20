@@ -3864,6 +3864,7 @@ static bool dcb_has_queued_interrupt(const uint32_t* dcb, uint32_t size_in_dword
 }
 
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
+	Phase68::NoteSubmit(0, dcb, size_in_dwords, "SubmitDcb");
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	GraphicsRunSubmit(dcb, size_in_dwords, nullptr, 0,
 	                  !dcb_has_queued_interrupt(dcb, size_in_dwords));
@@ -4147,6 +4148,7 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 
 	flush_pending_graphics_segment_before_acb(acb, size_in_dwords);
 
+	Phase68::NoteSubmit(queue, acb, size_in_dwords, "SubmitAcb");
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
 
 	const bool trigger_interrupt_on_done = !dcb_has_queued_interrupt(acb, size_in_dwords);

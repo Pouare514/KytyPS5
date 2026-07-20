@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/shader/recompiler/BindingLayout.h"
 #include "graphics/shader/recompiler/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
@@ -841,6 +842,13 @@ static void ShaderGetStaticInputInfoPS(
 	    vs_info->stage.program != nullptr && !vs_info->stage.program->bindings.descriptors.empty()
 	        ? 1
 	        : 0;
+	// Vulkan push-constant ranges must not overlap across stages that are updated
+	// independently; place PS after the VS range (16-byte padded), matching descriptor_set.
+	ps_info->push_constant_offset =
+	    vs_info->stage.program != nullptr
+	        ? ShaderRecompiler::IR::PushConstantVulkanRangeSize(
+	              vs_info->stage.program->bindings.push_constant_size)
+	        : 0;
 
 	for (int i = 0; i < 8; i++) {
 		ps_info->target_output_mode[i]    = sh->target_output_mode[i];
@@ -1471,7 +1479,7 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo* regs, const HW::ShaderRegis
 	options.user_data_count      = regs->ps_regs.rsrc2.user_sgpr;
 	options.user_data            = regs->ps_user_sgpr.value;
 	options.descriptor_set       = input_info->descriptor_set;
-	options.push_constant_offset = 0;
+	options.push_constant_offset = input_info->push_constant_offset;
 	options.pixel_input_info     = input_info;
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
@@ -1631,6 +1639,7 @@ ShaderId ShaderGetIdPS(const HW::PixelShaderInfo* regs, const ShaderPixelInputIn
 	ret.crc32 = regs->ps_regs.chksum & 0xffffffffu;
 
 	ret.ids.push_back(input_info->descriptor_set);
+	ret.ids.push_back(input_info->push_constant_offset);
 	ret.ids.push_back(input_info->input_num);
 	ret.ids.push_back(input_info->ps_system_input_base);
 	ret.ids.push_back(static_cast<uint32_t>(input_info->ps_pos_x));

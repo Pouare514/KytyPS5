@@ -43,14 +43,29 @@ class FilterScope final {
 public:
 	FilterScope() noexcept {
 		if (g_in_exception_filter) {
-			FailFast("nested exception while resolving a host fault");
+			// Prefer continuing the search over TerminateProcess so the outer handler can still
+			// emit its Access-violation EXIT with guest registers (diagnostics must stay
+			// exception-safe; nested faults should be rare after that).
+			Common::LogFatalToFile(
+			    "HostException: nested exception while resolving a host fault (continue search)");
+			nested = true;
+			return;
 		}
 		g_in_exception_filter = true;
 	}
 
-	~FilterScope() { g_in_exception_filter = false; }
+	~FilterScope() {
+		if (!nested) {
+			g_in_exception_filter = false;
+		}
+	}
+
+	[[nodiscard]] bool IsNested() const noexcept { return nested; }
 
 	KYTY_CLASS_NO_COPY(FilterScope);
+
+private:
+	bool nested = false;
 };
 
 static void LogFatalWinException(PEXCEPTION_POINTERS exception) {
@@ -132,6 +147,9 @@ static LONG WINAPI UnhandledTopLevelFilter(PEXCEPTION_POINTERS exception) {
 
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 	FilterScope filter_scope;
+	if (filter_scope.IsNested()) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
 
 	auto* exception_record = exception->ExceptionRecord;
 

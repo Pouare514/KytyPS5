@@ -653,7 +653,7 @@ static uint64_t              g_phase65_prev_flip_count {0};
 static std::atomic<bool>     g_phase65_heatmap_done {false};
 static char                  g_phase65_cause[48] = "unknown";
 // Phase 66: recycle Flip L0 after menu detection (opt-in KYTY_PHASE66_MENU_RECYCLE=1).
-static constexpr uint32_t kPhase66IdleNeed          = 3;
+static constexpr uint32_t kPhase66IdleNeed          = 1;
 static constexpr uint64_t kPhase66MinFlipIntervalMs = 2000;
 static std::atomic<uint32_t> g_phase66_pending_streak {0};
 static std::atomic<uint32_t> g_phase66_recycle_n {0};
@@ -661,6 +661,54 @@ static std::atomic<bool>     g_phase66_heatmap_done {false};
 static std::atomic<bool>     g_phase66_have_last_flip {false};
 static std::chrono::steady_clock::time_point g_phase66_last_flip {};
 static char                  g_phase66_cause[48] = "unknown";
+// Phase 69: NdJob ctrl/status dump + opt-in soft ready HLE (KYTY_PHASE69_NDJOB_READY=1).
+static constexpr uint32_t kPhase69StaticNeed = 8;
+static constexpr uint64_t kPhase69CtrlDef    = 0x0000000903420b00ULL;
+static constexpr uint64_t kPhase69StatusDef  = 0x000000090386ed80ULL;
+static std::atomic<uint32_t> g_phase69_dump_n {0};
+static std::atomic<uint32_t> g_phase69_static_streak {0};
+static std::atomic<bool>     g_phase69_field_static {false};
+static std::atomic<uint32_t> g_phase69_hle_n {0};
+static std::atomic<bool>     g_phase69_hle_done {false};
+static std::atomic<bool>     g_phase69_have_prev {false};
+static std::atomic<bool>     g_phase69_heatmap_done {false};
+static uint64_t              g_phase69_prev[8] {};
+static char                  g_phase69_cause[48] = "unknown";
+// Phase 70: Mixed predicate byte at *(*0x904bb6de8)+0x3eea (offline eboot @ 0x901DE418d).
+static constexpr uint32_t kPhase70StaticNeed   = 8;
+static constexpr uint64_t kPhase70BaseSlot     = 0x0000000904bb6de8ULL;
+static constexpr uint32_t kPhase70FieldOff     = 0x3eea;
+static constexpr uint64_t kPhase70NdJobCtrlDef = 0x0000000903420b00ULL;
+static std::atomic<uint32_t> g_phase70_dump_n {0};
+static std::atomic<uint32_t> g_phase70_static_streak {0};
+static std::atomic<bool>     g_phase70_field_static {false};
+static std::atomic<uint32_t> g_phase70_hle_n {0};
+static std::atomic<bool>     g_phase70_hle_done {false};
+static std::atomic<bool>     g_phase70_have_prev {false};
+static std::atomic<bool>     g_phase70_heatmap_done {false};
+static std::atomic<uint64_t> g_phase70_last_guest_rip {0};
+static std::atomic<uint32_t> g_phase70_guest_rip_mixed {0};
+static std::atomic<uint64_t> g_phase70_resolved_base {0};
+static uint64_t              g_phase70_prev_base {0};
+static uint8_t               g_phase70_prev_byte {0};
+static uint64_t              g_phase70_prev_obj {0};
+static char                  g_phase70_cause[48] = "unknown";
+// Phase 71: CTX_FIELD Mixed *(u32*)(0x905f254c0+0x24) + soft-HLE (KYTY_PHASE71_CTX_FIELD=1).
+static constexpr uint32_t kPhase71StaticNeed = 8;
+static constexpr uint64_t kPhase71CtxBase    = 0x0000000905f254c0ULL;
+static constexpr uint32_t kPhase71FieldOff   = 0x24;
+static constexpr uint32_t kPhase71CorrOff    = 0x8;
+static std::atomic<uint32_t> g_phase71_dump_n {0};
+static std::atomic<uint32_t> g_phase71_static_streak {0};
+static std::atomic<bool>     g_phase71_field_static {false};
+static std::atomic<uint32_t> g_phase71_hle_n {0};
+static std::atomic<bool>     g_phase71_hle_done {false};
+static std::atomic<bool>     g_phase71_have_prev {false};
+static std::atomic<bool>     g_phase71_heatmap_done {false};
+static std::atomic<bool>     g_phase71_base_ok {false};
+static uint32_t              g_phase71_prev_f24 {0};
+static uint32_t              g_phase71_prev_f8 {0};
+static char                  g_phase71_cause[48] = "unknown";
 static uint8_t*              g_phase41_keep1_thunk    = nullptr;
 static uint8_t*              g_phase41_keep1_live     = nullptr; // relocated prologue → body+12
 static uint8_t*              g_phase41_call_thunk     = nullptr; // host→guest SysV call
@@ -1016,6 +1064,16 @@ void Phase65SampleHostFlip(); // defined after VideoOutContext
 void Phase66TryMenuRecycle(); // defined after Phase37 helpers
 void Phase66EmitHeatmap(const char* why);
 void Phase66Poll();
+void Phase69EmitHeatmap(const char* why);
+void Phase69Poll();
+void Phase69SampleNdJob();
+void Phase70EmitHeatmap(const char* why);
+void Phase70Poll();
+void Phase70SampleField();
+void Phase70NoteGuestRip(uint64_t guest_rip, const char* role);
+void Phase71EmitHeatmap(const char* why);
+void Phase71Poll();
+void Phase71SampleCtx();
 void Phase58NoteWorkerFiberFromAtomics();
 void Phase58NoteMainAgcCross(const char* nid, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
 
@@ -2389,6 +2447,13 @@ extern "C" void Phase55MixedOnEntry(uint64_t guest_rdi, uint64_t guest_rsi, uint
 	g_phase55_mixed_rdi.store(guest_rdi, std::memory_order_release);
 	g_phase55_mixed_rsi.store(guest_rsi, std::memory_order_release);
 	g_phase55_mixed_rdx.store(guest_rdx, std::memory_order_release);
+	// At trampoline 0x901DE4140: rdi = *slot + 0x1920 → recover module data base.
+	if (guest_rdi >= 0x10000ULL + 0x1920ULL && guest_rdi < 0x0000800000000000ULL) {
+		const uint64_t cand = guest_rdi - 0x1920ULL;
+		if (cand >= 0x10000ULL) {
+			g_phase70_resolved_base.store(cand, std::memory_order_release);
+		}
+	}
 	std::memset(g_phase55_mixed_snap, 0, sizeof(g_phase55_mixed_snap));
 	if (guest_rdi >= 0x10000ULL && guest_rdi < 0x0000800000000000ULL) {
 		Phase41SafeRead(g_phase55_mixed_snap, reinterpret_cast<const void*>(guest_rdi), 64);
@@ -2800,6 +2865,9 @@ static void Phase55StartWatchThread() {
 			Phase64Poll();
 			Phase65Poll();
 			Phase66Poll();
+			Phase69Poll();
+			Phase70Poll();
+			Phase71Poll();
 			if ((i % 300) == 299) {
 				g_phase55_heatmap_done.store(false, std::memory_order_release);
 				Phase55EmitHeatmap(i < 600 ? "watch_30s" : "watch_mid");
@@ -2823,6 +2891,12 @@ static void Phase55StartWatchThread() {
 				Phase65EmitHeatmap(i < 600 ? "watch_30s" : "watch_mid");
 				g_phase66_heatmap_done.store(false, std::memory_order_release);
 				Phase66EmitHeatmap(i < 600 ? "watch_30s" : "watch_mid");
+				g_phase69_heatmap_done.store(false, std::memory_order_release);
+				Phase69EmitHeatmap(i < 600 ? "watch_30s" : "watch_mid");
+				g_phase70_heatmap_done.store(false, std::memory_order_release);
+				Phase70EmitHeatmap(i < 600 ? "watch_30s" : "watch_mid");
+				g_phase71_heatmap_done.store(false, std::memory_order_release);
+				Phase71EmitHeatmap(i < 600 ? "watch_30s" : "watch_mid");
 			}
 			if (i == 1799) {
 				g_phase55_heatmap_done.store(false, std::memory_order_release);
@@ -2847,6 +2921,12 @@ static void Phase55StartWatchThread() {
 				Phase65EmitHeatmap("watch_end");
 				g_phase66_heatmap_done.store(false, std::memory_order_release);
 				Phase66EmitHeatmap("watch_end");
+				g_phase69_heatmap_done.store(false, std::memory_order_release);
+				Phase69EmitHeatmap("watch_end");
+				g_phase70_heatmap_done.store(false, std::memory_order_release);
+				Phase70EmitHeatmap("watch_end");
+				g_phase71_heatmap_done.store(false, std::memory_order_release);
+				Phase71EmitHeatmap("watch_end");
 			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		}
@@ -5483,6 +5563,7 @@ void Phase65NoteCondWait(const char* role, const char* name, int tid, uint64_t r
 	if (looks_main && std::strcmp(r, "Main") != 0) {
 		(void)g_phase65_wait_alias_main.fetch_add(1, std::memory_order_relaxed);
 	}
+	Phase70NoteGuestRip(ra, r);
 	static std::atomic<uint32_t> logs {0};
 	if (logs.fetch_add(1, std::memory_order_relaxed) < 96) {
 		LOGF("SubmitTrace: phase65 cond_wait role=%s name=%s tid=%d ra=0x%016" PRIx64 "\n", r,
@@ -5604,7 +5685,7 @@ void Phase66EmitHeatmap(const char* why) {
 		Phase66SetCause("menu_recycle_off");
 	} else if (!menu) {
 		Phase66SetCause("menu_not_detected");
-	} else if (recycle_n >= 3) {
+	} else if (recycle_n >= 1) {
 		Phase66SetCause("menu_recycle_active");
 	} else if (streak >= kPhase66IdleNeed) {
 		Phase66SetCause("menu_l0_idle");
@@ -5631,6 +5712,492 @@ void Phase66Poll() {
 	if (t == 1 || (t % 100) == 0) {
 		g_phase66_heatmap_done.store(false, std::memory_order_release);
 		Phase66EmitHeatmap(t == 1 ? "poll_first" : "poll_10s");
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 69 — NdJob predicate dump + soft ready HLE (env-gated)
+// Priority: guest_submit_armed > ndjob_hle_no_submit > ndjob_field_static > still_opaque_predicate
+// ---------------------------------------------------------------------------
+
+static bool Phase69NdJobReadyEnabled() {
+	static int cached = -1;
+	if (cached < 0) {
+		const char* e = std::getenv("KYTY_PHASE69_NDJOB_READY");
+		cached        = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return cached == 1;
+}
+
+static void Phase69SetCause(const char* c) {
+	if (c == nullptr) {
+		return;
+	}
+	std::snprintf(g_phase69_cause, sizeof(g_phase69_cause), "%s", c);
+}
+
+static void Phase69TryHleReady(uint64_t ctrl, uint64_t status) {
+	if (!Phase69NdJobReadyEnabled()) {
+		return;
+	}
+	if (g_phase69_hle_done.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	// Soft ready only: gate+8=1 + status pattern seen pre/post Unreg (P41/P53).
+	// Do NOT invent *obj job pointers (FAKE_JOB ban) or poke LIST near 0x905f25cd0.
+	uint32_t gate = 0;
+	Phase41SafeRead(&gate, reinterpret_cast<const void*>(ctrl + 8), sizeof(gate));
+	if (gate == 0) {
+		gate = 1;
+		Phase41SafeWrite(reinterpret_cast<volatile void*>(ctrl + 8), &gate, sizeof(gate));
+	}
+	if (status >= 0x10000ULL && status < 0x0000800000000000ULL) {
+		uint32_t fill[8] = {1u, 1u, 0u, 0u, 1u, 0u, 0u, 0u};
+		Phase41SafeWrite(reinterpret_cast<volatile void*>(status), fill, sizeof(fill));
+	}
+	const uint32_t n = g_phase69_hle_n.fetch_add(1, std::memory_order_relaxed) + 1;
+	LOGF("SubmitTrace: phase69 ndjob_hle ready=1 ctrl=0x%016" PRIx64 " status=0x%016" PRIx64
+	     " gate=%u n=%u\n",
+	     ctrl, status, gate, n);
+	fprintf(stderr, "SubmitTrace: phase69 ndjob_hle ready ctrl=0x%016" PRIx64 " gate=%u\n", ctrl,
+	        gate);
+	Libs::Graphics::Sync::TriggerAgcUserInterrupt();
+}
+
+void Phase69SampleNdJob() {
+	if (!g_phase37_post_unreg.load(std::memory_order_acquire)) {
+		return;
+	}
+	uint64_t ctrl = Phase58QueueBase();
+	if (ctrl < 0x10000ULL) {
+		ctrl = kPhase69CtrlDef;
+	}
+	const uint64_t status = kPhase69StatusDef;
+	uint64_t       cur[8] {};
+	Phase41SafeRead(&cur[0], reinterpret_cast<const void*>(ctrl), sizeof(uint64_t));
+	Phase41SafeRead(&cur[1], reinterpret_cast<const void*>(ctrl + 8), sizeof(uint64_t));
+	Phase41SafeRead(&cur[2], reinterpret_cast<const void*>(ctrl + 0x10), sizeof(uint64_t));
+	Phase41SafeRead(&cur[3], reinterpret_cast<const void*>(ctrl + 0x18), sizeof(uint64_t));
+	Phase41SafeRead(&cur[4], reinterpret_cast<const void*>(ctrl + kPhase41Keep1FieldOff),
+	                sizeof(uint64_t));
+	Phase41SafeRead(&cur[5], reinterpret_cast<const void*>(status), sizeof(uint64_t));
+	Phase41SafeRead(&cur[6], reinterpret_cast<const void*>(status + 8), sizeof(uint64_t));
+	Phase41SafeRead(&cur[7], reinterpret_cast<const void*>(status + 16), sizeof(uint64_t));
+
+	if (g_phase69_have_prev.load(std::memory_order_acquire)) {
+		const bool same = std::memcmp(cur, g_phase69_prev, sizeof(cur)) == 0;
+		if (same) {
+			const uint32_t st =
+			    g_phase69_static_streak.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (st >= kPhase69StaticNeed) {
+				g_phase69_field_static.store(true, std::memory_order_release);
+			}
+		} else {
+			g_phase69_static_streak.store(0, std::memory_order_relaxed);
+		}
+	} else {
+		g_phase69_have_prev.store(true, std::memory_order_release);
+	}
+	std::memcpy(g_phase69_prev, cur, sizeof(cur));
+
+	const uint32_t dn = g_phase69_dump_n.fetch_add(1, std::memory_order_relaxed);
+	if (dn < 48 || (dn % 10) == 0) {
+		LOGF("SubmitTrace: phase69 ndjob_dump n=%u ctrl=0x%016" PRIx64 " *obj=0x%016" PRIx64
+		     " gate=0x%016" PRIx64 " u10=0x%016" PRIx64 " u18=0x%016" PRIx64
+		     " field=0x%016" PRIx64 " st0=0x%016" PRIx64 " st8=0x%016" PRIx64
+		     " st10=0x%016" PRIx64 " static=%d\n",
+		     dn, ctrl, cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6], cur[7],
+		     g_phase69_field_static.load(std::memory_order_relaxed) ? 1 : 0);
+		if (dn < 24 || (dn % 10) == 0) {
+			fprintf(stderr,
+			        "SubmitTrace: phase69 ndjob_dump *obj=0x%016" PRIx64 " gate=0x%016" PRIx64
+			        " st0=0x%016" PRIx64 " static=%d\n",
+			        cur[0], cur[1], cur[5],
+			        g_phase69_field_static.load(std::memory_order_relaxed) ? 1 : 0);
+		}
+	}
+
+	Phase69TryHleReady(ctrl, status);
+}
+
+void Phase69EmitHeatmap(const char* why) {
+	if (g_phase69_heatmap_done.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	const uint32_t guest_real =
+	    g_phase63_submit_guest_real_post.load(std::memory_order_relaxed);
+	const uint32_t dump_n   = g_phase69_dump_n.load(std::memory_order_relaxed);
+	const uint32_t streak   = g_phase69_static_streak.load(std::memory_order_relaxed);
+	const int      field_st = g_phase69_field_static.load(std::memory_order_relaxed) ? 1 : 0;
+	const uint32_t hle_n    = g_phase69_hle_n.load(std::memory_order_relaxed);
+	const int      hle_on   = Phase69NdJobReadyEnabled() ? 1 : 0;
+
+	if (guest_real > 0) {
+		Phase69SetCause("guest_submit_armed");
+	} else if (hle_n > 0 && guest_real == 0) {
+		Phase69SetCause("ndjob_hle_no_submit");
+	} else if (field_st != 0 && guest_real == 0) {
+		Phase69SetCause("ndjob_field_static");
+	} else {
+		Phase69SetCause("still_opaque_predicate");
+	}
+
+	LOGF("SubmitTrace: phase69 heatmap why=%s cause=%s dump_n=%u static_streak=%u "
+	     "field_static=%d hle_n=%u hle_on=%d guest_real_post=%u "
+	     "ctrl=*obj=0x%016" PRIx64 " gate=0x%016" PRIx64 " st0=0x%016" PRIx64 "\n",
+	     why != nullptr ? why : "?", g_phase69_cause, dump_n, streak, field_st, hle_n, hle_on,
+	     guest_real, g_phase69_prev[0], g_phase69_prev[1], g_phase69_prev[5]);
+	fprintf(stderr,
+	        "SubmitTrace: phase69 heatmap cause=%s dump_n=%u field_static=%d hle_n=%u "
+	        "guest_real_post=%u\n",
+	        g_phase69_cause, dump_n, field_st, hle_n, guest_real);
+}
+
+void Phase69Poll() {
+	if (!g_phase37_post_unreg.load(std::memory_order_acquire)) {
+		return;
+	}
+	static std::atomic<uint32_t> ticks {0};
+	const uint32_t               t = ticks.fetch_add(1, std::memory_order_relaxed) + 1;
+	// ~1 Hz sample first so heatmap never races dump_n=0 / hle_n=0.
+	if ((t % 10) == 0) {
+		Phase69SampleNdJob();
+	}
+	if ((t % 100) == 0) {
+		g_phase69_heatmap_done.store(false, std::memory_order_release);
+		Phase69EmitHeatmap(t == 100 ? "poll_first" : "poll_10s");
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 70 — Mixed predicate byte (*0x904bb6de8)+0x3eea + soft-HLE
+// Priority: guest_submit_armed > field_hle_no_submit > field_still_static
+// ---------------------------------------------------------------------------
+
+static bool Phase70NdJobFieldEnabled() {
+	static int cached = -1;
+	if (cached < 0) {
+		const char* e = std::getenv("KYTY_PHASE70_NDJOB_FIELD");
+		cached        = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return cached == 1;
+}
+
+static void Phase70SetCause(const char* c) {
+	if (c == nullptr) {
+		return;
+	}
+	std::snprintf(g_phase70_cause, sizeof(g_phase70_cause), "%s", c);
+}
+
+void Phase70NoteGuestRip(uint64_t guest_rip, const char* role) {
+	if (guest_rip == 0) {
+		return;
+	}
+	g_phase70_last_guest_rip.store(guest_rip, std::memory_order_release);
+	const bool near_mixed =
+	    guest_rip >= 0x0000000901DE4000ULL && guest_rip < 0x0000000901DE5000ULL;
+	if (near_mixed || (role != nullptr && (std::strcmp(role, "Mixed") == 0 ||
+	                                       std::strcmp(role, "Compute") == 0))) {
+		if (near_mixed) {
+			(void)g_phase70_guest_rip_mixed.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+}
+
+static void Phase70TryHleField(uint64_t base, uint8_t cur) {
+	if (!Phase70NdJobFieldEnabled()) {
+		return;
+	}
+	if (g_phase70_hle_done.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	// Offline: cmp byte [base+0x3eea],0 / sete sil — force non-zero if stuck at 0.
+	if (cur != 0) {
+		LOGF("SubmitTrace: phase70 ndjob_hle skip byte=0x%02x (already non-zero) base=0x%016"
+		     PRIx64 "\n",
+		     cur, base);
+		return;
+	}
+	const uint8_t ready = 1;
+	Phase41SafeWrite(reinterpret_cast<volatile void*>(base + kPhase70FieldOff), &ready,
+	                 sizeof(ready));
+	const uint32_t n = g_phase70_hle_n.fetch_add(1, std::memory_order_relaxed) + 1;
+	LOGF("SubmitTrace: phase70 ndjob_hle field=1 base=0x%016" PRIx64 " off=0x%x n=%u\n", base,
+	     kPhase70FieldOff, n);
+	fprintf(stderr, "SubmitTrace: phase70 ndjob_hle field=1 base=0x%016" PRIx64 "\n", base);
+	Libs::Graphics::Sync::TriggerAgcUserInterrupt();
+}
+
+void Phase70SampleField() {
+	if (!g_phase37_post_unreg.load(std::memory_order_acquire)) {
+		return;
+	}
+	uint64_t base = 0;
+	Phase41SafeRead(&base, reinterpret_cast<const void*>(kPhase70BaseSlot), sizeof(base));
+	if (base < 0x10000ULL || base >= 0x0000800000000000ULL) {
+		base = g_phase70_resolved_base.load(std::memory_order_acquire);
+	}
+	uint8_t byte = 0;
+	if (base >= 0x10000ULL && base < 0x0000800000000000ULL) {
+		Phase41SafeRead(&byte, reinterpret_cast<const void*>(base + kPhase70FieldOff),
+		                sizeof(byte));
+	}
+	uint64_t obj_head = 0;
+	Phase41SafeRead(&obj_head, reinterpret_cast<const void*>(kPhase70NdJobCtrlDef),
+	                sizeof(obj_head));
+
+	if (g_phase70_have_prev.load(std::memory_order_acquire)) {
+		const bool same =
+		    (base == g_phase70_prev_base && byte == g_phase70_prev_byte &&
+		     obj_head == g_phase70_prev_obj);
+		if (same) {
+			const uint32_t st =
+			    g_phase70_static_streak.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (st >= kPhase70StaticNeed) {
+				g_phase70_field_static.store(true, std::memory_order_release);
+			}
+		} else {
+			g_phase70_static_streak.store(0, std::memory_order_relaxed);
+		}
+	} else {
+		g_phase70_have_prev.store(true, std::memory_order_release);
+	}
+	g_phase70_prev_base = base;
+	g_phase70_prev_byte = byte;
+	g_phase70_prev_obj  = obj_head;
+
+	const uint32_t dn = g_phase70_dump_n.fetch_add(1, std::memory_order_relaxed);
+	const uint64_t rip = g_phase70_last_guest_rip.load(std::memory_order_relaxed);
+	if (dn < 48 || (dn % 10) == 0) {
+		LOGF("SubmitTrace: phase70 field_dump n=%u slot=0x%016" PRIx64 " base=0x%016" PRIx64
+		     " byte=0x%02x *obj=0x%016" PRIx64 " static=%d guest_rip=0x%016" PRIx64
+		     " rip_mixed=%u\n",
+		     dn, kPhase70BaseSlot, base, byte, obj_head,
+		     g_phase70_field_static.load(std::memory_order_relaxed) ? 1 : 0, rip,
+		     g_phase70_guest_rip_mixed.load(std::memory_order_relaxed));
+		if (dn < 24 || (dn % 10) == 0) {
+			fprintf(stderr,
+			        "SubmitTrace: phase70 field_dump byte=0x%02x base=0x%016" PRIx64
+			        " *obj=0x%016" PRIx64 " static=%d\n",
+			        byte, base, obj_head,
+			        g_phase70_field_static.load(std::memory_order_relaxed) ? 1 : 0);
+		}
+	}
+
+	if (base >= 0x10000ULL && base < 0x0000800000000000ULL) {
+		Phase70TryHleField(base, byte);
+	}
+}
+
+void Phase70EmitHeatmap(const char* why) {
+	if (g_phase70_heatmap_done.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	const uint32_t guest_real =
+	    g_phase63_submit_guest_real_post.load(std::memory_order_relaxed);
+	const uint32_t dump_n   = g_phase70_dump_n.load(std::memory_order_relaxed);
+	const uint32_t streak   = g_phase70_static_streak.load(std::memory_order_relaxed);
+	const int      field_st = g_phase70_field_static.load(std::memory_order_relaxed) ? 1 : 0;
+	const uint32_t hle_n    = g_phase70_hle_n.load(std::memory_order_relaxed);
+	const int      hle_on   = Phase70NdJobFieldEnabled() ? 1 : 0;
+	const uint32_t rip_m    = g_phase70_guest_rip_mixed.load(std::memory_order_relaxed);
+	const uint64_t rip      = g_phase70_last_guest_rip.load(std::memory_order_relaxed);
+
+	if (guest_real > 0) {
+		Phase70SetCause("guest_submit_armed");
+	} else if (hle_n > 0 && guest_real == 0) {
+		Phase70SetCause("field_hle_no_submit");
+	} else if (field_st != 0 && guest_real == 0) {
+		Phase70SetCause("field_still_static");
+	} else {
+		Phase70SetCause("still_opaque_predicate");
+	}
+
+	LOGF("SubmitTrace: phase70 heatmap why=%s cause=%s dump_n=%u static_streak=%u "
+	     "field_static=%d hle_n=%u hle_on=%d guest_real_post=%u byte=0x%02x "
+	     "base=0x%016" PRIx64 " *obj=0x%016" PRIx64 " guest_rip=0x%016" PRIx64
+	     " rip_mixed=%u\n",
+	     why != nullptr ? why : "?", g_phase70_cause, dump_n, streak, field_st, hle_n, hle_on,
+	     guest_real, g_phase70_prev_byte, g_phase70_prev_base, g_phase70_prev_obj, rip, rip_m);
+	fprintf(stderr,
+	        "SubmitTrace: phase70 heatmap cause=%s dump_n=%u field_static=%d hle_n=%u "
+	        "byte=0x%02x guest_real_post=%u\n",
+	        g_phase70_cause, dump_n, field_st, hle_n, g_phase70_prev_byte, guest_real);
+}
+
+void Phase70Poll() {
+	if (!g_phase37_post_unreg.load(std::memory_order_acquire)) {
+		return;
+	}
+	static std::atomic<uint32_t> ticks {0};
+	const uint32_t               t = ticks.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((t % 10) == 0) {
+		Phase70SampleField();
+	}
+	if ((t % 100) == 0) {
+		g_phase70_heatmap_done.store(false, std::memory_order_release);
+		Phase70EmitHeatmap(t == 100 ? "poll_first" : "poll_10s");
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 71 — CTX_FIELD Mixed *(u32*)(0x905f254c0+0x24) + soft-HLE
+// Priority: guest_submit_armed > field_hle_no_submit > field_still_static
+//           > ctx_base_unresolved > still_opaque_predicate
+// ---------------------------------------------------------------------------
+
+static bool Phase71CtxFieldEnabled() {
+	static int cached = -1;
+	if (cached < 0) {
+		const char* e = std::getenv("KYTY_PHASE71_CTX_FIELD");
+		cached        = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return cached == 1;
+}
+
+static void Phase71SetCause(const char* c) {
+	if (c == nullptr) {
+		return;
+	}
+	std::snprintf(g_phase71_cause, sizeof(g_phase71_cause), "%s", c);
+}
+
+static void Phase71TryHleField(uint32_t cur) {
+	if (!Phase71CtxFieldEnabled()) {
+		return;
+	}
+	if (g_phase71_hle_done.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	if (cur != 0) {
+		LOGF("SubmitTrace: phase71 ctx_hle skip f24=0x%x (already non-zero) base=0x%016" PRIx64
+		     "\n",
+		     cur, kPhase71CtxBase);
+		return;
+	}
+	const uint32_t ready = 1;
+	Phase41SafeWrite(reinterpret_cast<volatile void*>(kPhase71CtxBase + kPhase71FieldOff),
+	                 &ready, sizeof(ready));
+	const uint32_t n = g_phase71_hle_n.fetch_add(1, std::memory_order_relaxed) + 1;
+	LOGF("SubmitTrace: phase71 ctx_hle f24=1 base=0x%016" PRIx64 " off=0x%x n=%u\n",
+	     kPhase71CtxBase, kPhase71FieldOff, n);
+	fprintf(stderr, "SubmitTrace: phase71 ctx_hle f24=1 base=0x%016" PRIx64 "\n",
+	        kPhase71CtxBase);
+	Libs::Graphics::Sync::TriggerAgcUserInterrupt();
+}
+
+void Phase71SampleCtx() {
+	if (!g_phase37_post_unreg.load(std::memory_order_acquire)) {
+		return;
+	}
+	// Ban check: base must stay distinct from LIST 0x905f25cd0 (Δ=0x110).
+	if (kPhase71CtxBase == kPhase56BannedBase || Phase56IsBannedBase(kPhase71CtxBase)) {
+		return;
+	}
+
+	uint32_t f24   = 0;
+	uint32_t f8    = 0;
+	uint32_t probe = 0;
+	Phase41SafeRead(&probe, reinterpret_cast<const void*>(kPhase71CtxBase), sizeof(probe));
+	Phase41SafeRead(&f24, reinterpret_cast<const void*>(kPhase71CtxBase + kPhase71FieldOff),
+	                sizeof(f24));
+	Phase41SafeRead(&f8, reinterpret_cast<const void*>(kPhase71CtxBase + kPhase71CorrOff),
+	                sizeof(f8));
+	if (probe != 0 || f24 != 0 || f8 != 0) {
+		g_phase71_base_ok.store(true, std::memory_order_release);
+	}
+
+	if (g_phase71_have_prev.load(std::memory_order_acquire)) {
+		const bool same = (f24 == g_phase71_prev_f24 && f8 == g_phase71_prev_f8);
+		if (same) {
+			const uint32_t st =
+			    g_phase71_static_streak.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (st >= kPhase71StaticNeed) {
+				g_phase71_field_static.store(true, std::memory_order_release);
+			}
+		} else {
+			g_phase71_static_streak.store(0, std::memory_order_relaxed);
+		}
+	} else {
+		g_phase71_have_prev.store(true, std::memory_order_release);
+	}
+	g_phase71_prev_f24 = f24;
+	g_phase71_prev_f8  = f8;
+
+	const uint32_t dn  = g_phase71_dump_n.fetch_add(1, std::memory_order_relaxed);
+	const uint64_t rip = g_phase70_last_guest_rip.load(std::memory_order_relaxed);
+	if (dn < 48 || (dn % 10) == 0) {
+		LOGF("SubmitTrace: phase71 ctx_dump n=%u base=0x%016" PRIx64 " f24=0x%x f8=0x%x "
+		     "probe=0x%x static=%d base_ok=%d guest_rip=0x%016" PRIx64 "\n",
+		     dn, kPhase71CtxBase, f24, f8, probe,
+		     g_phase71_field_static.load(std::memory_order_relaxed) ? 1 : 0,
+		     g_phase71_base_ok.load(std::memory_order_relaxed) ? 1 : 0, rip);
+		if (dn < 24 || (dn % 10) == 0) {
+			fprintf(stderr,
+			        "SubmitTrace: phase71 ctx_dump f24=0x%x f8=0x%x static=%d base_ok=%d\n",
+			        f24, f8, g_phase71_field_static.load(std::memory_order_relaxed) ? 1 : 0,
+			        g_phase71_base_ok.load(std::memory_order_relaxed) ? 1 : 0);
+		}
+	}
+
+	if (g_phase71_base_ok.load(std::memory_order_acquire) || dn >= 2) {
+		Phase71TryHleField(f24);
+		if (g_phase71_hle_n.load(std::memory_order_relaxed) > 0) {
+			g_phase71_base_ok.store(true, std::memory_order_release);
+		}
+	}
+}
+
+void Phase71EmitHeatmap(const char* why) {
+	if (g_phase71_heatmap_done.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	const uint32_t guest_real =
+	    g_phase63_submit_guest_real_post.load(std::memory_order_relaxed);
+	const uint32_t dump_n   = g_phase71_dump_n.load(std::memory_order_relaxed);
+	const uint32_t streak   = g_phase71_static_streak.load(std::memory_order_relaxed);
+	const int      field_st = g_phase71_field_static.load(std::memory_order_relaxed) ? 1 : 0;
+	const uint32_t hle_n    = g_phase71_hle_n.load(std::memory_order_relaxed);
+	const int      hle_on   = Phase71CtxFieldEnabled() ? 1 : 0;
+	const int      base_ok  = g_phase71_base_ok.load(std::memory_order_relaxed) ? 1 : 0;
+	const uint64_t rip      = g_phase70_last_guest_rip.load(std::memory_order_relaxed);
+
+	if (guest_real > 0) {
+		Phase71SetCause("guest_submit_armed");
+	} else if (hle_n > 0 && guest_real == 0) {
+		Phase71SetCause("field_hle_no_submit");
+	} else if (field_st != 0 && guest_real == 0) {
+		Phase71SetCause("field_still_static");
+	} else if (!base_ok && dump_n > 0 && guest_real == 0) {
+		Phase71SetCause("ctx_base_unresolved");
+	} else {
+		Phase71SetCause("still_opaque_predicate");
+	}
+
+	LOGF("SubmitTrace: phase71 heatmap why=%s cause=%s dump_n=%u static_streak=%u "
+	     "field_static=%d hle_n=%u hle_on=%d base_ok=%d guest_real_post=%u f24=0x%x f8=0x%x "
+	     "base=0x%016" PRIx64 " guest_rip=0x%016" PRIx64 "\n",
+	     why != nullptr ? why : "?", g_phase71_cause, dump_n, streak, field_st, hle_n, hle_on,
+	     base_ok, guest_real, g_phase71_prev_f24, g_phase71_prev_f8, kPhase71CtxBase, rip);
+	fprintf(stderr,
+	        "SubmitTrace: phase71 heatmap cause=%s dump_n=%u field_static=%d hle_n=%u "
+	        "base_ok=%d f24=0x%x guest_real_post=%u\n",
+	        g_phase71_cause, dump_n, field_st, hle_n, base_ok, g_phase71_prev_f24, guest_real);
+}
+
+void Phase71Poll() {
+	if (!g_phase37_post_unreg.load(std::memory_order_acquire)) {
+		return;
+	}
+	static std::atomic<uint32_t> ticks {0};
+	const uint32_t               t = ticks.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((t % 10) == 0) {
+		Phase71SampleCtx();
+	}
+	if ((t % 100) == 0) {
+		g_phase71_heatmap_done.store(false, std::memory_order_release);
+		Phase71EmitHeatmap(t == 100 ? "poll_first" : "poll_10s");
 	}
 }
 

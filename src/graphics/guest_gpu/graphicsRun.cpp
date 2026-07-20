@@ -28,10 +28,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <list>
+#include <mutex>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -601,6 +605,142 @@ static void YieldCommandProcessorWait(uint32_t poll_interval_cycles) noexcept {
 	std::this_thread::yield();
 }
 
+// ---------------------------------------------------------------------------
+// Phase 68 — SharpEmu-like submit-state + WAIT_REG_MEM ack
+// ---------------------------------------------------------------------------
+
+namespace Phase68 {
+namespace {
+
+constexpr size_t kMaxWaitAddrs = 64;
+
+struct SubmittedGpuStateKyty {
+	std::mutex              mu;
+	uint64_t                submission_seq {0};
+	uint32_t                last_queue {0};
+	uint64_t                last_dcb {0};
+	uint32_t                last_dwords {0};
+	std::chrono::steady_clock::time_point last_submit {};
+	std::unordered_set<uint64_t> wait_addrs;
+	std::atomic<uint32_t>   submit_n {0};
+	std::atomic<uint32_t>   wait_ack_n {0};
+};
+
+SubmittedGpuStateKyty g_state;
+
+void CollectWaitAddrs(const uint32_t* dcb, uint32_t size_in_dwords,
+                      std::unordered_set<uint64_t>* out) {
+	if (dcb == nullptr || size_in_dwords == 0 || out == nullptr) {
+		return;
+	}
+	for (uint32_t offset = 0; offset < size_in_dwords;) {
+		const uint32_t cmd_id = dcb[offset];
+		const uint32_t len    = KYTY_PM4_LEN(cmd_id);
+		if (len == 0 || len > size_in_dwords - offset) {
+			return;
+		}
+		const uint32_t op = (cmd_id >> 8u) & 0xffu;
+		if (op == Pm4::IT_NOP && KYTY_PM4_R(cmd_id) == Pm4::R_WAIT_MEM_32 && len >= 7) {
+			const uint64_t address = static_cast<uint64_t>(dcb[offset + 1]) |
+			                         (static_cast<uint64_t>(dcb[offset + 2]) << 32u);
+			if (address != 0 && out->size() < kMaxWaitAddrs) {
+				out->insert(address);
+			}
+		} else if (op == Pm4::IT_NOP && KYTY_PM4_R(cmd_id) == Pm4::R_WAIT_MEM_64 && len >= 9) {
+			const uint64_t address = static_cast<uint64_t>(dcb[offset + 1]) |
+			                         (static_cast<uint64_t>(dcb[offset + 2]) << 32u);
+			if (address != 0 && out->size() < kMaxWaitAddrs) {
+				out->insert(address);
+			}
+		}
+		offset += len;
+	}
+}
+
+} // namespace
+
+bool Enabled() {
+	static int cached = -1;
+	if (cached < 0) {
+		const char* e = std::getenv("KYTY_PHASE68_SHARPEMU_WAIT");
+		cached        = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return cached == 1;
+}
+
+void NoteSubmit(uint32_t queue, const uint32_t* dcb, uint32_t dwords, const char* api) {
+	if (!Enabled()) {
+		return;
+	}
+	std::unordered_set<uint64_t> found;
+	CollectWaitAddrs(dcb, dwords, &found);
+	uint64_t seq = 0;
+	{
+		std::lock_guard lock(g_state.mu);
+		seq                    = ++g_state.submission_seq;
+		g_state.last_queue     = queue;
+		g_state.last_dcb       = reinterpret_cast<uint64_t>(dcb);
+		g_state.last_dwords    = dwords;
+		g_state.last_submit    = std::chrono::steady_clock::now();
+		for (uint64_t a: found) {
+			if (g_state.wait_addrs.size() >= kMaxWaitAddrs) {
+				break;
+			}
+			g_state.wait_addrs.insert(a);
+		}
+	}
+	const uint32_t n = g_state.submit_n.fetch_add(1, std::memory_order_relaxed) + 1;
+	static std::atomic<uint32_t> logs {0};
+	if (logs.fetch_add(1, std::memory_order_relaxed) < 48) {
+		LOGF("SubmitTrace: phase68 submit_state seq=%" PRIu64 " queue=0x%" PRIx32
+		     " dcb=0x%016" PRIx64 " dw=%u waits=%zu api=%s submit_n=%u\n",
+		     seq, queue, reinterpret_cast<uint64_t>(dcb), dwords, found.size(),
+		     api != nullptr ? api : "?", n);
+		fprintf(stderr,
+		        "SubmitTrace: phase68 submit_state seq=%" PRIu64 " waits=%zu api=%s\n", seq,
+		        found.size(), api != nullptr ? api : "?");
+	}
+	// SharpEmu-like: notify GRAPHICS / AGC_USER so waiters can progress.
+	Sync::TriggerAgcUserInterrupt();
+	Sync::TriggerEopEvent(0, Sync::EopSource::HostForce);
+}
+
+bool TryAckWaitRegMem(uint64_t addr) {
+	if (!Enabled() || addr == 0) {
+		return false;
+	}
+	bool linked = false;
+	bool have_submit = false;
+	{
+		std::lock_guard lock(g_state.mu);
+		have_submit = g_state.submission_seq > 0;
+		if (g_state.wait_addrs.count(addr) != 0) {
+			linked = true;
+			g_state.wait_addrs.erase(addr);
+		} else if (have_submit) {
+			// Fallback: any outstanding submit within 30s → soft-ack (no label mutate).
+			const auto age = std::chrono::steady_clock::now() - g_state.last_submit;
+			if (age < std::chrono::seconds(30)) {
+				linked = true;
+			}
+		}
+	}
+	if (!linked) {
+		return false;
+	}
+	const uint32_t n = g_state.wait_ack_n.fetch_add(1, std::memory_order_relaxed) + 1;
+	static std::atomic<uint32_t> logs {0};
+	if (logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+		LOGF("SubmitTrace: phase68 wait_ack addr=0x%016" PRIx64 " ack_n=%u (no label mutate)\n",
+		     addr, n);
+		fprintf(stderr, "SubmitTrace: phase68 wait_ack addr=0x%016" PRIx64 " ack_n=%u\n", addr, n);
+	}
+	Sync::TriggerAgcUserInterrupt();
+	return true;
+}
+
+} // namespace Phase68
+
 template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll,
                                   uint32_t wait_op) {
@@ -617,6 +757,10 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	for (;;) {
 		const auto value = *addr;
 		if (TestWaitRegMemValue(value, ref, mask, func)) {
+			break;
+		}
+		// Phase 68: SharpEmu-like soft ack — do not mutate guest label.
+		if (Phase68::TryAckWaitRegMem(addr_value)) {
 			break;
 		}
 		if ((++spin_count % 100000u) == 0) {
