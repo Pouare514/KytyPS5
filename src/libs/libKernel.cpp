@@ -9,6 +9,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/presentation/window.h"
+#include "graphics/presentation/videoOut.h"
 #include "kernel/eventFlag.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
@@ -2517,6 +2518,9 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 		return FIBER_ERROR_INVALID;
 	}
 	if (g_current_fiber != nullptr) {
+		if (std::strstr(fiber->name, "NdJob") != nullptr) {
+			Libs::VideoOut::Phase51NoteFiber("Run", fiber->name, "PERMISSION");
+		}
 		return FIBER_ERROR_PERMISSION;
 	}
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_RUNNING)) {
@@ -2529,6 +2533,9 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 
 	const int save_rc = FiberSaveContext(&g_thread_fiber_context);
 	if (save_rc == 0) {
+		if (std::strstr(fiber->name, "NdJob") != nullptr) {
+			Libs::VideoOut::Phase51NoteFiber("Run", fiber->name, "REAL");
+		}
 		if (fiber->context_valid) {
 			FiberRestoreContext(&fiber->saved_context, 1);
 		}
@@ -2541,6 +2548,9 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 		LOGF("SubmitTrace: FiberRun resume-from-fiber name=%s save_rc=%d\n", fiber->name, save_rc);
 		fprintf(stderr, "SubmitTrace: FiberRun resume-from-fiber name=%s save_rc=%d\n", fiber->name,
 		        save_rc);
+	}
+	if (std::strstr(fiber->name, "NdJob") != nullptr) {
+		Libs::VideoOut::Phase51NoteFiber("Run", fiber->name, "REAL");
 	}
 
 	FiberCommitDeferredIdle();
@@ -2593,6 +2603,9 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 				fprintf(stderr, "SubmitTrace: FiberSwitch PERMISSION→Run name=%s tid=%d\n",
 				        fiber->name, Common::Thread::GetThreadIdUnique());
 			}
+			if (std::strstr(fiber->name, "NdJob") != nullptr) {
+				Libs::VideoOut::Phase51NoteFiber("Switch", fiber->name, "PERMISSION");
+			}
 			return FiberRun(fiber, arg_on_run, arg_on_return);
 		}
 		static std::atomic<int> adopt {0};
@@ -2606,6 +2619,7 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 
 	// Soft-ACK remains diag-only (KYTY_PHASE35_FIBER_SOFTACK / PHASE33). Phase 36 default =
 	// real FiberSwitch with stale-RUNNING reclaim.
+	// Phase 51: never soft-ACK NdJob* fibers (BootCards / other names unchanged).
 	const char* fiber_p35 = std::getenv("KYTY_PHASE35_FIBER_SOFTACK");
 	const bool  soft_all =
 	    fiber_p35 != nullptr && fiber_p35[0] == '1' &&
@@ -2615,7 +2629,11 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 	    fiber_soft != nullptr && fiber_soft[0] == '1' &&
 	    Libs::Graphics::WindowShouldIgnoreQuit() &&
 	    Common::Thread::GetThreadIdUnique() == 8;
-	if (soft_all || soft_main) {
+	const bool skip_ndjob_soft = Libs::VideoOut::Phase51ShouldSkipFiberSoftAck(fiber->name);
+	if ((soft_all || soft_main) && skip_ndjob_soft) {
+		Libs::VideoOut::Phase51NoteFiber("Switch", fiber->name, "softACK_skipped");
+	}
+	if ((soft_all || soft_main) && !skip_ndjob_soft) {
 		static std::atomic<int> soft_switches {0};
 		const int               n   = soft_switches.fetch_add(1, std::memory_order_relaxed);
 		const int               cap = soft_all ? 128 : 16;
@@ -2625,6 +2643,9 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 				     Common::Thread::GetThreadIdUnique(), static_cast<void*>(fiber));
 				fprintf(stderr, "SubmitTrace: FiberSwitch soft-ACK (phase35) n=%d tid=%d\n", n,
 				        Common::Thread::GetThreadIdUnique());
+			}
+			if (std::strstr(fiber->name, "NdJob") != nullptr) {
+				Libs::VideoOut::Phase51NoteFiber("Switch", fiber->name, "softACK");
 			}
 			if (arg_on_return != nullptr) {
 				*arg_on_return = arg_on_run;
@@ -2647,6 +2668,9 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 		     fiber->size_context, FiberGetOwner(fiber), static_cast<void*>(g_current_fiber));
 		fprintf(stderr, "SubmitTrace: FiberSwitch REAL n=%d name=%s state=%u ctx_valid=%d\n",
 		        n_real, fiber->name, FiberLoadState(fiber), fiber->context_valid ? 1 : 0);
+	}
+	if (std::strstr(fiber->name, "NdJob") != nullptr) {
+		Libs::VideoOut::Phase51NoteFiber("Switch", fiber->name, "REAL");
 	}
 
 	for (;;) {

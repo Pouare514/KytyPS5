@@ -17,19 +17,29 @@ namespace Sync {
 [[nodiscard]] uint64_t ReadReferenceClock();
 
 void TriggerAgcUserInterrupt();
-void TriggerEopEvent(uint32_t context_id);
-void TriggerEopEventAtEndOfPipe(CommandBuffer* buffer, uint32_t context_id);
+
+// Phase 46: distinguish host-forced EOP from PM4 EVENT_WRITE_EOP / RELEASE_MEM.
+enum class EopSource : uint32_t {
+	HostForce  = 0,
+	Pm4Eop     = 1,
+	Pm4Release = 2,
+};
+
+void TriggerEopEvent(uint32_t context_id, EopSource source = EopSource::HostForce);
+void TriggerEopEventAtEndOfPipe(CommandBuffer* buffer, uint32_t context_id,
+                                EopSource source = EopSource::Pm4Eop);
 
 namespace SubmitTrace {
 extern std::atomic<uint64_t> submit_dcb;
 extern std::atomic<uint64_t> submit_acb;
 extern std::atomic<uint64_t> add_eq;
 extern std::atomic<uint64_t> eop;
+extern std::atomic<uint64_t> eop_pm4;
 
 void NoteSubmitDcb();
 void NoteSubmitAcb();
 void NoteAddEq();
-void NoteEop();
+void NoteEop(EopSource source = EopSource::HostForce);
 void LogNdJobSyncTimeout();
 } // namespace SubmitTrace
 

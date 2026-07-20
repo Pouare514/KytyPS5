@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/presentation/videoOut.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -331,6 +332,24 @@ int KYTY_SYSV_ABI KernelAddEvent(KernelEqueue eq, const KernelEqueueEvent& event
 
 	eq->AddEvent(event);
 
+	if (eq->GetName().find("NdJob") != std::string::npos) {
+		static std::atomic<uint32_t> add_n {0};
+		const uint32_t               n = add_n.fetch_add(1, std::memory_order_relaxed);
+		if (n < 48) {
+			LOGF("SubmitTrace: phase51 eq_add name=%s ident=0x%016" PRIx64 " filter=%d data=0x%016"
+			     PRIx64 " udata=0x%016" PRIx64 " tid=%d\n",
+			     eq->GetName().c_str(), static_cast<uint64_t>(event.event.ident),
+			     event.event.filter, static_cast<uint64_t>(event.event.data),
+			     reinterpret_cast<uint64_t>(event.event.udata),
+			     Common::Thread::GetThreadIdUnique());
+			if (n < 24) {
+				fprintf(stderr,
+				        "SubmitTrace: phase51 eq_add filter=%d ident=0x%016" PRIx64 "\n",
+				        event.event.filter, static_cast<uint64_t>(event.event.ident));
+			}
+		}
+	}
+
 	return OK;
 }
 
@@ -338,6 +357,27 @@ int KYTY_SYSV_ABI KernelTriggerEvent(KernelEqueue eq, uintptr_t ident, int16_t f
                                      void* trigger_data) {
 	if (eq == nullptr) {
 		return KERNEL_ERROR_EBADF;
+	}
+
+	if (eq->GetName().find("NdJob") != std::string::npos) {
+		static std::atomic<uint32_t> trig_n {0};
+		const uint32_t               n = trig_n.fetch_add(1, std::memory_order_relaxed);
+		const bool not_completion =
+		    Libs::VideoOut::Phase51GraphicsIdent0IsNotCompletion(static_cast<uint64_t>(ident),
+		                                                         filter);
+		if (n < 64) {
+			LOGF("SubmitTrace: phase51 eq_trigger name=%s ident=0x%016" PRIx64
+			     " filter=%d data=0x%016" PRIx64 " not_completion=%d tid=%d\n",
+			     eq->GetName().c_str(), static_cast<uint64_t>(ident), filter,
+			     reinterpret_cast<uint64_t>(trigger_data), not_completion ? 1 : 0,
+			     Common::Thread::GetThreadIdUnique());
+			if (n < 32) {
+				fprintf(stderr,
+				        "SubmitTrace: phase51 eq_trigger filter=%d ident=0x%016" PRIx64
+				        " not_completion=%d\n",
+				        filter, static_cast<uint64_t>(ident), not_completion ? 1 : 0);
+			}
+		}
 	}
 
 	if (!eq->TriggerEvent(ident, filter, trigger_data)) {
@@ -458,6 +498,12 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 				fprintf(stderr,
 				        "SubmitTrace: NdJobBatch[%d/%d] ident=0x%016" PRIx64 " filter=%d\n", i,
 				        *out, static_cast<uint64_t>(ev[i].ident), ev[i].filter);
+				Libs::VideoOut::Phase50NoteNdJobBatch(i, *out, static_cast<uint64_t>(ev[i].ident),
+				                                      ev[i].filter,
+				                                      static_cast<uint64_t>(ev[i].data));
+				Libs::VideoOut::Phase51NoteEqDelivery(
+				    eq->GetName().c_str(), static_cast<uint64_t>(ev[i].ident), ev[i].filter,
+				    static_cast<uint64_t>(ev[i].data), ev[i].udata);
 			}
 		}
 	}
@@ -536,6 +582,11 @@ int KYTY_SYSV_ABI KernelTriggerUserEvent(KernelEqueue eq, int id, void* udata) {
 		LOGF("SubmitTrace: UserEventTrigger id=0x1800 eq=0x%016" PRIx64 "\n",
 		     reinterpret_cast<uint64_t>(eq));
 		fprintf(stderr, "SubmitTrace: UserEventTrigger id=0x1800\n");
+	}
+	if (Libs::VideoOut::Phase37PostUnregisterSeen() &&
+	    LibKernel::PthreadCurrentIsMainRelated()) {
+		Libs::VideoOut::Phase55NoteMainWakeAlt("TriggerUserEvent", static_cast<uint64_t>(id),
+		                                       reinterpret_cast<uint64_t>(eq));
 	}
 
 	return KernelTriggerEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_USER, udata);

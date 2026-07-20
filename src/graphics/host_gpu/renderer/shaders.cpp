@@ -405,10 +405,11 @@ static void CreateLayout(vk::DescriptorSetLayout* set_layouts, uint32_t* set_lay
 	const bool  need_descriptor = !bindings.descriptors.empty();
 
 	if (bindings.push_constant_size != 0) {
-		AddOrMergePushConstantRange(push_constant_info, push_constant_info_num, vk_stage,
-		                            bindings.push_constant_offset,
-		                            ShaderRecompiler::IR::PushConstantVulkanRangeSize(
-		                                bindings.push_constant_size));
+		auto index = *push_constant_info_num;
+		push_constant_info[index].stageFlags = vk_stage;
+		push_constant_info[index].offset     = bindings.push_constant_offset;
+		push_constant_info[index].size       = bindings.push_constant_size;
+		(*push_constant_info_num)++;
 	}
 
 	if (need_descriptor) {
@@ -547,6 +548,7 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, vk::Rende
 
 	vk::VertexInputAttributeDescription input_attr[ShaderVertexInputInfo::RES_MAX];
 	vk::VertexInputBindingDescription   input_desc[ShaderVertexInputInfo::RES_MAX];
+	uint32_t                            attr_count = 0;
 
 	for (int bi = 0; bi < vs_input_info->buffers_num; bi++) {
 		const auto& b          = vs_input_info->buffers[bi];
@@ -910,15 +912,15 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline* pipeline, vk::Rende
 	    vk::DynamicState::eStencilWriteMask,
 	    vk::DynamicState::eColorWriteEnableEXT,
 	};
-	const VkDynamicState depth_only_dynamic_states[] = {
-	    VK_DYNAMIC_STATE_VIEWPORT,
-	    VK_DYNAMIC_STATE_SCISSOR,
-	    VK_DYNAMIC_STATE_LINE_WIDTH,
-	    VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
-	    VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-	    VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+	const vk::DynamicState depth_only_dynamic_states[] = {
+	    vk::DynamicState::eViewport,
+	    vk::DynamicState::eScissor,
+	    vk::DynamicState::eLineWidth,
+	    vk::DynamicState::eStencilCompareMask,
+	    vk::DynamicState::eStencilReference,
+	    vk::DynamicState::eStencilWriteMask,
 	};
-	const auto* dynamic_states_ptr =
+	const vk::DynamicState* dynamic_states_ptr =
 	    static_params.color_count > 0 ? dynamic_states : depth_only_dynamic_states;
 	const auto dynamic_states_count = static_params.color_count > 0
 	                                      ? static_cast<uint32_t>(sizeof(dynamic_states) /

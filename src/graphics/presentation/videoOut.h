@@ -37,6 +37,134 @@ void Phase38NudgeBootWorkers();
 void Phase41MenuHandoffAttempt();
 // Phase 44: true VideoOutRegisterBuffers2 ABI post-Unregister (not snapshot).
 bool Phase44GuestRegisterBuffers2Seen();
+// Phase 45: NdJob-path submit_dcb post-Unregister (not MainThread P43 seed).
+bool Phase45NdJobDcbSeen();
+void Phase45OnNdJobSyncTimeout(LibKernel::EventQueue::KernelEqueue eq);
+void Phase45NoteSubmitDcb(uint64_t submit_count);
+// Phase 46: real (non-NOP) DCB + native PM4 EOP post-Unregister.
+bool Phase46RealDcbSeen();
+bool Phase46NativeEopSeen();
+bool Phase46ReadyForSoftIdle();
+void Phase46InspectSubmitDcb(uint32_t queue, const uint32_t* dcb, uint32_t size_in_dwords);
+void Phase46NoteNativeEop(const char* source);
+// Phase 47: guest DRAW/DISPATCH DCB (excludes host seed).
+bool Phase47GuestDrawSeen();
+bool Phase47ReadyForSoftIdle();
+void Phase47PostSeedWake(const char* why);
+void Phase47NoteSubmitAcb(uint64_t submit_count);
+// Phase 48: present content classification.
+bool Phase48ContentNonZeroSeen();
+bool Phase48FloatFlipSeen();
+// Phase 50: NdJob *obj / wake / batch / GPU flip correlation (no trampoline logging).
+void Phase50PollKeep1Obj(const char* why);
+void Phase50NoteWake(const char* name, size_t woken);
+void Phase50NoteNdJobBatch(int index, int total, uint64_t ident, int filter, uint64_t data);
+void Phase50NoteSubmitGpu(int handle, int index, uint64_t request_id, uint64_t submit_gpu_total);
+bool Phase50ObjNonZeroSeen();
+// Phase 51: NdJob producer — struct dump / EQ / fiber / failfast / bypass flip.
+void Phase51DumpNdJobStruct(const char* why);
+void Phase51NoteEqDelivery(const char* eq_name, uint64_t ident, int filter, uint64_t data,
+                           void* udata);
+bool Phase51GraphicsIdent0IsNotCompletion(uint64_t ident, int filter);
+void Phase51NoteFiber(const char* op, const char* name, const char* path);
+bool Phase51ShouldSkipFiberSoftAck(const char* name);
+void Phase51CheckWorkerFailfast(const char* why);
+void Phase51TryBypassFlipL0(const char* why);
+void Phase52NoteAfterDump(const char* why);
+void Phase53ProbeRetarget(const char* why);
+void Phase53ScanObjDeep(const char* why);
+void Phase53DumpStatusRdi(const char* why);
+void Phase53DumpUserAnchors(const char* why);
+bool Phase53RealQueueSeen();
+// Phase 54: producer Mixed enqueue (cond map / cycle / submit kind / wake budget / fake job).
+bool     Phase37PostUnregisterSeen();
+uint64_t Phase54CurrentCycleId();
+uint64_t Phase54BumpCycle(const char* why);
+void     Phase54NoteHostWake(const char* why);
+[[nodiscard]] bool Phase54AllowHostWake();
+void     Phase54NoteMixedWake(const char* role, uintptr_t cond_ptr, const char* outcome);
+void     Phase54NoteMixedLeave(const char* role);
+void     Phase54NoteSubmit(uint32_t queue, const uint32_t* dcb, uint32_t size_in_dwords);
+void     Phase54TryFakeJobAfterWake(const char* role);
+[[nodiscard]] bool Phase54FakeJobEnabled();
+// Phase 55: Mixed entry thunk + queue layout + watch + fake queue inject.
+constexpr uint64_t kPhase55MixedEntry = 0x0000000901DE4140ULL;
+void Phase55TryArmMixedThunk();
+void Phase55OnMixedRewait(const char* role, uintptr_t cond_ptr);
+void Phase55NoteMainWakeAlt(const char* kind, uint64_t a0, uint64_t a1);
+void Phase55FlushDeferredLogs();
+void Phase55PollWatch();
+void Phase55EmitHeatmap(const char* why);
+void Phase55NoteGuestCond(uint64_t guest_cond_va, uint64_t guest_arg, const char* role);
+[[nodiscard]] bool Phase55FakeQueueEnabled();
+// Phase 56: LIST_CANDIDATE retarget + writers + FAKE_COUNT.
+void Phase56NoteGuestSync(uint64_t guest_cond_va, uint64_t guest_mutex_va, uint64_t guest_arg,
+                          const char* role);
+void Phase56NoteMainSignal(uint64_t guest_cond_va, const char* role);
+void Phase56PollWatch();
+void Phase56EmitHeatmap(const char* why);
+void Phase56TryFakeCount(const char* why);
+[[nodiscard]] bool Phase56FakeCountEnabled();
+uint64_t Phase56CurrentSyncId();
+uint64_t Phase56QueueBase();
+// Phase 57: global queue (A) + Main producer (C).
+void Phase57TryScanMixedBody();
+void Phase57NoteMixedRegs(uint64_t rdi, uint64_t rsi, uint64_t rdx);
+void Phase57NoteMainAgcTouch(const char* nid, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
+void Phase57NoteMainObjectWrite(uint64_t guest_va, const char* why);
+void Phase57PollHeatmap();
+void Phase57EmitHeatmap(const char* why);
+uint64_t Phase57QueueBase();
+[[nodiscard]] bool Phase57Elected();
+// Phase 58: NdJob ancre + subblock classify + discriminant heatmap.
+void Phase58NoteNdJobAncre(const char* why);
+void Phase58NoteMainAgcCross(const char* nid, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
+void Phase58PollWatch();
+void Phase58EmitHeatmap(const char* why);
+uint64_t Phase58QueueBase();
+[[nodiscard]] bool Phase58Elected();
+// Phase 59: AGC guest VA ↔ host queue/stream/ctx mapping (instrumentation only).
+void Phase59NoteGuestVa(const char* kind, uint64_t va, uint64_t host_id, const char* source_tag);
+void Phase59NoteSubmit(uint32_t queue, const uint32_t* dcb, uint32_t size_in_dwords,
+                       const char* submit_kind);
+void Phase59NoteWorkloadStream(uint32_t stream_id, const void* stream);
+void Phase59NoteWorkloadActive(uint32_t stream_id, const char* why);
+void Phase59NoteStubArgs(const char* nid, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
+void Phase59NoteEq(int id, uint64_t eq_va, uint32_t context_id, const char* why);
+void Phase59SeedNdJobAnchors(uint64_t ndjob, uint64_t status, uint64_t user10, uint64_t user40);
+void Phase59EmitHeatmap(const char* why);
+void Phase59Poll();
+// Phase 61: unlock gate — read-only user_ring PM4/ptr probe.
+void Phase61RingProbe();
+void Phase61EmitHeatmap(const char* why);
+void Phase61Poll();
+// Phase 62: producer silence post-Unreg (RegisterResource map; not KPRI ring gate).
+void Phase62NoteRegisterResource(uint64_t addr, uint64_t size, int res_type, const char* name,
+                                 uint32_t handle);
+void Phase62NoteUnreg();
+void Phase62EmitHeatmap(const char* why);
+void Phase62Poll();
+// Phase 63: Unreg forensics — Owner cycle_id + SubmitEntry (read-only).
+void Phase63NoteUnregister(uint32_t owner, int n_resources, const char* why, bool owner_event);
+void Phase63NoteSubmitEntry(const char* api, uint32_t queue, const uint32_t* dcb,
+                            uint32_t size_in_dwords);
+void Phase63NotePostAgc(const char* why);
+void Phase63EmitHeatmap(const char* why);
+void Phase63Poll();
+// Phase 64: post-Unreg waiters (Main cond / flip stuck / NdJob static) — read-only.
+void Phase64NoteMainCondWait(uint64_t cond_va);
+void Phase64NoteMainCondSignal(uint64_t cond_va, bool match_wait);
+void Phase64EmitHeatmap(const char* why);
+void Phase64Poll();
+// Phase 65: who waits / menu entry markers post-Unreg — read-only.
+void Phase65NoteCondWait(const char* role, const char* name, int tid, uint64_t ra);
+void Phase65NoteGuestRegbuf2();
+void Phase65NoteGuestFlip();
+void Phase65EmitHeatmap(const char* why);
+void Phase65Poll();
+// Phase 66: recycle Flip L0 after menu detection (opt-in KYTY_PHASE66_MENU_RECYCLE).
+void Phase66EmitHeatmap(const char* why);
+void Phase66Poll();
 
 KYTY_SYSV_ABI int  VideoOutOpen(int user_id, int bus_type, int index, const void* param);
 KYTY_SYSV_ABI int  VideoOutClose(int handle);

@@ -174,6 +174,21 @@ list(APPEND kyty_emulator_src
 	emulator.h
 	emulator.cpp
 )
+# clang-cl does not assemble .S via CMake ASM; build with clang driver explicitly.
+if (WIN32)
+	set(_kyty_fiber_s "${CMAKE_CURRENT_SOURCE_DIR}/libs/fiberContext_win.S")
+	set(_kyty_fiber_obj "${CMAKE_CURRENT_BINARY_DIR}/fiberContext_win.obj")
+	find_program(KYTY_CLANG_ASM NAMES clang clang.exe REQUIRED)
+	add_custom_command(
+		OUTPUT "${_kyty_fiber_obj}"
+		COMMAND "${KYTY_CLANG_ASM}" -c -target x86_64-pc-windows-msvc
+			-o "${_kyty_fiber_obj}" "${_kyty_fiber_s}"
+		DEPENDS "${_kyty_fiber_s}"
+		COMMENT "Assembling fiberContext_win.S"
+		VERBATIM
+	)
+	list(APPEND kyty_emulator_src "${_kyty_fiber_obj}")
+endif()
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
 if (KYTY_CLANG_CL)

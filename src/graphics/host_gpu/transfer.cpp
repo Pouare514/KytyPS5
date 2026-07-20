@@ -13,6 +13,8 @@
 #include "graphics/presentation/window.h"
 
 #include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <memory>
 #include <span>
 #include <vector>
@@ -850,9 +852,100 @@ void BlitToSwapchain(CommandBuffer* buffer, VulkanImage* src_image,
 		     src_image != nullptr ? static_cast<int>(src_image->layout) : -1);
 	}
 
-	VulkanImage swapchain_image(VulkanImageType::Unknown);
+	// Phase 48 (SharpEmu #448): linear-float flips need linear→sRGB encode into UNORM
+	// swapchains. Blit through an sRGB intermediate (store encodes), then raw-copy.
+	auto GetSrgbCounterpart = [](vk::Format format) -> vk::Format {
+		switch (format) {
+			case vk::Format::eB8G8R8A8Unorm: return vk::Format::eB8G8R8A8Srgb;
+			case vk::Format::eR8G8B8A8Unorm: return vk::Format::eR8G8B8A8Srgb;
+			default: return vk::Format::eUndefined;
+		}
+	};
+	const bool src_float = src_image->format == vk::Format::eR16G16B16A16Sfloat ||
+	                       src_image->format == vk::Format::eR32G32B32A32Sfloat;
+	const vk::Format encode_fmt = GetSrgbCounterpart(dst_swapchain->swapchain_format);
+	const bool encode_for_present = src_float && encode_fmt != vk::Format::eUndefined;
 
-	swapchain_image.image  = dst_swapchain->swapchain_images[dst_swapchain->current_index];
+	struct PresentEncodeCache {
+		vk::Image        image  = nullptr;
+		vk::DeviceMemory memory = nullptr;
+		vk::Extent2D     extent {};
+		vk::Format       format = vk::Format::eUndefined;
+		vk::Device       device = nullptr;
+		~PresentEncodeCache() {
+			if (device && image) {
+				device.destroyImage(image, nullptr);
+			}
+			if (device && memory) {
+				device.freeMemory(memory, nullptr);
+			}
+		}
+	};
+	static PresentEncodeCache encode_cache;
+
+	vk::Image blit_dst_image = dst_swapchain->swapchain_images[dst_swapchain->current_index];
+	if (encode_for_present) {
+		auto* gctx = WindowGetGraphicContext();
+		EXIT_IF(gctx == nullptr);
+		const auto extent = dst_swapchain->swapchain_extent;
+		if (encode_cache.image == nullptr || encode_cache.device != gctx->device ||
+		    encode_cache.format != encode_fmt || encode_cache.extent.width != extent.width ||
+		    encode_cache.extent.height != extent.height) {
+			if (encode_cache.device && encode_cache.image) {
+				encode_cache.device.destroyImage(encode_cache.image, nullptr);
+				encode_cache.image = nullptr;
+			}
+			if (encode_cache.device && encode_cache.memory) {
+				encode_cache.device.freeMemory(encode_cache.memory, nullptr);
+				encode_cache.memory = nullptr;
+			}
+			vk::ImageCreateInfo image_info {};
+			image_info.sType         = vk::StructureType::eImageCreateInfo;
+			image_info.imageType     = vk::ImageType::e2D;
+			image_info.format        = encode_fmt;
+			image_info.extent        = vk::Extent3D {extent.width, extent.height, 1};
+			image_info.mipLevels     = 1;
+			image_info.arrayLayers   = 1;
+			image_info.samples       = vk::SampleCountFlagBits::e1;
+			image_info.tiling        = vk::ImageTiling::eOptimal;
+			image_info.usage =
+			    vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc;
+			image_info.sharingMode   = vk::SharingMode::eExclusive;
+			image_info.initialLayout = vk::ImageLayout::eUndefined;
+			encode_cache.image =
+			    gctx->device.createImage(image_info, nullptr).value;
+			const auto req = gctx->device.getImageMemoryRequirements(encode_cache.image);
+			vk::MemoryAllocateInfo alloc {};
+			alloc.sType           = vk::StructureType::eMemoryAllocateInfo;
+			alloc.allocationSize  = req.size;
+			alloc.memoryTypeIndex = 0;
+			const auto mem_props  = gctx->physical_device.getMemoryProperties();
+			for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+				if ((req.memoryTypeBits & (1u << i)) != 0 &&
+				    (mem_props.memoryTypes[i].propertyFlags &
+				     vk::MemoryPropertyFlagBits::eDeviceLocal) != vk::MemoryPropertyFlags {}) {
+					alloc.memoryTypeIndex = i;
+					break;
+				}
+			}
+			encode_cache.memory = gctx->device.allocateMemory(alloc, nullptr).value;
+			(void)gctx->device.bindImageMemory(encode_cache.image, encode_cache.memory, 0);
+			encode_cache.device = gctx->device;
+			encode_cache.extent = extent;
+			encode_cache.format = encode_fmt;
+			static std::atomic<bool> once {false};
+			if (!once.exchange(true, std::memory_order_acq_rel)) {
+				LOGF("FlipTrace: phase48 present sRGB encode enabled src_fmt=%d swap=%d\n",
+				     static_cast<int>(src_image->format),
+				     static_cast<int>(dst_swapchain->swapchain_format));
+				fprintf(stderr, "FlipTrace: phase48 present sRGB encode enabled\n");
+			}
+		}
+		blit_dst_image = encode_cache.image;
+	}
+
+	VulkanImage swapchain_image(VulkanImageType::Unknown);
+	swapchain_image.image  = blit_dst_image;
 	swapchain_image.layout = vk::ImageLayout::eUndefined;
 
 	SetImageLayout(vk_buffer, &swapchain_image, 0, 1, vk::ImageAspectFlagBits::eColor,
@@ -876,13 +969,39 @@ void BlitToSwapchain(CommandBuffer* buffer, VulkanImage* src_image,
 	region.dstOffsets[0].x               = 0;
 	region.dstOffsets[0].y               = 0;
 	region.dstOffsets[0].z               = 0;
-	region.dstOffsets[1].x               = static_cast<int>(dst_swapchain->swapchain_extent.width);
-	region.dstOffsets[1].y               = static_cast<int>(dst_swapchain->swapchain_extent.height);
-	region.dstOffsets[1].z               = 1;
+	region.dstOffsets[1].x = static_cast<int>(dst_swapchain->swapchain_extent.width);
+	region.dstOffsets[1].y = static_cast<int>(dst_swapchain->swapchain_extent.height);
+	region.dstOffsets[1].z = 1;
 
 	vk_buffer.blitImage(src_image->image, vk::ImageLayout::eTransferSrcOptimal,
 	                    swapchain_image.image, vk::ImageLayout::eTransferDstOptimal, 1, &region,
 	                    vk::Filter::eLinear);
+
+	if (encode_for_present) {
+		VulkanImage encode_src(VulkanImageType::Unknown);
+		encode_src.image  = encode_cache.image;
+		encode_src.layout = vk::ImageLayout::eTransferDstOptimal;
+		SetImageLayout(vk_buffer, &encode_src, 0, 1, vk::ImageAspectFlagBits::eColor,
+		               vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferSrcOptimal);
+
+		VulkanImage final_dst(VulkanImageType::Unknown);
+		final_dst.image  = dst_swapchain->swapchain_images[dst_swapchain->current_index];
+		final_dst.layout = vk::ImageLayout::eUndefined;
+		SetImageLayout(vk_buffer, &final_dst, 0, 1, vk::ImageAspectFlagBits::eColor,
+		               vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal);
+
+		vk::ImageCopy copy {};
+		copy.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
+		copy.srcSubresource.mipLevel       = 0;
+		copy.srcSubresource.baseArrayLayer = 0;
+		copy.srcSubresource.layerCount     = 1;
+		copy.dstSubresource                = copy.srcSubresource;
+		copy.extent.width                  = dst_swapchain->swapchain_extent.width;
+		copy.extent.height                 = dst_swapchain->swapchain_extent.height;
+		copy.extent.depth                  = 1;
+		vk_buffer.copyImage(encode_cache.image, vk::ImageLayout::eTransferSrcOptimal,
+		                    final_dst.image, vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+	}
 }
 
 void ClearColorImage(CommandBuffer* buffer, VulkanImage* image, const vk::ClearColorValue& color) {

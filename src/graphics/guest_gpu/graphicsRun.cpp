@@ -1742,7 +1742,9 @@ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id)
 
 	CheckBuffer();
 
-	Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), interrupt_context_id);
+	// RELEASE_MEM path — tag as pm4_release for Phase 46 native EOP.
+	Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), interrupt_context_id,
+	                                 Sync::EopSource::Pm4Release);
 }
 
 void CommandProcessor::RenderTextureBarrier(uint64_t vaddr, uint64_t size) {

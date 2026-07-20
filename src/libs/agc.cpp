@@ -24,9 +24,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cinttypes>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #ifdef min
@@ -1450,52 +1453,193 @@ static std::mutex g_workload_stream_mutex;
 static uint32_t   g_workload_stream_mask = 0;
 static uint8_t    g_workload_streams[WORKLOAD_STREAM_MAX_ID + 1][WORKLOAD_STREAM_RECORD_SIZE] {};
 
+// Phase 48: owner-scoped AGC resource registry (SharpEmu #469).
+static constexpr uint32_t                      GRAPHICS5_DRIVER_DEFAULT_OWNER = 0x8a6c9018u;
+static std::mutex                              g_agc_reg_mu;
+static std::unordered_map<uint32_t, uint32_t>  g_agc_owners;    // owner -> resource count
+static std::unordered_map<uint32_t, uint32_t>  g_agc_resources; // handle -> owner
+static std::atomic<uint32_t>                   g_agc_next_owner {1};
+static std::atomic<uint32_t>                   g_agc_next_resource {1};
+static std::atomic<bool>                       g_agc_default_owner_ready {false};
+
+static void AgcEnsureDefaultOwnerLocked() {
+	if (!g_agc_default_owner_ready.load(std::memory_order_relaxed)) {
+		g_agc_owners.emplace(GRAPHICS5_DRIVER_DEFAULT_OWNER, 0);
+		g_agc_default_owner_ready.store(true, std::memory_order_relaxed);
+	}
+}
+
+static int AgcRemoveResourcesForOwnerLocked(uint32_t owner) {
+	int removed = 0;
+	for (auto it = g_agc_resources.begin(); it != g_agc_resources.end();) {
+		if (it->second == owner) {
+			it = g_agc_resources.erase(it);
+			++removed;
+		} else {
+			++it;
+		}
+	}
+	auto owner_it = g_agc_owners.find(owner);
+	if (owner_it != g_agc_owners.end()) {
+		owner_it->second = 0;
+	}
+	return removed;
+}
+
 uint32_t KYTY_SYSV_ABI GraphicsDriverGetDefaultOwner() {
 	PRINT_NAME();
-
-	return 0x8a6c9018u;
+	std::lock_guard lock(g_agc_reg_mu);
+	AgcEnsureDefaultOwnerLocked();
+	return GRAPHICS5_DRIVER_DEFAULT_OWNER;
 }
 
 uint32_t KYTY_SYSV_ABI GraphicsDriverGetResourceRegistrationMaxNameLength() {
 	PRINT_NAME();
-
-	return 0x8a6c9018u;
+	return 256u;
 }
 
 uint32_t KYTY_SYSV_ABI GraphicsDriverInitResourceRegistration() {
 	PRINT_NAME();
-
-	return 0x8a6c9018u;
+	std::lock_guard lock(g_agc_reg_mu);
+	AgcEnsureDefaultOwnerLocked();
+	return 0;
 }
 
 uint32_t KYTY_SYSV_ABI
 GraphicsDriverQueryResourceRegistrationUserMemoryRequirements(uint64_t* size_in_bytes) {
 	PRINT_NAME();
-
 	if (size_in_bytes != nullptr) {
 		*size_in_bytes = 0;
 	}
-
-	return 0x8a6c9018u;
-}
-
-int KYTY_SYSV_ABI GraphicsDriverRegisterOwner() {
-	PRINT_NAME();
-
-	return static_cast<int>(0x8a6c9018u);
-}
-
-int KYTY_SYSV_ABI GraphicsDriverRegisterResource() {
-	PRINT_NAME();
-
-	// Phase 27: magic 0x8a6c9018 soft-disabled resources; return 0 so guest treats registration as OK.
 	return 0;
 }
 
-int KYTY_SYSV_ABI GraphicsDriverUnregisterResource() {
+int KYTY_SYSV_ABI GraphicsDriverRegisterOwner(uint32_t* owner_out, const char* name) {
 	PRINT_NAME();
+	(void)name;
+	std::lock_guard lock(g_agc_reg_mu);
+	AgcEnsureDefaultOwnerLocked();
+	uint32_t owner = 0;
+	for (;;) {
+		owner = g_agc_next_owner.fetch_add(1, std::memory_order_relaxed);
+		if (owner == 0 || owner == GRAPHICS5_DRIVER_DEFAULT_OWNER) {
+			continue;
+		}
+		if (g_agc_owners.emplace(owner, 0).second) {
+			break;
+		}
+	}
+	if (owner_out != nullptr) {
+		*owner_out = owner;
+	}
+	static std::atomic<int> log_n {0};
+	if (log_n.fetch_add(1, std::memory_order_relaxed) < 32) {
+		LOGF("AgcDriver: RegisterOwner owner=0x%08" PRIx32 " name=%s\n", owner,
+		     name != nullptr ? name : "(null)");
+		fprintf(stderr, "AgcDriver: RegisterOwner owner=0x%08" PRIx32 "\n", owner);
+	}
+	return OK;
+}
 
-	return static_cast<int>(0x8a6c9018u);
+int KYTY_SYSV_ABI GraphicsDriverRegisterResource(uint32_t* resource_out, uint32_t owner,
+                                                 const void* addr, uint64_t size, const char* name,
+                                                 int res_type, uint64_t user_data) {
+	PRINT_NAME();
+	(void)user_data;
+	std::lock_guard lock(g_agc_reg_mu);
+	AgcEnsureDefaultOwnerLocked();
+	if (g_agc_owners.find(owner) == g_agc_owners.end()) {
+		g_agc_owners.emplace(owner, 0);
+	}
+	uint32_t handle = 0;
+	for (;;) {
+		handle = g_agc_next_resource.fetch_add(1, std::memory_order_relaxed);
+		if (handle == 0) {
+			continue;
+		}
+		if (g_agc_resources.emplace(handle, owner).second) {
+			break;
+		}
+	}
+	g_agc_owners[owner] += 1;
+	if (resource_out != nullptr) {
+		*resource_out = handle;
+	}
+	{
+		const uint64_t addr_va = reinterpret_cast<uint64_t>(addr);
+		if (addr_va >= 0x10000ULL) {
+			const char* kind = "queue";
+			if (addr_va >= 0x0000001000000000ULL && addr_va < 0x0000001100000000ULL) {
+				kind = "user_ring";
+			} else if (addr_va >= 0x0000000903400000ULL && addr_va < 0x0000000903900000ULL) {
+				kind = "ctx";
+			}
+			Libs::VideoOut::Phase59NoteGuestVa(kind, addr_va, handle, "resource_reg");
+			Libs::VideoOut::Phase62NoteRegisterResource(addr_va, size, res_type, name, handle);
+			Libs::VideoOut::Phase63NotePostAgc("RegisterResource");
+		}
+	}
+	static std::atomic<int> log_n {0};
+	if (log_n.fetch_add(1, std::memory_order_relaxed) < 32) {
+		LOGF("AgcDriver: RegisterResource handle=0x%08" PRIx32 " owner=0x%08" PRIx32 "\n", handle,
+		     owner);
+		fprintf(stderr,
+		        "AgcDriver: RegisterResource handle=0x%08" PRIx32 " owner=0x%08" PRIx32 "\n",
+		        handle, owner);
+	}
+	return OK;
+}
+
+int KYTY_SYSV_ABI GraphicsDriverUnregisterResource(uint32_t resource) {
+	PRINT_NAME();
+	std::lock_guard lock(g_agc_reg_mu);
+	AgcEnsureDefaultOwnerLocked();
+	auto it = g_agc_resources.find(resource);
+	if (it == g_agc_resources.end()) {
+		return GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT;
+	}
+	const uint32_t owner = it->second;
+	g_agc_resources.erase(it);
+	auto owner_it = g_agc_owners.find(owner);
+	if (owner_it != g_agc_owners.end() && owner_it->second > 0) {
+		owner_it->second -= 1;
+	}
+	Libs::VideoOut::Phase63NoteUnregister(owner, 1, "UnregisterResource", false);
+	return OK;
+}
+
+int KYTY_SYSV_ABI GraphicsDriverUnregisterOwnerAndResources(uint32_t owner) {
+	PRINT_NAME();
+	std::lock_guard lock(g_agc_reg_mu);
+	AgcEnsureDefaultOwnerLocked();
+	if (g_agc_owners.find(owner) == g_agc_owners.end()) {
+		LOGF("AgcDriver: UnregisterOwnerAndResources unknown owner=0x%08" PRIx32 "\n", owner);
+		fprintf(stderr, "AgcDriver: UnregisterOwnerAndResources INVALID owner=0x%08" PRIx32 "\n",
+		        owner);
+		return GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT;
+	}
+	const int removed = AgcRemoveResourcesForOwnerLocked(owner);
+	g_agc_owners.erase(owner);
+	Libs::VideoOut::Phase63NoteUnregister(owner, removed, "UnregisterOwnerAndResources", true);
+	LOGF("AgcDriver: UnregisterOwnerAndResources owner=0x%08" PRIx32 " resources=%d\n", owner,
+	     removed);
+	fprintf(stderr, "AgcDriver: UnregisterOwnerAndResources owner=0x%08" PRIx32 " resources=%d\n",
+	        owner, removed);
+	return OK;
+}
+
+int KYTY_SYSV_ABI GraphicsDriverUnregisterAllResourcesForOwner(uint32_t owner) {
+	PRINT_NAME();
+	std::lock_guard lock(g_agc_reg_mu);
+	AgcEnsureDefaultOwnerLocked();
+	const int removed = AgcRemoveResourcesForOwnerLocked(owner);
+	Libs::VideoOut::Phase63NoteUnregister(owner, removed, "UnregisterAllResourcesForOwner", true);
+	LOGF("AgcDriver: UnregisterAllResourcesForOwner owner=0x%08" PRIx32 " resources=%d\n", owner,
+	     removed);
+	fprintf(stderr,
+	        "AgcDriver: UnregisterAllResourcesForOwner owner=0x%08" PRIx32 " resources=%d\n", owner,
+	        removed);
+	return OK;
 }
 
 int KYTY_SYSV_ABI GraphicsDriverRegisterWorkloadStream(uint32_t stream_id, const void* stream) {
@@ -1512,6 +1656,9 @@ int KYTY_SYSV_ABI GraphicsDriverRegisterWorkloadStream(uint32_t stream_id, const
 	if (stream == nullptr) {
 		return GRAPHICS5_DRIVER_ERROR_INVALID_ARGUMENT;
 	}
+
+	Libs::VideoOut::Phase59NoteWorkloadStream(stream_id, stream);
+	Libs::VideoOut::Phase63NotePostAgc("RegisterWorkloadStream");
 
 	std::lock_guard lock(g_workload_stream_mutex);
 
@@ -1918,6 +2065,7 @@ uint32_t* KYTY_SYSV_ABI GraphicsDcbSetWorkloadsActive(CommandBuffer* buf, uint32
 	     "\t workload_ids   = 0x%016" PRIx64 "\n"
 	     "\t workload_count = %" PRIu32 "\n",
 	     stream_id, reinterpret_cast<uint64_t>(workload_ids), workload_count);
+	Libs::VideoOut::Phase59NoteWorkloadActive(stream_id, "active");
 
 	if (buf == nullptr || workload_ids == nullptr || workload_count == 0 ||
 	    workload_count > WORKLOAD_ACTIVE_COUNT_MAX || stream_id < WORKLOAD_STREAM_MIN_ID ||
@@ -1970,6 +2118,7 @@ uint32_t* KYTY_SYSV_ABI GraphicsDcbSetWorkloadComplete(CommandBuffer* buf, uint3
 	LOGF("\t stream_id   = %" PRIu32 "\n"
 	     "\t workload_id = %" PRIu32 "\n",
 	     stream_id, workload_id);
+	Libs::VideoOut::Phase59NoteWorkloadActive(stream_id, "complete");
 
 	if (buf == nullptr || stream_id < WORKLOAD_STREAM_MIN_ID ||
 	    stream_id > WORKLOAD_STREAM_MAX_ID || workload_id > WORKLOAD_ID_MAX) {
@@ -3870,6 +4019,9 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitDcb(const Packet* packet) {
 	EXIT_NOT_IMPLEMENTED(packet == nullptr);
 	EXIT_NOT_IMPLEMENTED(packet->pad[0] != 0);
 
+	Libs::VideoOut::Phase63NoteSubmitEntry("SubmitDcb", 0, packet->addr, packet->dw_num);
+	Libs::VideoOut::Phase46InspectSubmitDcb(0, packet->addr, packet->dw_num);
+	Libs::VideoOut::Phase59NoteSubmit(0, packet->addr, packet->dw_num, "dcb");
 	Sync::SubmitTrace::NoteSubmitDcb();
 	LOGF("SubmitTrace: SubmitDcb addr=0x%016" PRIx64 " dw_num=0x%08" PRIx32 "\n",
 	     reinterpret_cast<uint64_t>(packet->addr), packet->dw_num);
@@ -3909,6 +4061,8 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
 		if (dcb == nullptr) {
 			continue;
 		}
+		Libs::VideoOut::Phase63NoteSubmitEntry("SubmitMultiDcbs", 0, dcb, size_in_dwords);
+		Libs::VideoOut::Phase46InspectSubmitDcb(0, dcb, size_in_dwords);
 		submit_dcb(dcb, size_in_dwords);
 	}
 
@@ -3919,6 +4073,11 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitCommandBuffer(uint32_t queue, uint32_t* dc
                                                     uint32_t size_in_dwords) {
 	PRINT_NAME();
 
+	Libs::VideoOut::Phase63NoteSubmitEntry("SubmitCommandBuffer", queue, dcb, size_in_dwords);
+	Libs::VideoOut::Phase54NoteSubmit(queue, dcb, size_in_dwords);
+	if (dcb != nullptr && size_in_dwords != 0) {
+		Libs::VideoOut::Phase46InspectSubmitDcb(queue, dcb, size_in_dwords);
+	}
 	Sync::SubmitTrace::NoteSubmitDcb();
 	LOGF("SubmitTrace: SubmitCommandBuffer queue=0x%08" PRIx32 " dcb=0x%016" PRIx64
 	     " size=0x%08" PRIx32 "\n",
@@ -4012,6 +4171,9 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitAcb(uint32_t queue, const Packet* packet) 
 	     "\t flags = 0x%02" PRIx8 "\n",
 	     reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->pad[0]);
 
+	Libs::VideoOut::Phase63NoteSubmitEntry("SubmitAcb", queue, packet->addr, packet->dw_num);
+	Libs::VideoOut::Phase59NoteSubmit(queue, packet->addr, packet->dw_num, "acb");
+
 	submit_acb(queue, packet->addr, packet->dw_num);
 
 	return OK;
@@ -4035,6 +4197,8 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const*
 	}
 
 	for (uint32_t i = 0; i < count; i++) {
+		Libs::VideoOut::Phase63NoteSubmitEntry("SubmitMultiAcbs", queue, acbs[i],
+		                                       sizes_in_dwords[i]);
 		submit_acb(queue, acbs[i], sizes_in_dwords[i]);
 	}
 
@@ -4047,6 +4211,8 @@ int KYTY_SYSV_ABI GraphicsDriverAddEqEvent(LibKernel::EventQueue::KernelEqueue e
 
 	LOGF("SubmitTrace: GraphicsDriverAddEqEvent id=%d eq=0x%016" PRIx64 "\n", id,
 	     reinterpret_cast<uint64_t>(eq));
+	Libs::VideoOut::Phase59NoteEq(id, reinterpret_cast<uint64_t>(eq), 0, "AddEqEvent");
+	Libs::VideoOut::Phase63NotePostAgc("AddEqEvent");
 
 	if (eq == nullptr) {
 		return LibKernel::KERNEL_ERROR_EBADF;
@@ -4088,10 +4254,13 @@ uint32_t KYTY_SYSV_ABI GraphicsDriverGetEqContextId(const LibKernel::EventQueue:
 	}
 
 	if (ev->filter == LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS) {
+		Libs::VideoOut::Phase59NoteEq(static_cast<int>(ev->ident), 0, 0, "GetEqContextId_gfx");
 		return 0;
 	}
 
-	return static_cast<uint32_t>(ev->ident);
+	const uint32_t ctx = static_cast<uint32_t>(ev->ident);
+	Libs::VideoOut::Phase59NoteEq(static_cast<int>(ev->ident), 0, ctx, "GetEqContextId");
+	return ctx;
 }
 
 int KYTY_SYSV_ABI GraphicsDriverSetTFRing(const volatile void* base, uint32_t size) {

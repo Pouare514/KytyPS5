@@ -74,9 +74,14 @@ uint32_t KYTY_SYSV_ABI GraphicsDriverGetResourceRegistrationMaxNameLength();
 uint32_t KYTY_SYSV_ABI GraphicsDriverInitResourceRegistration();
 uint32_t KYTY_SYSV_ABI
 GraphicsDriverQueryResourceRegistrationUserMemoryRequirements(uint64_t* size_in_bytes);
-int KYTY_SYSV_ABI GraphicsDriverRegisterOwner();
-int KYTY_SYSV_ABI GraphicsDriverRegisterResource();
-int KYTY_SYSV_ABI GraphicsDriverUnregisterResource();
+int KYTY_SYSV_ABI GraphicsDriverRegisterOwner(uint32_t* owner_out, const char* name);
+int KYTY_SYSV_ABI GraphicsDriverRegisterResource(uint32_t* resource_out, uint32_t owner,
+                                                 const void* addr, uint64_t size, const char* name,
+                                                 int res_type, uint64_t user_data);
+int KYTY_SYSV_ABI GraphicsDriverUnregisterResource(uint32_t resource);
+// Phase 48 (SharpEmu #469): owner-scoped teardown — was AgcDriver soft-stub.
+int KYTY_SYSV_ABI GraphicsDriverUnregisterOwnerAndResources(uint32_t owner);
+int KYTY_SYSV_ABI GraphicsDriverUnregisterAllResourcesForOwner(uint32_t owner);
 int KYTY_SYSV_ABI GraphicsDriverRegisterWorkloadStream(uint32_t stream_id, const void* stream);
 
 uint32_t* KYTY_SYSV_ABI GraphicsCbNop(CommandBuffer* buf, uint32_t size_in_dwords);

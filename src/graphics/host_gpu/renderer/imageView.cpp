@@ -10,6 +10,26 @@ namespace Libs::Graphics {
 
 namespace {
 
+[[nodiscard]] bool IsSrgbColorFormat(vk::Format format) noexcept {
+	return format == vk::Format::eR8G8B8A8Srgb || format == vk::Format::eB8G8R8A8Srgb;
+}
+
+[[nodiscard]] vk::ImageUsageFlags NonStorageColorViewUsage() noexcept {
+	return vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
+	       vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+}
+
+[[nodiscard]] vk::ImageUsageFlags DefaultColorViewUsage(vk::Format image_format,
+                                                       GraphicContext* ctx) noexcept {
+	// sRGB (and any color format without STORAGE_IMAGE) must not inherit
+	// VK_IMAGE_USAGE_STORAGE_BIT from the image — VUID-02275.
+	if (IsSrgbColorFormat(image_format) ||
+	    (ctx != nullptr && !ImageViewOps::FormatSupportsStorage(ctx, image_format))) {
+		return NonStorageColorViewUsage();
+	}
+	return {};
+}
+
 void CreateView(GraphicContext* ctx, VulkanImage* image, int view_index,
                 vk::ImageViewType view_type, vk::ImageAspectFlags aspect_mask,
                 vk::ComponentMapping components, uint32_t base_array_layer, uint32_t base_mip_level,
@@ -85,27 +105,47 @@ bool FormatSupportsStorage(GraphicContext* ctx, vk::Format format) {
 }
 
 void CreateRenderTargetViews(GraphicContext* ctx, RenderTextureVulkanImage* image) {
+	const auto default_usage = DefaultColorViewUsage(image->format, ctx);
 	CreateRenderTargetView(ctx, image, VulkanImage::VIEW_DEFAULT, vk::ComponentSwizzle::eIdentity,
 	                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-	                       vk::ComponentSwizzle::eIdentity);
+	                       vk::ComponentSwizzle::eIdentity, vk::ImageViewType::e2D,
+	                       vk::Format::eUndefined, default_usage);
 	if (image->layers > 1) {
 		CreateRenderTargetView(ctx, image, VulkanImage::VIEW_DEFAULT_ARRAY,
 		                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
 		                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-		                       vk::ImageViewType::e2DArray);
+		                       vk::ImageViewType::e2DArray, vk::Format::eUndefined, default_usage);
 	}
 	if (FormatSupportsStorage(ctx, image->format)) {
 		CreateRenderTargetView(ctx, image, VulkanImage::VIEW_STORAGE,
 		                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
 		                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
 		                       vk::ImageViewType::e2D, vk::Format::eUndefined,
-		                       vk::ImageUsageFlags {}, 1);
+		                       vk::ImageUsageFlagBits::eStorage, 1);
 		if (image->layers > 1) {
 			CreateRenderTargetView(ctx, image, VulkanImage::VIEW_STORAGE_ARRAY,
 			                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
 			                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
 			                       vk::ImageViewType::e2DArray, vk::Format::eUndefined,
-			                       vk::ImageUsageFlags {}, 1);
+			                       vk::ImageUsageFlagBits::eStorage, 1);
+		}
+	} else {
+		const auto storage_format = SrgbStorageViewFormat(image->format);
+		if (storage_format != vk::Format::eUndefined &&
+		    FormatSupportsStorage(ctx, storage_format)) {
+			CreateRenderTargetView(ctx, image, VulkanImage::VIEW_STORAGE,
+			                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
+			                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
+			                       vk::ImageViewType::e2D, storage_format,
+			                       vk::ImageUsageFlagBits::eStorage, 1);
+			if (image->layers > 1) {
+				CreateRenderTargetView(ctx, image, VulkanImage::VIEW_STORAGE_ARRAY,
+				                       vk::ComponentSwizzle::eIdentity,
+				                       vk::ComponentSwizzle::eIdentity,
+				                       vk::ComponentSwizzle::eIdentity,
+				                       vk::ComponentSwizzle::eIdentity, vk::ImageViewType::e2DArray,
+				                       storage_format, vk::ImageUsageFlagBits::eStorage, 1);
+			}
 		}
 	}
 }
@@ -119,9 +159,11 @@ void CreateDepthViews(GraphicContext* ctx, DepthStencilVulkanImage* image) {
 }
 
 void CreateVideoOutViews(GraphicContext* ctx, VideoOutVulkanImage* image) {
+	const auto default_usage = DefaultColorViewUsage(image->format, ctx);
 	CreateRenderTargetView(ctx, image, VulkanImage::VIEW_DEFAULT, vk::ComponentSwizzle::eIdentity,
 	                       vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-	                       vk::ComponentSwizzle::eIdentity);
+	                       vk::ComponentSwizzle::eIdentity, vk::ImageViewType::e2D,
+	                       vk::Format::eUndefined, default_usage);
 	if ((image->format == vk::Format::eR8G8B8A8Srgb ||
 	     image->format == vk::Format::eB8G8R8A8Srgb) &&
 	    FormatSupportsStorage(ctx, vk::Format::eR8G8B8A8Uint)) {
@@ -336,8 +378,22 @@ vk::ImageView TextureCache::GetRenderTargetStorageView(GraphicContext*          
 		     level_count, base_layer, layer_count, static_cast<int>(type),
 		     image != nullptr ? image->mip_levels : 0, image != nullptr ? image->layers : 0);
 	}
-	const bool exact      = view_format == image->format;
-	const bool compatible = view_format == BgraSrgbStorageViewFormat(image->format);
+	const bool exact = view_format == image->format;
+	const auto storage_compatible_format = SrgbStorageViewFormat(image->format);
+	const bool compatible = view_format == storage_compatible_format;
+	// Exact sRGB views cannot carry STORAGE (VUID-02275) — remap to Unorm.
+	if (exact && IsSrgbColorFormat(image->format)) {
+		if (storage_compatible_format == vk::Format::eUndefined ||
+		    !ImageViewOps::FormatSupportsStorage(ctx, storage_compatible_format)) {
+			EXIT("TextureCache: sRGB render-target has no storage-compatible view,"
+			     " image_format=%d\n",
+			     static_cast<int>(image->format));
+		}
+		return GetImageView(ctx, image,
+		                    {storage_compatible_format, type, vk::ImageAspectFlagBits::eColor,
+		                     base_level, level_count, base_layer, layer_count, DstSel(4, 5, 6, 7),
+		                     vk::ImageUsageFlagBits::eStorage});
+	}
 	if (!exact && !compatible) {
 		EXIT("TextureCache: incompatible render-target storage view, image_format=%d"
 		     " view_format=%d base=%u count=%u\n",

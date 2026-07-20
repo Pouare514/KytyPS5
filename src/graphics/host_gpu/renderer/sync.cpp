@@ -11,13 +11,19 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/displayBuffer.h"
+#include "graphics/presentation/videoOut.h"
 #include "kernel/eventQueue.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
-#include <array>
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <limits>
+#include <mutex>
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace Libs::Graphics::Sync {
 
@@ -26,6 +32,7 @@ std::atomic<uint64_t> submit_dcb {0};
 std::atomic<uint64_t> submit_acb {0};
 std::atomic<uint64_t> add_eq {0};
 std::atomic<uint64_t> eop {0};
+std::atomic<uint64_t> eop_pm4 {0};
 std::atomic<bool>     bootstrap_eop_done {false};
 std::atomic<bool>     bootstrap_seen_irq0 {false};
 std::atomic<bool>     bootstrap_seen_eop {false};
@@ -34,11 +41,13 @@ std::atomic<bool>     bootstrap_extended_irq {false};
 void NoteSubmitDcb() {
 	const auto n = submit_dcb.fetch_add(1, std::memory_order_relaxed) + 1;
 	LOGF("SubmitTrace: GraphicsDriverSubmitDcb count=%" PRIu64 "\n", n);
+	Libs::VideoOut::Phase45NoteSubmitDcb(n);
 }
 
 void NoteSubmitAcb() {
 	const auto n = submit_acb.fetch_add(1, std::memory_order_relaxed) + 1;
 	LOGF("SubmitTrace: GraphicsDriverSubmitAcb count=%" PRIu64 "\n", n);
+	Libs::VideoOut::Phase47NoteSubmitAcb(n);
 }
 
 void NoteAddEq() {
@@ -46,9 +55,24 @@ void NoteAddEq() {
 	LOGF("SubmitTrace: GraphicsDriverAddEqEvent count=%" PRIu64 "\n", n);
 }
 
-void NoteEop() {
+static const char* EopSourceName(EopSource source) {
+	switch (source) {
+		case EopSource::Pm4Eop: return "pm4_eop";
+		case EopSource::Pm4Release: return "pm4_release";
+		case EopSource::HostForce:
+		default: return "host_force";
+	}
+}
+
+void NoteEop(EopSource source) {
 	const auto n = eop.fetch_add(1, std::memory_order_relaxed) + 1;
-	LOGF("SubmitTrace: TriggerEopEvent count=%" PRIu64 "\n", n);
+	LOGF("SubmitTrace: TriggerEopEvent count=%" PRIu64 " source=%s\n", n, EopSourceName(source));
+	if (source == EopSource::Pm4Eop || source == EopSource::Pm4Release) {
+		const auto pn = eop_pm4.fetch_add(1, std::memory_order_relaxed) + 1;
+		LOGF("SubmitTrace: phase46 native_eop count=%" PRIu64 " source=%s\n", pn,
+		     EopSourceName(source));
+		Libs::VideoOut::Phase46NoteNativeEop(EopSourceName(source));
+	}
 }
 
 [[nodiscard]] bool NoSubmitsYet() {
@@ -63,18 +87,19 @@ void LogNdJobSyncTimeout() {
 		return;
 	}
 	LOGF("SubmitTrace: NdJobSyncTimeout submit_dcb=%" PRIu64 " submit_acb=%" PRIu64
-	     " add_eq=%" PRIu64 " eop=%" PRIu64 " bootstrap=%d extended=%d\n",
+	     " add_eq=%" PRIu64 " eop=%" PRIu64 " eop_pm4=%" PRIu64 " bootstrap=%d extended=%d\n",
 	     submit_dcb.load(std::memory_order_relaxed), submit_acb.load(std::memory_order_relaxed),
 	     add_eq.load(std::memory_order_relaxed), eop.load(std::memory_order_relaxed),
+	     eop_pm4.load(std::memory_order_relaxed),
 	     bootstrap_eop_done.load(std::memory_order_relaxed) ? 1 : 0,
 	     bootstrap_extended_irq.load(std::memory_order_relaxed) ? 1 : 0);
 	if (n < 8) {
 		fprintf(stderr,
 		        "SubmitTrace: NdJobSyncTimeout submit_dcb=%" PRIu64 " submit_acb=%" PRIu64
-		        " add_eq=%" PRIu64 " eop=%" PRIu64 " bootstrap=%d extended=%d\n",
+		        " add_eq=%" PRIu64 " eop=%" PRIu64 " eop_pm4=%" PRIu64 " bootstrap=%d extended=%d\n",
 		        submit_dcb.load(std::memory_order_relaxed),
 		        submit_acb.load(std::memory_order_relaxed), add_eq.load(std::memory_order_relaxed),
-		        eop.load(std::memory_order_relaxed),
+		        eop.load(std::memory_order_relaxed), eop_pm4.load(std::memory_order_relaxed),
 		        bootstrap_eop_done.load(std::memory_order_relaxed) ? 1 : 0,
 		        bootstrap_extended_irq.load(std::memory_order_relaxed) ? 1 : 0);
 	}
@@ -164,8 +189,24 @@ static void MaybeSyntheticBootstrapEop(LibKernel::EventQueue::KernelEqueue eq, i
 	TrySyntheticBootstrapIrq0(eq);
 }
 
+static void MaybeExtendedBootstrapIrq(LibKernel::EventQueue::KernelEqueue eq) {
+	if (!SubmitTrace::bootstrap_eop_done.load(std::memory_order_relaxed) ||
+	    !SubmitTrace::NoSubmitsYet() ||
+	    SubmitTrace::bootstrap_extended_irq.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	if (eq == nullptr) {
+		return;
+	}
+	LOGF("SubmitTrace: SyntheticBootstrapIrq0Extended eq=0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(eq));
+	fprintf(stderr, "SubmitTrace: SyntheticBootstrapIrq0Extended\n");
+	TriggerBootstrapIrq0(eq);
+}
+
 void OnNdJobSyncTimeout(LibKernel::EventQueue::KernelEqueue eq) {
 	SubmitTrace::LogNdJobSyncTimeout();
+	Libs::VideoOut::Phase45OnNdJobSyncTimeout(eq);
 	if (!SubmitTrace::NoSubmitsYet()) {
 		return;
 	}
@@ -245,12 +286,14 @@ enum class EndOfPipeWriteAction { Write, WriteBack, Interrupt, InterruptWriteBac
 static bool TriggerEopEventCallback(const uint64_t* args) {
 	EXIT_IF(g_render_ctx == nullptr);
 	EXIT_IF(args == nullptr);
+	SubmitTrace::NoteEop(static_cast<EopSource>(args[1]));
 	g_render_ctx->TriggerEopEvent(static_cast<uint32_t>(args[0]));
 	return true;
 }
 
 static bool TriggerDefaultEopEventCallback(const uint64_t* /*args*/) {
 	EXIT_IF(g_render_ctx == nullptr);
+	SubmitTrace::NoteEop(EopSource::Pm4Eop);
 	g_render_ctx->TriggerEopEvent(0);
 	return true;
 }
@@ -270,7 +313,8 @@ static void RecordEndOfPipeSignal(const EndOfPipeSignal& signal) {
 	                            signal.debug_args[0], signal.debug_args[1], signal.debug_args[2],
 	                            signal.debug_args[3], signal.debug_data);
 
-	const uint64_t args[LABEL_ARGS_MAX] = {signal.completion_data};
+	const uint64_t args[LABEL_ARGS_MAX] = {
+	    signal.completion_data, static_cast<uint64_t>(EopSource::Pm4Eop)};
 	switch (signal.completion) {
 		case EndOfPipeCompletion::None: return;
 		case EndOfPipeCompletion::Interrupt:
@@ -331,10 +375,11 @@ void TriggerAgcUserInterrupt() {
 	EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_ENOENT);
 }
 
-void TriggerEopEvent(uint32_t context_id) {
+void TriggerEopEvent(uint32_t context_id, EopSource source) {
 	EXIT_IF(g_render_ctx == nullptr);
-	SubmitTrace::NoteEop();
-	LOGF("SubmitTrace: TriggerEopEvent context_id=%" PRIu32 "\n", context_id);
+	SubmitTrace::NoteEop(source);
+	LOGF("SubmitTrace: TriggerEopEvent context_id=%" PRIu32 " source=%u\n", context_id,
+	     static_cast<uint32_t>(source));
 	g_render_ctx->TriggerEopEvent(context_id);
 }
 
@@ -494,10 +539,11 @@ void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer* buffer, int han
 	});
 }
 
-void TriggerEopEventAtEndOfPipe(CommandBuffer* buffer, uint32_t context_id) {
+void TriggerEopEventAtEndOfPipe(CommandBuffer* buffer, uint32_t context_id, EopSource source) {
 	ValidateEndOfPipeSignal({.buffer = buffer});
 
-	uint64_t args[LABEL_ARGS_MAX] = {static_cast<uint64_t>(context_id)};
+	uint64_t args[LABEL_ARGS_MAX] = {static_cast<uint64_t>(context_id),
+	                                 static_cast<uint64_t>(source)};
 	SubmitLabel(buffer, nullptr, TriggerEopEventCallback, args);
 }
 

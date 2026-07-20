@@ -566,55 +566,67 @@ static void Phase33DivertPumpForever() {
 	}
 }
 
-// Phase 34/44: MainThread soft-idle — continue handoff until guest RegisterBuffers2 ABI.
+// Phase 34/47: MainThread soft-idle — keep menu flips alive after guest_draw park.
 static void Phase34MainThreadSoftIdle() {
-	LOGF("GuestExit: catchReturnFromMain — phase44 soft-idle (handoff until Reg2)\n");
-	fprintf(stderr, "GuestExit: catchReturnFromMain — phase44 soft-idle\n");
+	LOGF("GuestExit: catchReturnFromMain — phase47 soft-idle (sustain flips forever)\n");
+	fprintf(stderr, "GuestExit: catchReturnFromMain — phase47 soft-idle\n");
 	std::fflush(stderr);
-	Common::LogFatalToFile("catchReturnFromMain phase44 soft-idle");
+	Common::LogFatalToFile("catchReturnFromMain phase47 soft-idle");
 	for (int tick = 0;; ++tick) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(33));
-		if (!Libs::VideoOut::Phase44GuestRegisterBuffers2Seen()) {
-			Libs::VideoOut::Phase41MenuHandoffAttempt();
-			Libs::VideoOut::Phase38NudgeBootWorkers();
+		// Always handoff/sustain — stopping after guest_draw froze presented≈60.
+		Libs::VideoOut::Phase41MenuHandoffAttempt();
+		Libs::VideoOut::Phase38NudgeBootWorkers();
+		if (Libs::VideoOut::Phase46ReadyForSoftIdle() &&
+		    !Libs::VideoOut::Phase47GuestDrawSeen()) {
+			Libs::VideoOut::Phase47PostSeedWake("mainthread-softidle");
 		}
 		(void)Libs::LibKernel::PthreadWakeSubmissionCondWaitersAfterFlip();
 		if ((tick % 30) == 0) {
 			(void)Libs::LibKernel::EventQueue::KernelTriggerUserEventForAll(0x1800, nullptr);
 			Libs::Graphics::WindowArmIgnoreQuit(60);
-			if (!Libs::VideoOut::Phase44GuestRegisterBuffers2Seen() && (tick % 300) == 0) {
-				LOGF("GuestExit: phase44 soft-idle still waiting for guest RegisterBuffers2 "
-				     "(%ds)\n",
+			if (!Libs::VideoOut::Phase47ReadyForSoftIdle() && (tick % 300) == 0) {
+				LOGF("GuestExit: phase47 soft-idle still waiting for guest_draw (%ds)\n",
 				     tick / 30);
-				fprintf(stderr, "GuestExit: phase44 still waiting Reg2 (%ds)\n", tick / 30);
+				fprintf(stderr, "GuestExit: phase47 still waiting guest_draw (%ds)\n", tick / 30);
+			} else if (Libs::VideoOut::Phase47ReadyForSoftIdle() && (tick % 300) == 0) {
+				LOGF("GuestExit: phase47 soft-idle sustain tick=%d\n", tick);
+				fprintf(stderr, "GuestExit: phase47 soft-idle sustain tick=%d\n", tick);
 			}
 		}
 	}
 }
 
-// Phase 43: anti-CRT divert — handoff until sustained menu frames (presented delta ≥30).
+// Phase 47: anti-CRT divert — handoff until menu frames + guest DRAW/DISPATCH.
 static void Phase38DeferredSoftIdle() {
-	LOGF("GuestExit: phase43 anti-CRT divert — until menu_frames_ok (no timeout park)\n");
-	fprintf(stderr, "GuestExit: phase43 anti-CRT divert — until menu_frames_ok\n");
+	LOGF("GuestExit: phase47 anti-CRT divert — until menu_frames_ok + guest_draw\n");
+	fprintf(stderr, "GuestExit: phase47 anti-CRT divert — until menu_frames + guest_draw\n");
 	std::fflush(stderr);
-	Common::LogFatalToFile("phase43 anti-CRT divert");
+	Common::LogFatalToFile("phase47 anti-CRT divert");
 	for (int i = 0;; ++i) {
-		if (Libs::VideoOut::Phase38GuestBootProgressSeen()) {
-			LOGF("GuestExit: phase43 menu_frames_ok at %dms — soft-idle park\n", i * 100);
-			fprintf(stderr, "GuestExit: phase43 menu_frames_ok — soft-idle park\n");
+		const bool frames = Libs::VideoOut::Phase38GuestBootProgressSeen();
+		const bool p47    = Libs::VideoOut::Phase47ReadyForSoftIdle();
+		if (frames && p47) {
+			LOGF("GuestExit: phase47 menu_frames+guest_draw at %dms — soft-idle park\n",
+			     i * 100);
+			fprintf(stderr, "GuestExit: phase47 ready — soft-idle park\n");
 			break;
 		}
 		if (i == 20) {
-			Libs::LibKernel::PthreadDumpAllGuestThreads("phase43 anti-CRT +2s");
+			Libs::LibKernel::PthreadDumpAllGuestThreads("phase47 anti-CRT +2s");
 		}
 		if (i > 0 && (i % 300) == 0) {
-			LOGF("GuestExit: phase43 still waiting for menu_frames_ok (%ds) — NOT soft-idle\n",
-			     i / 10);
-			fprintf(stderr, "GuestExit: phase43 still waiting %ds — NOT soft-idle\n", i / 10);
-			Common::LogFatalToFile("phase43 still waiting for menu_frames_ok");
+			LOGF("GuestExit: phase47 still waiting frames=%d guest_draw=%d (%ds) — NOT soft-idle\n",
+			     frames ? 1 : 0, p47 ? 1 : 0, i / 10);
+			fprintf(stderr, "GuestExit: phase47 still waiting frames=%d guest_draw=%d (%ds)\n",
+			        frames ? 1 : 0, p47 ? 1 : 0, i / 10);
+			Common::LogFatalToFile("phase47 still waiting for frames+guest_draw");
 		}
 		Libs::VideoOut::Phase41MenuHandoffAttempt();
 		Libs::VideoOut::Phase38NudgeBootWorkers();
+		if (Libs::VideoOut::Phase46ReadyForSoftIdle() && !p47) {
+			Libs::VideoOut::Phase47PostSeedWake("anti-crt-divert");
+		}
 		Libs::Graphics::WindowArmIgnoreQuit(60);
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 	}

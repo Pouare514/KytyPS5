@@ -503,6 +503,246 @@ static bool IsSubmissionRelatedName(const std::string& name) {
 	       name.find("Submit") != std::string::npos;
 }
 
+static bool IsMixedName(const std::string& name) {
+	return name.find("Mixed") != std::string::npos;
+}
+
+static bool IsComputeName(const std::string& name) {
+	return name.find("Compute") != std::string::npos;
+}
+
+static bool IsMainRelatedThread(const PthreadPrivate* thread) {
+	if (thread == nullptr) {
+		return false;
+	}
+	return thread->unique_id == 8 || thread->name == "MainThread" ||
+	       thread->name.find("Main") != std::string::npos ||
+	       thread->name.find("BootCards") != std::string::npos;
+}
+
+static const char* Phase54RoleOf(const PthreadPrivate* thread) {
+	if (thread == nullptr) {
+		return "?";
+	}
+	if (IsMixedName(thread->name)) {
+		return "Mixed";
+	}
+	if (IsComputeName(thread->name)) {
+		return "Compute";
+	}
+	if (IsMainRelatedThread(thread)) {
+		return "Main";
+	}
+	if (IsSubmissionRelatedName(thread->name)) {
+		return "Submit";
+	}
+	return "other";
+}
+
+struct Phase54CondTrace {
+	uintptr_t cond_ptr              = 0;
+	uint32_t  wait_n                = 0;
+	uint32_t  signal_n              = 0;
+	uint32_t  signals_from_main     = 0;
+	uint32_t  signals_from_other    = 0;
+	uint32_t  wake_mixed            = 0;
+	uint32_t  wake_compute          = 0;
+	int       last_tid              = 0;
+	char      last_by[40]           = {};
+	uint8_t   has_mixed_waiter : 1;
+	uint8_t   has_compute_waiter : 1;
+	uint8_t   role_logged_mixed : 1;
+	uint8_t   role_logged_compute : 1;
+};
+
+static constexpr size_t kPhase54CondSlots = 48;
+static Phase54CondTrace g_phase54_conds[kPhase54CondSlots] {};
+static std::mutex       g_phase54_cond_mu;
+
+static Phase54CondTrace* Phase54FindOrAddCond(uintptr_t cond_ptr) {
+	if (cond_ptr == 0) {
+		return nullptr;
+	}
+	Phase54CondTrace* free_slot = nullptr;
+	for (size_t i = 0; i < kPhase54CondSlots; i++) {
+		if (g_phase54_conds[i].cond_ptr == cond_ptr) {
+			return &g_phase54_conds[i];
+		}
+		if (free_slot == nullptr && g_phase54_conds[i].cond_ptr == 0) {
+			free_slot = &g_phase54_conds[i];
+		}
+	}
+	if (free_slot != nullptr) {
+		free_slot->cond_ptr            = cond_ptr;
+		free_slot->has_mixed_waiter    = 0;
+		free_slot->has_compute_waiter  = 0;
+		free_slot->role_logged_mixed   = 0;
+		free_slot->role_logged_compute = 0;
+		return free_slot;
+	}
+	return nullptr;
+}
+
+static void Phase54TagRoleOnce(PthreadPrivate* thread) {
+	if (thread == nullptr || !Libs::VideoOut::Phase37PostUnregisterSeen()) {
+		return;
+	}
+	static std::atomic<uint32_t> mixed_logged {0};
+	static std::atomic<uint32_t> compute_logged {0};
+	if (IsMixedName(thread->name) && mixed_logged.fetch_add(1, std::memory_order_relaxed) == 0) {
+		LOGF("SubmitTrace: phase54 role=Mixed tid=%d name=%s\n", thread->unique_id,
+		     thread->name.c_str());
+		fprintf(stderr, "SubmitTrace: phase54 role=Mixed tid=%d name=%s\n", thread->unique_id,
+		        thread->name.c_str());
+	}
+	if (IsComputeName(thread->name) &&
+	    compute_logged.fetch_add(1, std::memory_order_relaxed) == 0) {
+		LOGF("SubmitTrace: phase54 role=Compute tid=%d name=%s\n", thread->unique_id,
+		     thread->name.c_str());
+		fprintf(stderr, "SubmitTrace: phase54 role=Compute tid=%d name=%s\n", thread->unique_id,
+		        thread->name.c_str());
+	}
+}
+
+static thread_local bool g_phase54_tls_just_woken = false;
+
+static void Phase54OnCondWaitExit(PthreadPrivate* thread, PthreadCondPrivate* cond_value,
+                                  int wait_result) {
+	if (wait_result != OK || thread == nullptr || cond_value == nullptr) {
+		return;
+	}
+	if (!IsSubmissionRelatedName(thread->name) ||
+	    !Libs::VideoOut::Phase37PostUnregisterSeen()) {
+		return;
+	}
+	g_phase54_tls_just_woken = true;
+	Libs::VideoOut::Phase54NoteMixedWake(Phase54RoleOf(thread),
+	                                     reinterpret_cast<uintptr_t>(cond_value), "woken");
+}
+
+static void Phase54NoteCondWait(PthreadCondPrivate* cond, PthreadPrivate* thread) {
+	if (cond == nullptr || thread == nullptr) {
+		return;
+	}
+	Phase54TagRoleOnce(thread);
+	if (g_phase54_tls_just_woken && IsSubmissionRelatedName(thread->name) &&
+	    Libs::VideoOut::Phase37PostUnregisterSeen()) {
+		g_phase54_tls_just_woken = false;
+		Libs::VideoOut::Phase54NoteMixedWake(Phase54RoleOf(thread),
+		                                     reinterpret_cast<uintptr_t>(cond), "rewait");
+	}
+	const bool interesting = IsSubmissionRelatedName(thread->name) || IsMainRelatedThread(thread);
+	if (!interesting && !Libs::VideoOut::Phase37PostUnregisterSeen()) {
+		return;
+	}
+	uint64_t cycle = Libs::VideoOut::Phase54CurrentCycleId();
+	{
+		std::lock_guard lock(g_phase54_cond_mu);
+		auto*           tr = Phase54FindOrAddCond(reinterpret_cast<uintptr_t>(cond));
+		if (tr != nullptr) {
+			tr->wait_n++;
+			if (IsMixedName(thread->name)) {
+				tr->has_mixed_waiter = 1;
+			}
+			if (IsComputeName(thread->name)) {
+				tr->has_compute_waiter = 1;
+			}
+		}
+	}
+	if (!Libs::VideoOut::Phase37PostUnregisterSeen() && !interesting) {
+		return;
+	}
+	if (Libs::VideoOut::Phase37PostUnregisterSeen() && IsMainRelatedThread(thread)) {
+		Libs::VideoOut::Phase64NoteMainCondWait(reinterpret_cast<uint64_t>(cond));
+	}
+	if (Libs::VideoOut::Phase37PostUnregisterSeen()) {
+		const uint64_t ra = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+		Libs::VideoOut::Phase65NoteCondWait(Phase54RoleOf(thread), thread->name.c_str(),
+		                                    thread->unique_id, ra);
+	}
+	static std::atomic<uint32_t> logs {0};
+	if (logs.fetch_add(1, std::memory_order_relaxed) < 128) {
+		LOGF("SubmitTrace: phase54 cond_wait role=%s cond=0x%016" PRIx64 " cycle=%" PRIu64
+		     " tid=%d name=%s\n",
+		     Phase54RoleOf(thread), reinterpret_cast<uint64_t>(cond), cycle, thread->unique_id,
+		     thread->name.c_str());
+		fprintf(stderr,
+		        "SubmitTrace: phase54 cond_wait role=%s cond=0x%016" PRIx64 " cycle=%" PRIu64 "\n",
+		        Phase54RoleOf(thread), reinterpret_cast<uint64_t>(cond), cycle);
+	}
+}
+
+static uint64_t Phase54NoteCondSignal(PthreadCondPrivate* cond, PthreadPrivate* by, bool notify,
+                                      bool broadcast, const char* waiters_summary) {
+	if (cond == nullptr) {
+		return Libs::VideoOut::Phase54CurrentCycleId();
+	}
+	const bool from_main = IsMainRelatedThread(by);
+	bool       has_mixed = false;
+	bool       has_comp  = false;
+	uint32_t   sig_main  = 0;
+	uint32_t   wake_m    = 0;
+	uint32_t   wake_c    = 0;
+	uint64_t   cycle     = Libs::VideoOut::Phase54CurrentCycleId();
+	{
+		std::lock_guard lock(g_phase54_cond_mu);
+		auto*           tr = Phase54FindOrAddCond(reinterpret_cast<uintptr_t>(cond));
+		if (tr != nullptr) {
+			tr->signal_n++;
+			if (from_main) {
+				tr->signals_from_main++;
+			} else {
+				tr->signals_from_other++;
+			}
+			tr->last_tid = by != nullptr ? by->unique_id : 0;
+			if (by != nullptr) {
+				std::snprintf(tr->last_by, sizeof(tr->last_by), "%s", by->name.c_str());
+			}
+			has_mixed = tr->has_mixed_waiter != 0;
+			has_comp  = tr->has_compute_waiter != 0;
+			if (notify) {
+				if (has_mixed) {
+					tr->wake_mixed++;
+				}
+				if (has_comp) {
+					tr->wake_compute++;
+				}
+			}
+			sig_main = tr->signals_from_main;
+			wake_m   = tr->wake_mixed;
+			wake_c   = tr->wake_compute;
+		}
+	}
+	if ((has_mixed || has_comp) && notify) {
+		cycle = Libs::VideoOut::Phase54BumpCycle(broadcast ? "cond_broadcast" : "cond_signal");
+	}
+	const bool log_it =
+	    Libs::VideoOut::Phase37PostUnregisterSeen() || from_main || has_mixed || has_comp;
+	if (Libs::VideoOut::Phase37PostUnregisterSeen()) {
+		Libs::VideoOut::Phase64NoteMainCondSignal(reinterpret_cast<uint64_t>(cond), false);
+	}
+	if (!log_it) {
+		return cycle;
+	}
+	static std::atomic<uint32_t> logs {0};
+	if (logs.fetch_add(1, std::memory_order_relaxed) < 128) {
+		const uint64_t ra = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+		LOGF("SubmitTrace: phase54 cond_%s by=%s role=%s cond=0x%016" PRIx64
+		     " notify=%d waiters=%s cycle=%" PRIu64 " rip=0x%016" PRIx64
+		     " sig_main=%u wake_m=%u wake_c=%u tid=%d\n",
+		     broadcast ? "broadcast" : "signal", by != nullptr ? by->name.c_str() : "?",
+		     Phase54RoleOf(by), reinterpret_cast<uint64_t>(cond), notify ? 1 : 0,
+		     waiters_summary != nullptr ? waiters_summary : "-", cycle, ra, sig_main, wake_m,
+		     wake_c, by != nullptr ? by->unique_id : 0);
+		fprintf(stderr,
+		        "SubmitTrace: phase54 cond_%s by=%s cond=0x%016" PRIx64 " notify=%d cycle=%" PRIu64
+		        "\n",
+		        broadcast ? "broadcast" : "signal", by != nullptr ? by->name.c_str() : "?",
+		        reinterpret_cast<uint64_t>(cond), notify ? 1 : 0, cycle);
+	}
+	return cycle;
+}
+
 static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	EXIT_IF(cond == nullptr);
 	EXIT_IF(thread == nullptr);
@@ -510,10 +750,7 @@ static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	thread->waiting_cond = cond;
 	cond->waiters.push_back(thread);
 
-	const bool main_related =
-	    thread->unique_id == 8 || thread->name == "MainThread" ||
-	    thread->name.find("Main") != std::string::npos ||
-	    thread->name.find("BootCards") != std::string::npos;
+	const bool main_related = IsMainRelatedThread(thread);
 	if (IsSubmissionRelatedName(thread->name) || main_related) {
 		static std::atomic<uint32_t> logs {0};
 		if (logs.fetch_add(1, std::memory_order_relaxed) < 96) {
@@ -524,6 +761,7 @@ static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
 			        thread->unique_id, cond->name.c_str());
 		}
 	}
+	Phase54NoteCondWait(cond, thread);
 }
 
 static bool CondRemoveWaiter(PthreadCondPrivate* cond, Pthread thread) {
@@ -717,6 +955,7 @@ public:
 	size_t ResumeAllGuests();
 	size_t SuspendMainRelatedGuests();
 	size_t ResumeMainRelatedGuests();
+	[[nodiscard]] bool HasAliveMainThread();
 
 private:
 	std::vector<Pthread> m_threads;
@@ -1385,6 +1624,12 @@ void* PthreadStaticObjects::CreateObject(void* addr, PthreadStaticObject::Type t
 		return addr;
 	}
 
+	const uint64_t guest_va = reinterpret_cast<uint64_t>(addr);
+	if (Libs::VideoOut::Phase37PostUnregisterSeen() && PthreadCurrentIsMainRelated() &&
+	    guest_va >= 0x0000000900000000ULL && guest_va < 0x0000000a00000000ULL) {
+		Libs::VideoOut::Phase57NoteMainObjectWrite(guest_va, "CreateObject");
+	}
+
 	auto*      current       = static_cast<void**>(addr);
 	auto       current_ref   = std::atomic_ref<void*>(*current);
 	auto*      current_value = current_ref.load(std::memory_order_acquire);
@@ -1588,6 +1833,7 @@ size_t PthreadPool::WakeSubmissionCondWaiters() {
 			LOGF("SubmitTrace: WakeSubmissionCond name=%s tid=%d cond_ptr=0x%016" PRIx64 "\n",
 			     p->name.c_str(), p->unique_id, reinterpret_cast<uint64_t>(cond));
 			fprintf(stderr, "SubmitTrace: WakeSubmissionCond name=%s\n", p->name.c_str());
+			Libs::VideoOut::Phase50NoteWake(p->name.c_str(), 1);
 		}
 	}
 	return woken;
@@ -1607,6 +1853,37 @@ bool PthreadCurrentIsMainRelated() {
 	return self->unique_id == 8 || self->name == "MainThread" ||
 	       self->name.find("Main") != std::string::npos ||
 	       self->name.find("BootCards") != std::string::npos;
+}
+
+bool PthreadMainThreadAlive() {
+	auto alive_one = [](const PthreadPrivate* p) -> bool {
+		if (p == nullptr || p->free.load(std::memory_order_acquire) ||
+		    p->almost_done.load(std::memory_order_acquire) || p->host_thread_id == 0) {
+			return false;
+		}
+		return p->unique_id == 8 || p->name == "MainThread";
+	};
+	if (alive_one(g_pthread_main)) {
+		return true;
+	}
+	if (g_pthread_context == nullptr || g_pthread_context->GetPthreadPool() == nullptr) {
+		return false;
+	}
+	return g_pthread_context->GetPthreadPool()->HasAliveMainThread();
+}
+
+bool PthreadPool::HasAliveMainThread() {
+	Common::LockGuard lock(m_mutex);
+	for (auto* p: m_threads) {
+		if (p == nullptr || p->free.load(std::memory_order_acquire) ||
+		    p->almost_done.load(std::memory_order_acquire) || p->host_thread_id == 0) {
+			continue;
+		}
+		if (p->unique_id == 8 || p->name == "MainThread") {
+			return true;
+		}
+	}
+	return false;
 }
 
 void PthreadDumpSubmissionThreads(const char* reason) {
@@ -1652,6 +1929,17 @@ size_t PthreadWakeSubmissionCondWaitersAfterFlip() {
 }
 
 size_t PthreadWakeSubmissionCondWaitersUnlimited() {
+	if (!Libs::VideoOut::Phase54AllowHostWake()) {
+		static std::atomic<uint32_t> skips {0};
+		const uint32_t               sn = skips.fetch_add(1, std::memory_order_relaxed);
+		if (sn < 8 || (sn % 64) == 0) {
+			LOGF("SubmitTrace: phase54 wake_budget_skip unlimited cycle=%" PRIu64 " n=%u\n",
+			     Libs::VideoOut::Phase54CurrentCycleId(), sn);
+			fprintf(stderr, "SubmitTrace: phase54 wake_budget_skip unlimited n=%u\n", sn);
+		}
+		return 0;
+	}
+	Libs::VideoOut::Phase54NoteHostWake("unlimited");
 	if (g_pthread_context == nullptr || g_pthread_context->GetPthreadPool() == nullptr) {
 		return 0;
 	}
@@ -3097,6 +3385,7 @@ int KYTY_SYSV_ABI PthreadCondattrSetclock(PthreadCondattr* attr, KernelClockid c
 int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
 	// PRINT_NAME();
 
+	const uint64_t guest_cond_va = reinterpret_cast<uint64_t>(cond);
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
 	cond = static_cast<PthreadCond*>(
@@ -3111,13 +3400,23 @@ int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
 	int  result = 0;
 	bool notify = false;
 	bool mixed_waiter = false;
+	char waiters_buf[96] = "-";
 	{
 		std::lock_guard lock((*cond)->m);
+		size_t          wpos = 0;
+		waiters_buf[0]       = '\0';
 		for (auto* waiter: (*cond)->waiters) {
 			if (waiter != nullptr && IsSubmissionRelatedName(waiter->name)) {
 				mixed_waiter = true;
-				break;
 			}
+			if (waiter != nullptr && wpos + 24 < sizeof(waiters_buf)) {
+				wpos += static_cast<size_t>(std::snprintf(
+				    waiters_buf + wpos, sizeof(waiters_buf) - wpos, "%s%s",
+				    wpos == 0 ? "" : ",", Phase54RoleOf(waiter)));
+			}
+		}
+		if (waiters_buf[0] == '\0') {
+			std::snprintf(waiters_buf, sizeof(waiters_buf), "-");
 		}
 		if (!(*cond)->waiters.empty()) {
 			(*cond)->sequence++;
@@ -3137,6 +3436,8 @@ int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
 			        reinterpret_cast<uint64_t>(*cond), self != nullptr ? self->name.c_str() : "?");
 		}
 	}
+	(void)Phase54NoteCondSignal(*cond, g_pthread_self, notify, true, waiters_buf);
+	Libs::VideoOut::Phase56NoteMainSignal(guest_cond_va, Phase54RoleOf(g_pthread_self));
 	if (notify) {
 		(*cond)->cv.notify_all();
 	}
@@ -3216,6 +3517,7 @@ int KYTY_SYSV_ABI PthreadCondInit(PthreadCond* cond, const PthreadCondattr* attr
 int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 	// PRINT_NAME();
 
+	const uint64_t guest_cond_va = reinterpret_cast<uint64_t>(cond);
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
 	cond = static_cast<PthreadCond*>(
@@ -3230,13 +3532,23 @@ int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 	int  result = 0;
 	bool notify = false;
 	bool mixed_waiter = false;
+	char waiters_buf[96] = "-";
 	{
 		std::lock_guard lock((*cond)->m);
+		size_t          wpos = 0;
+		waiters_buf[0]       = '\0';
 		for (auto* waiter: (*cond)->waiters) {
 			if (waiter != nullptr && IsSubmissionRelatedName(waiter->name)) {
 				mixed_waiter = true;
-				break;
 			}
+			if (waiter != nullptr && wpos + 24 < sizeof(waiters_buf)) {
+				wpos += static_cast<size_t>(std::snprintf(
+				    waiters_buf + wpos, sizeof(waiters_buf) - wpos, "%s%s",
+				    wpos == 0 ? "" : ",", Phase54RoleOf(waiter)));
+			}
+		}
+		if (waiters_buf[0] == '\0') {
+			std::snprintf(waiters_buf, sizeof(waiters_buf), "-");
 		}
 		notify = CondWakeWaiter(*cond, nullptr);
 	}
@@ -3253,6 +3565,8 @@ int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 			        notify ? 1 : 0);
 		}
 	}
+	(void)Phase54NoteCondSignal(*cond, g_pthread_self, notify, false, waiters_buf);
+	Libs::VideoOut::Phase56NoteMainSignal(guest_cond_va, Phase54RoleOf(g_pthread_self));
 	if (notify) {
 		(*cond)->cv.notify_all();
 	}
@@ -3296,10 +3610,33 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 	return KERNEL_ERROR_EINVAL;
 }
 
+static void Phase55MaybeNoteGuestSync(PthreadCond* guest_cond_before, PthreadMutex* guest_mutex_before,
+                                      Pthread thread) {
+	if (thread == nullptr || !IsSubmissionRelatedName(thread->name)) {
+		return;
+	}
+	Libs::VideoOut::Phase56NoteGuestSync(reinterpret_cast<uint64_t>(guest_cond_before),
+	                                     reinterpret_cast<uint64_t>(guest_mutex_before),
+	                                     reinterpret_cast<uint64_t>(thread->arg),
+	                                     Phase54RoleOf(thread));
+}
+
+static void Phase55MaybeNoteGuestCond(PthreadCond* guest_cond_before_create, Pthread thread) {
+	if (guest_cond_before_create == nullptr || thread == nullptr ||
+	    !IsSubmissionRelatedName(thread->name)) {
+		return;
+	}
+	Libs::VideoOut::Phase55NoteGuestCond(reinterpret_cast<uint64_t>(guest_cond_before_create),
+	                                     reinterpret_cast<uint64_t>(thread->arg),
+	                                     Phase54RoleOf(thread));
+}
+
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
 	// PRINT_NAME();
 
+	const uint64_t guest_cond_va  = reinterpret_cast<uint64_t>(cond);
+	const uint64_t guest_mutex_va = reinterpret_cast<uint64_t>(mutex);
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
 	cond = static_cast<PthreadCond*>(
@@ -3320,6 +3657,10 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	if (mutex_value->owner != g_pthread_self) {
 		return KERNEL_ERROR_EPERM;
 	}
+
+	Phase55MaybeNoteGuestSync(reinterpret_cast<PthreadCond*>(guest_cond_va),
+	                          reinterpret_cast<PthreadMutex*>(guest_mutex_va), g_pthread_self);
+	Phase55MaybeNoteGuestCond(reinterpret_cast<PthreadCond*>(guest_cond_va), g_pthread_self);
 
 	std::unique_lock cond_lock(cond_value->m);
 	const auto       sequence        = cond_value->sequence;
@@ -3370,6 +3711,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	if (result == OK && thread != nullptr && !thread->name.empty()) {
 		Libs::VideoOut::Phase35TryGuestMenuFromSubmissionThread(thread->name.c_str());
 	}
+	Phase54OnCondWaitExit(thread, cond_value, result == OK ? OK : result);
 
 	int lock_result = NativeMutexLockRecurse(mutex_value, recurse);
 	if (result == OK) {
@@ -3391,6 +3733,8 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
                                           const KernelTimespec* abstime) {
 	// PRINT_NAME();
 
+	const uint64_t guest_cond_va  = reinterpret_cast<uint64_t>(cond);
+	const uint64_t guest_mutex_va = reinterpret_cast<uint64_t>(mutex);
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
 	cond = static_cast<PthreadCond*>(
@@ -3416,6 +3760,10 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 	if (mutex_value->owner != g_pthread_self) {
 		return KERNEL_ERROR_EPERM;
 	}
+
+	Phase55MaybeNoteGuestSync(reinterpret_cast<PthreadCond*>(guest_cond_va),
+	                          reinterpret_cast<PthreadMutex*>(guest_mutex_va), g_pthread_self);
+	Phase55MaybeNoteGuestCond(reinterpret_cast<PthreadCond*>(guest_cond_va), g_pthread_self);
 
 	std::unique_lock cond_lock(cond_value->m);
 	const auto       sequence        = cond_value->sequence;
@@ -3458,6 +3806,11 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
 
+	if (result == OK && thread != nullptr && !thread->name.empty()) {
+		Libs::VideoOut::Phase35TryGuestMenuFromSubmissionThread(thread->name.c_str());
+	}
+	Phase54OnCondWaitExit(thread, cond_value, result);
+
 	int lock_result = NativeMutexLockRecurse(mutex_value, recurse);
 	if (result == OK) {
 		result = lock_result;
@@ -3475,6 +3828,8 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	PRINT_NAME();
 
+	const uint64_t guest_cond_va  = reinterpret_cast<uint64_t>(cond);
+	const uint64_t guest_mutex_va = reinterpret_cast<uint64_t>(mutex);
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
 	cond = static_cast<PthreadCond*>(
@@ -3500,6 +3855,13 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	const auto       sequence        = cond_value->sequence;
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
+	if (thread != nullptr && IsSubmissionRelatedName(thread->name)) {
+		Phase55MaybeNoteGuestSync(reinterpret_cast<PthreadCond*>(guest_cond_va),
+		                          reinterpret_cast<PthreadMutex*>(guest_mutex_va), thread);
+		Libs::VideoOut::Phase55NoteGuestCond(guest_cond_va,
+		                                     reinterpret_cast<uint64_t>(thread->arg),
+		                                     Phase54RoleOf(thread));
+	}
 	CondAddWaiter(cond_value, thread);
 
 	uint32_t recurse = 0;
@@ -3528,6 +3890,7 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	if (thread != nullptr && !thread->name.empty()) {
 		Libs::VideoOut::Phase35TryGuestMenuFromSubmissionThread(thread->name.c_str());
 	}
+	Phase54OnCondWaitExit(thread, cond_value, OK);
 
 	result = NativeMutexLockRecurse(mutex_value, recurse);
 
@@ -3725,6 +4088,11 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 		created_thread->almost_done     = false;
 		created_thread->detached        = created_thread->attr->detached;
 		created_thread->unique_id       = -1;
+
+		// Phase 55: arm Mixed/Compute entry trampoline before first run.
+		if (reinterpret_cast<uint64_t>(entry) == Libs::VideoOut::kPhase55MixedEntry) {
+			Libs::VideoOut::Phase55TryArmMixedThunk();
+		}
 
 		result =
 		    pthread_create(&created_thread->p, &created_thread->attr->p, RunThread, created_thread);

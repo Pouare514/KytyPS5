@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/textureCache.h"
 
+#include "graphics/host_gpu/guestImageWriteTracker.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -11,6 +12,7 @@
 #include "graphics/host_gpu/objects/label.h"
 #include "graphics/host_gpu/objects/textureCommon.h"
 #include "graphics/host_gpu/renderer/bufferCache.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/dummyTextureCache.h"
 #include "graphics/host_gpu/renderer/image.h"
 #include "graphics/host_gpu/renderer/imageView.h"
@@ -24,6 +26,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -1207,6 +1211,7 @@ VulkanImage* TextureCache::FindTexture(CommandBuffer* command, GraphicContext* c
 			}
 		}
 		const bool buffer_dirty = match->buffer_modified;
+		const bool write_gen_stale = GuestImageWriteTracker::NeedsReupload(info.address);
 		if (buffer_dirty) {
 			if (match->gpu_modified ||
 			    !IsCoherentGuestImageSource(source, info.address, info.size)) {
@@ -1218,7 +1223,7 @@ VulkanImage* TextureCache::FindTexture(CommandBuffer* command, GraphicContext* c
 			}
 			m_memory_tracker.MarkRegionAsCpuModified(info.address, info.size);
 		}
-		if (match->info.IsCpuDirty() || buffer_dirty) {
+		if (match->info.IsCpuDirty() || buffer_dirty || write_gen_stale) {
 			m_memory_tracker.ForEachUploadRange(
 			    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
 			    [&]() noexcept {
@@ -1228,6 +1233,10 @@ VulkanImage* TextureCache::FindTexture(CommandBuffer* command, GraphicContext* c
 			    });
 			if (match->info.IsCpuDirty()) {
 				match->info.RefreshComplete();
+			}
+			int64_t gen = 0;
+			if (GuestImageWriteTracker::TryGetWriteGeneration(info.address, &gen)) {
+				GuestImageWriteTracker::RecordUploadedGeneration(info.address, gen);
 			}
 			match->buffer_modified = false;
 		}
@@ -1270,6 +1279,11 @@ VulkanImage* TextureCache::FindTexture(CommandBuffer* command, GraphicContext* c
 		    m_tiler.DetileImage(cached->ctx, static_cast<GpuTextureVulkanImage*>(cached->image),
 		                        cached->info, source, false, false);
 	    });
+	GuestImageWriteTracker::Track(info.address, info.size);
+	int64_t gen = 0;
+	if (GuestImageWriteTracker::TryGetWriteGeneration(info.address, &gen)) {
+		GuestImageWriteTracker::RecordUploadedGeneration(info.address, gen);
+	}
 	ImageOps::CreateTextureViews(ctx, static_cast<GpuTextureVulkanImage*>(cached->image), info,
 	                             false, components);
 	return PublishImage(command, std::move(cached));
@@ -1881,7 +1895,7 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 	}
 	auto cached                 = std::make_shared<CachedImage>();
 	cached->kind                = CachedImage::Kind::DepthTarget;
-	cached->depth               = bind_info;
+	cached->depth               = info;
 	cached->ctx                 = ctx;
 	cached->stencil_initialized = !has_stencil;
 	cached->image               = ImageOps::CreateDepthTarget(ctx, info);
@@ -1978,10 +1992,10 @@ DepthStencilVulkanImage* TextureCache::FindDepthTarget(CommandBuffer* command, G
 			m_memory_tracker.ForEachUploadRange(
 			    info.stencil_address, info.stencil_size, false, [](uint64_t, uint64_t) noexcept {},
 			    [&]() noexcept {
-				    if (!bind_info.stencil_load_clear) {
+				    if (!info.stencil_load_clear) {
 					    m_tiler.DetileStencil(ctx,
 					                          static_cast<DepthStencilVulkanImage*>(cached->image),
-					                          bind_info, stencil_source, false);
+					                          info, stencil_source, false);
 				    }
 			    });
 			cached->stencil_initialized = true;
@@ -2036,6 +2050,7 @@ TextureCache::RegisterVideoOutSurfaces(GraphicContext*                  ctx,
 		cached->video_out = info;
 		cached->ctx       = ctx;
 		cached->image     = ImageOps::CreateVideoOut(ctx, info);
+		GuestImageWriteTracker::Track(info.address, info.size);
 		if (info.compression == VideoOutCompression::Uncompressed) {
 			m_memory_tracker.ForEachUploadRange(
 			    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
@@ -2043,6 +2058,10 @@ TextureCache::RegisterVideoOutSurfaces(GraphicContext*                  ctx,
 				    ImageOps::UploadVideoOut(ctx, static_cast<VideoOutVulkanImage*>(cached->image),
 				                             info, false);
 			    });
+			int64_t gen = 0;
+			if (GuestImageWriteTracker::TryGetWriteGeneration(info.address, &gen)) {
+				GuestImageWriteTracker::RecordUploadedGeneration(info.address, gen);
+			}
 		} else {
 			// A compressed guest surface cannot be decoded without its DCC metadata. Establish the
 			// normal tracked range, but leave the shared native image to be initialized by a GPU
@@ -2074,7 +2093,8 @@ void TextureCache::RefreshVideoOut(VideoOutVulkanImage* image, bool render_targe
 	}
 	auto& cached = **it;
 	const auto& info = cached.video_out;
-	if (cached.gpu_modified) {
+	const bool write_gen_stale = GuestImageWriteTracker::NeedsReupload(info.address);
+	if (cached.gpu_modified && !write_gen_stale) {
 		if (boot_trace_log()) {
 			LOGF("VideoOutTrace: Refresh skip gpu_modified addr=0x%016" PRIx64
 			     " render_target=%d for_present=%d\n",
@@ -2083,20 +2103,34 @@ void TextureCache::RefreshVideoOut(VideoOutVulkanImage* image, bool render_targe
 		return;
 	}
 	if (for_present && !m_memory_tracker.IsRegionCpuModified(info.address, info.size) &&
-	    !cached.buffer_modified) {
+	    !cached.buffer_modified && !write_gen_stale) {
 		if (boot_trace_log()) {
 			LOGF("VideoOutTrace: Refresh skip present gpu addr=0x%016" PRIx64 "\n",
 			     info.address);
 		}
 		return;
 	}
-	const bool  image_dirty  = m_memory_tracker.IsRegionCpuModified(info.address, info.size);
+	const bool  image_dirty  = m_memory_tracker.IsRegionCpuModified(info.address, info.size) ||
+	                           write_gen_stale;
 	const bool  buffer_dirty = cached.buffer_modified ||
 	                           m_buffer_cache.IsRegionCpuModified(info.address, info.size) ||
 	                           m_buffer_cache.IsRegionGpuModified(info.address, info.size);
 	if (!image_dirty && !buffer_dirty) {
 		if (info.compression == VideoOutCompression::Uncompressed ||
 		    CanUseVideoOutNativeWithoutUpload(info.compression, render_target, false, false)) {
+			if (CanUseVideoOutNativeWithoutUpload(info.compression, render_target, false,
+			                                      false)) {
+				static std::atomic<bool> phase46_dcc_native_logged {false};
+				if (!phase46_dcc_native_logged.exchange(true, std::memory_order_acq_rel)) {
+					LOGF("FlipTrace: phase46 dcc native videoout addr=0x%016" PRIx64
+					     " compression=%d render_target=%d\n",
+					     info.address, static_cast<int>(info.compression),
+					     render_target ? 1 : 0);
+					fprintf(stderr,
+					        "FlipTrace: phase46 dcc native compression=%d\n",
+					        static_cast<int>(info.compression));
+				}
+			}
 			if (boot_trace_log()) {
 				LOGF("VideoOutTrace: Refresh noop addr=0x%016" PRIx64 " render_target=%d\n",
 				     info.address, render_target ? 1 : 0);
@@ -2132,6 +2166,16 @@ void TextureCache::RefreshVideoOut(VideoOutVulkanImage* image, bool render_targe
 	m_memory_tracker.ForEachUploadRange(
 	    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
 	    [&]() noexcept { ImageOps::UploadVideoOut(cached.ctx, image, info, true); });
+	int64_t gen = 0;
+	if (GuestImageWriteTracker::TryGetWriteGeneration(info.address, &gen)) {
+		GuestImageWriteTracker::RecordUploadedGeneration(info.address, gen);
+		static std::atomic<int> wg_log {0};
+		if (write_gen_stale && wg_log.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("FlipTrace: phase48 write_gen reupload addr=0x%016" PRIx64 " gen=%" PRId64 "\n",
+			     info.address, gen);
+			fprintf(stderr, "FlipTrace: phase48 write_gen reupload gen=%" PRId64 "\n", gen);
+		}
+	}
 }
 
 void TextureCache::UnregisterVideoOutSurfaces(const std::vector<VideoOutVulkanImage*>& images) {

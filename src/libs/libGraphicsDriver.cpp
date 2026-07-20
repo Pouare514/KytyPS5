@@ -1,9 +1,12 @@
 #include "common/abi.h"
+#include "graphics/presentation/videoOut.h"
+#include "kernel/pthread.h"
 #include "libs/agc.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
 #include <atomic>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 
@@ -194,6 +197,8 @@ LIB_DEFINE(InitGraphicsDriver_1) {
 	LIB_FUNC("X-Nm5KLREeg", Gen5::GraphicsDriverRegisterOwner);
 	LIB_FUNC("W5z4eZrjEas", Gen5::GraphicsDriverRegisterResource);
 	LIB_FUNC("pWLG7WOpVcw", Gen5::GraphicsDriverUnregisterResource);
+	LIB_FUNC("ZLJk9r2+2Aw", Gen5::GraphicsDriverUnregisterOwnerAndResources);
+	LIB_FUNC("SCoAN5fYlUM", Gen5::GraphicsDriverUnregisterAllResourcesForOwner);
 	LIB_FUNC("3AyTaWcF-H8", Gen5::GraphicsDriverRegisterWorkloadStream);
 
 	LIB_FUNC("LtTouSCZjHM", Gen5::GraphicsCbNop);
@@ -326,26 +331,78 @@ namespace LibAgcDriver {
 
 LIB_VERSION("AgcDriver", 1, "AgcDriver", 1, 1);
 
+namespace Gen5       = Graphics::Gen5;
 namespace Gen5Driver = Graphics::Gen5Driver;
 
 // Soft-stub for TLOU AgcDriver_v1 NIDs that have no Graphics5Driver alias yet.
-// Always logs so Mixed Submission blockers are visible (Phase 22 soft-stubs were silent/never hit).
+// Phase 54: fail-soft — 1st Main/BootCards hit = candidate_nid log only; 2nd same NID = HLE.
+static std::atomic<const char*> g_phase54_candidate_nid {nullptr};
+static std::atomic<uint32_t>    g_phase54_candidate_hits {0};
+static std::atomic<bool>        g_phase54_hle_armed {false};
+
+static uint64_t Phase54AgcStubHit(const char* nid, uint64_t a0, uint64_t a1, uint64_t a2,
+                                  uint64_t a3) {
+	static std::atomic<uint32_t> call_count {0};
+	const auto                   n = call_count.fetch_add(1, std::memory_order_relaxed);
+	const bool post_unreg = Libs::VideoOut::Phase37PostUnregisterSeen();
+	const bool main_rel   = LibKernel::PthreadCurrentIsMainRelated();
+	const int  tid        = Common::Thread::GetThreadIdUnique();
+	const uint64_t ra     = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+	const uint64_t cycle  = Libs::VideoOut::Phase54CurrentCycleId();
+
+	if (post_unreg && (n < 96 || main_rel)) {
+		LOGF("SubmitTrace: phase54 AgcDriverStub nid=%s call=%u tid=%d main=%d "
+		     "cycle=%" PRIu64 " a0=0x%016" PRIx64 " a1=0x%016" PRIx64 " a2=0x%016" PRIx64
+		     " a3=0x%016" PRIx64 " rip=0x%016" PRIx64 "\n",
+		     nid != nullptr ? nid : "?", n, tid, main_rel ? 1 : 0, cycle, a0, a1, a2, a3, ra);
+		fprintf(stderr,
+		        "SubmitTrace: phase54 AgcDriverStub nid=%s tid=%d main=%d cycle=%" PRIu64 "\n",
+		        nid != nullptr ? nid : "?", tid, main_rel ? 1 : 0, cycle);
+	} else if (!post_unreg && n < 64) {
+		LOGF("AgcDriverStub: NID=%s call=%u\n", nid != nullptr ? nid : "?", n);
+		fprintf(stderr, "AgcDriverStub: NID=%s call=%u\n", nid != nullptr ? nid : "?", n);
+	}
+
+	if (post_unreg) {
+		Libs::VideoOut::Phase59NoteStubArgs(nid, a0, a1, a2, a3);
+	}
+	if (post_unreg && main_rel) {
+		Libs::VideoOut::Phase57NoteMainAgcTouch(nid, a0, a1, a2, a3);
+	}
+
+	if (post_unreg && main_rel && nid != nullptr) {
+		const char* cand = g_phase54_candidate_nid.load(std::memory_order_acquire);
+		if (cand == nullptr) {
+			g_phase54_candidate_nid.store(nid, std::memory_order_release);
+			g_phase54_candidate_hits.store(1, std::memory_order_release);
+			LOGF("SubmitTrace: phase54 candidate_nid=%s (1st Main hit, log only)\n", nid);
+			fprintf(stderr, "SubmitTrace: phase54 candidate_nid=%s\n", nid);
+		} else if (std::strcmp(cand, nid) == 0) {
+			const uint32_t hits =
+			    g_phase54_candidate_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (hits >= 2 && !g_phase54_hle_armed.exchange(true, std::memory_order_acq_rel)) {
+				LOGF("SubmitTrace: phase54 hle_arm nid=%s hits=%u (fail-soft)\n", nid, hits);
+				fprintf(stderr, "SubmitTrace: phase54 hle_arm nid=%s\n", nid);
+			}
+		}
+	}
+
+	if (g_phase54_hle_armed.load(std::memory_order_acquire)) {
+		const char* cand = g_phase54_candidate_nid.load(std::memory_order_acquire);
+		if (cand != nullptr && nid != nullptr && std::strcmp(cand, nid) == 0) {
+			// SharpEmu-aligned soft accept: many AgcDriver helpers treat 0 as OK.
+			return 0;
+		}
+	}
+	return 0;
+}
+
 #define KYTY_AGC_DRIVER_STUB(fn)                                                                   \
 	static KYTY_SYSV_ABI uint64_t fn(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,            \
 	                                 uint64_t a4, uint64_t a5) {                                    \
-		(void)a0;                                                                                  \
-		(void)a1;                                                                                  \
-		(void)a2;                                                                                  \
-		(void)a3;                                                                                  \
 		(void)a4;                                                                                  \
 		(void)a5;                                                                                  \
-		static std::atomic<uint32_t> call_count {0};                                               \
-		const auto                   n = call_count.fetch_add(1, std::memory_order_relaxed);       \
-		LOGF("AgcDriverStub: NID=%s call=%u\n", #fn, n);                                           \
-		if (n < 64) {                                                                              \
-			fprintf(stderr, "AgcDriverStub: NID=%s call=%u\n", #fn, n);                            \
-		}                                                                                          \
-		return 0;                                                                                  \
+		return Phase54AgcStubHit(#fn, a0, a1, a2, a3);                                             \
 	}
 
 KYTY_AGC_DRIVER_STUB(AgcDriverStub_Xq5WmbwPTnQ)
@@ -356,8 +413,6 @@ KYTY_AGC_DRIVER_STUB(AgcDriverStub_plus_TN0oRTBxJQ)
 KYTY_AGC_DRIVER_STUB(AgcDriverStub_rJUyMrDdxJg)
 KYTY_AGC_DRIVER_STUB(AgcDriverStub_n5ElQVYsU1A)
 KYTY_AGC_DRIVER_STUB(AgcDriverStub_emP3ckeS2uo)
-KYTY_AGC_DRIVER_STUB(AgcDriverStub_ZLJk9r2_2Aw)
-KYTY_AGC_DRIVER_STUB(AgcDriverStub_SCoAN5fYlUM)
 KYTY_AGC_DRIVER_STUB(AgcDriverStub_5l3IfCFJxBs)
 KYTY_AGC_DRIVER_STUB(AgcDriverStub_M9yBzRKkjPc)
 KYTY_AGC_DRIVER_STUB(AgcDriverStub_rI9lNAXPMIw)
@@ -399,8 +454,8 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("rJUyMrDdxJg", AgcDriverStub_rJUyMrDdxJg);
 	LIB_FUNC("n5ElQVYsU1A", AgcDriverStub_n5ElQVYsU1A);
 	LIB_FUNC("emP3ckeS2uo", AgcDriverStub_emP3ckeS2uo);
-	LIB_FUNC("ZLJk9r2+2Aw", AgcDriverStub_ZLJk9r2_2Aw);
-	LIB_FUNC("SCoAN5fYlUM", AgcDriverStub_SCoAN5fYlUM);
+	LIB_FUNC("ZLJk9r2+2Aw", Gen5::GraphicsDriverUnregisterOwnerAndResources);
+	LIB_FUNC("SCoAN5fYlUM", Gen5::GraphicsDriverUnregisterAllResourcesForOwner);
 	LIB_FUNC("5l3IfCFJxBs", AgcDriverStub_5l3IfCFJxBs);
 	LIB_FUNC("M9yBzRKkjPc", AgcDriverStub_M9yBzRKkjPc);
 	LIB_FUNC("rI9lNAXPMIw", AgcDriverStub_rI9lNAXPMIw);

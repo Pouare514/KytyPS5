@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/presentation/videoOut.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -371,6 +372,10 @@ int KYTY_SYSV_ABI KernelSignalSema(KernelSema sem, int count) {
 			LOGF("SubmitTrace: MixedSignalSema name=%s tid=%d sem=%s count=%d\n", name,
 			     PthreadGetUniqueId(self), sem->GetName().c_str(), count);
 		}
+	}
+	if (Libs::VideoOut::Phase37PostUnregisterSeen() && PthreadCurrentIsMainRelated()) {
+		Libs::VideoOut::Phase55NoteMainWakeAlt(
+		    "SignalSema", reinterpret_cast<uint64_t>(sem), static_cast<uint64_t>(count));
 	}
 
 	auto result = sem->Signal(count);

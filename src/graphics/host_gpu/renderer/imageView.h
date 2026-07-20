@@ -169,6 +169,12 @@ IsSupportedSampledDepthUintResource(const ShaderRecompiler::IR::ImageResource& r
 	       !resource.written && !resource.atomic && !resource.depth_compare;
 }
 
+[[nodiscard]] inline bool IsSrgbStorageView(vk::Format image_format, vk::Format view_format,
+                                            uint32_t swizzle) noexcept {
+	return view_format == SrgbStorageViewFormat(image_format) &&
+	       (swizzle == DstSel(4, 5, 6, 7) || IsBgraSrgbStorageView(image_format, view_format, swizzle));
+}
+
 [[nodiscard]] inline int SelectStorageColorView(vk::Format image_format, vk::Format view_format,
                                                 uint32_t swizzle) noexcept {
 	const bool single_channel =
@@ -183,8 +189,7 @@ IsSupportedSampledDepthUintResource(const ShaderRecompiler::IR::ImageResource& r
 	    ((view_format == vk::Format::eR8G8B8A8Unorm || view_format == vk::Format::eR8G8B8A8Uint) &&
 	     (swizzle == DstSel(4, 5, 6, 1) || swizzle == DstSel(6, 5, 4, 7))) ||
 	    (view_format == vk::Format::eR32G32B32A32Sfloat && swizzle == DstSel(5, 6, 7, 4));
-	if ((image_format != view_format &&
-	     !IsBgraSrgbStorageView(image_format, view_format, swizzle)) ||
+	if ((image_format != view_format && !IsSrgbStorageView(image_format, view_format, swizzle)) ||
 	    !swizzle_ok) {
 		UnsupportedColorView("storage", image_format, view_format, swizzle);
 	}

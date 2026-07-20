@@ -86,6 +86,7 @@ $RECYCLE.BIN/
 _ImportReport.txt
 *_pipeline_*.log
 *_buffer_*.log
+TLOU_AGC_*.md
 
 # Local build transcripts (redirected compiler output, not *.log)
 /build-log*.txt
