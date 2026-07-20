@@ -137,7 +137,7 @@ config_compiler_and_linker()
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory(common)
 
-file(GLOB kyty_emulator_src
+file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	libs/*.cpp
 	libs/*.h
 	graphics/*.cpp
@@ -174,40 +174,17 @@ list(APPEND kyty_emulator_src
 	emulator.h
 	emulator.cpp
 )
-# clang-cl does not assemble .S via CMake ASM; build with clang driver explicitly.
-if (WIN32)
-	set(_kyty_fiber_s "${CMAKE_CURRENT_SOURCE_DIR}/libs/fiberContext_win.S")
-	set(_kyty_fiber_obj "${CMAKE_CURRENT_BINARY_DIR}/fiberContext_win.obj")
-	find_program(KYTY_CLANG_ASM NAMES clang clang.exe REQUIRED)
-	add_custom_command(
-		OUTPUT "${_kyty_fiber_obj}"
-		COMMAND "${KYTY_CLANG_ASM}" -c -target x86_64-pc-windows-msvc
-			-o "${_kyty_fiber_obj}" "${_kyty_fiber_s}"
-		DEPENDS "${_kyty_fiber_s}"
-		COMMENT "Assembling fiberContext_win.S"
-		VERBATIM
-	)
-	list(APPEND kyty_emulator_src "${_kyty_fiber_obj}")
-endif()
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
 if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common vulkan-1 spirv-tools-opt spirv-tools SDL2-static xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9)
 
 set(inc_headers
 	${CMAKE_CURRENT_SOURCE_DIR}
 	${KYTY_THIRD_PARTY_DIR}/SDL2/include
-)
-
-if(DEFINED ENV{VULKAN_SDK})
-	list(APPEND inc_headers $ENV{VULKAN_SDK}/Include)
-endif()
-
-list(APPEND inc_headers
-	${KYTY_THIRD_PARTY_DIR}/Vulkan-Headers/include
 	${KYTY_THIRD_PARTY_DIR}/VulkanMemoryAllocator/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
@@ -255,7 +232,6 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	../tests/PageManagerTests.cpp
 	graphics/host_gpu/pageManager.cpp
 )
-target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
 
 add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
@@ -308,29 +284,17 @@ add_executable(resource_mutex_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_mutex_tests common)
 target_include_directories(resource_mutex_tests PRIVATE ${inc_headers})
 
+add_executable(image_page_table_tests EXCLUDE_FROM_ALL
+	../tests/ImagePageTableTests.cpp
+)
+target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests ../tests/ShaderRecompilerComputeTests.cpp)
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests ../tests/VirtualMemoryAllocationTests.cpp)
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
-set(KYTY_TEST_TARGETS
-	shader_cfg_tests
-	scalar_provenance_tests
-	page_manager_tests
-	memory_tracker_tests
-	shader_vertex_metadata_tests
-	shader_stage_runtime_tests
-	resource_tracking_tests
-	resource_mutex_tests
-	shader_recompiler_compute_tests
-	virtual_memory_allocation_tests
-)
-
-enable_testing()
-foreach(test_target IN LISTS KYTY_TEST_TARGETS)
-	add_test(NAME ${test_target} COMMAND ${test_target})
-endforeach()
 
 add_executable(kyty_emulator main.cpp ${kyty_emulator_src})
 
@@ -359,7 +323,7 @@ set(KYTY_EMULATOR_MAP_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/${KYTY_EMULATOR_MAP
 set(KYTY_EMULATOR_PDB_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/kyty_emulator.pdb")
 
 if(KYTY_CLANG_CL)
-	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "/DYNAMICBASE:NO /CETCOMPAT:NO /DEBUG:FULL /PDB:${KYTY_EMULATOR_PDB_LINK_PATH} /lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}")
+	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "/DYNAMICBASE:NO /DEBUG:FULL /PDB:${KYTY_EMULATOR_PDB_LINK_PATH} /lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}")
 	add_custom_command(TARGET kyty_emulator POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:kyty_emulator>/libwinpthread-1.dll)
 elseif(WIN32 OR LINUX)
 	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS} -Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")

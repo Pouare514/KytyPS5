@@ -62,6 +62,17 @@ Code contributions should be focused, build successfully on Windows, and include
 where practical. Because KytyPS5 is still evolving quickly, consider opening an issue before
 starting a large change.
 
+### Formatting
+
+Set up the clang-format hook after cloning:
+
+```powershell
+python -m pip install pre-commit
+python -m pre_commit install --install-hooks
+```
+
+It formats staged `.cpp`, `.h`, and `.inc` files in `src`.
+
 ## Developer Information
 
 The PS5 graphics architecture is based on AMD RDNA 2. Use AMD's
@@ -95,9 +106,6 @@ the Vulkan/SPIR-V validation rules.
 - Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
   **C++ Clang tools for Windows** component
 - Qt 6 for MSVC 2022 64-bit, including Concurrent, Network, and Widgets
-- Vulkan SDK 1.4.350 (same version as CI and `scripts/build-windows.cmd`). Set `VULKAN_SDK` to the SDK
-  root (e.g. `C:\VulkanSDK\1.4.350.0`); CMake expects `Lib\vulkan-1.lib` under that path. CI
-  verifies this before configuring.
 
 The Microsoft C++ compiler (`cl.exe`) is not supported; use `clang-cl`.
 
@@ -111,18 +119,18 @@ git submodule update --init --recursive
 Configure the project. Replace the Qt path with the version installed on your system:
 
 ```powershell
-cmake -S src -B build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64"
+cmake -S src -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64"
 ```
 
 Build the launcher and stage a runnable installation:
 
 ```powershell
-cmake --build build/windows --target launcher
-cmake --install build/windows --prefix build/windows/install
+cmake --build _Build/windows --target launcher
+cmake --install _Build/windows --prefix _Build/windows/install
 ```
 
 The finished application and its runtime dependencies will be placed in
-`build/windows/install`.
+`_Build/windows/install`.
 
 ### Visual Studio Code
 
@@ -147,7 +155,7 @@ Update your graphics driver before reporting rendering problems.
 To use the graphical launcher:
 
 ```powershell
-.\build\windows\install\launcher.exe
+.\_Build\windows\install\launcher.exe
 ```
 
 On first launch, add one or more game folders in the global settings. The launcher searches those
@@ -157,102 +165,11 @@ from the game list.
 The emulator can also be started directly with a legally obtained game directory or ELF file:
 
 ```powershell
-.\build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
+.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
 ```
 
 Run `kyty_emulator.exe --help` to see the available graphics, logging, validation, profiling, and
 debugging options.
-
-### Troubleshooting
-
-#### Crash at startup with `loader_get_json: Failed to open JSON file ... medal-vulkan64.json`
-
-This happens when a third-party Vulkan layer (commonly [Medal](https://medal.tv/)) is registered in
-Windows but its manifest JSON file is missing, often after an update or partial uninstall. Orphaned
-registry entries can remain even after Medal is removed.
-
-**Automatic fix (kyty_emulator / launcher):** at startup the process sets `VK_LOADER_LAYERS_DISABLE`
-to skip known third-party layers (Medal, NVIDIA capture `*nvspcap*`, Steam overlay, Discord, OBS).
-Other applications are unaffected; only this process skips them.
-
-Boot logs include `VulkanLayerTrace:` lines listing available layers and the effective disable list.
-
-**Option A — Disable Vulkan validation** (fastest if issues persist):
-
-In the launcher, uncheck **Enable Vulkan validation layers**, or run:
-
-```powershell
-.\build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame" --vulkan-validation false
-```
-
-**Option B — Fix Medal**:
-
-Reinstall or update Medal, disable Vulkan capture in Medal settings, or uninstall Medal if unused.
-
-**Option C — Manual layer disable** (only if automatic disable is insufficient):
-
-```powershell
-$env:VK_LOADER_LAYERS_DISABLE = "VK_LAYER_MEDAL_capture,VK_LAYER_MEDAL_HOOK,*nvspcap*,~implicit~"
-.\build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
-```
-
-#### NVIDIA / Steam overlay and crash `0xC0000409`
-
-GeForce Experience / NVIDIA App in-game overlay and other implicit Vulkan layers can hook
-`vkQueuePresentKHR` and trigger native crashes (`-1073740791` / `0xC0000409`).
-
-**Quick test:**
-
-1. Disable **In-Game Overlay** in NVIDIA App / GeForce Experience.
-2. Or run with all implicit layers disabled:
-
-```powershell
-$env:VK_LOADER_LAYERS_DISABLE = "~implicit~"
-.\build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame" --vulkan-validation false
-```
-
-Fatal crash details are appended to `_kyty_fatal.txt` (and the `--printf-output-file` if set):
-`Fatal win exception: rip=..., module=...` or `Security failure: retaddr=..., module=...`.
-
-**Registry cleanup:** if Medal errors still appear, remove stale keys under
-`HKCU\Software\Khronos\Vulkan\ImplicitLayers` that point to `%LocalAppData%\Medal\`.
-
-Recent builds log general loader errors without exiting, but disabling the broken layer or
-validation avoids the noise entirely.
-
-#### `C++ exception (0xe06d7363)` or game closes without `GameMainLoop: exit...`
-
-`0xe06d7363` is the Windows code for MSVC C++ `throw`. KytyPS5 no longer logs these on first
-chance — they are usually caught internally (Vulkan validation, shader compiler, Qt) and are not
-fatal by themselves.
-
-If the game window closes without a clean exit message, capture a diagnostic log:
-
-```powershell
-.\build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame" `
-  --vulkan-validation false --printf-direction File --printf-output-file _kyty.txt 2> _kyty_stderr.txt
-echo $LASTEXITCODE
-```
-
-| Exit code | Meaning |
-|-----------|---------|
-| `0` | Clean exit |
-| `-1073740791` (`0xC0000409`) | Stack buffer overrun — check `_kyty_fatal.txt`, `_kyty_stderr.txt` for `Security failure:` (retaddr) or `_kyty.txt` for `Fatal win exception:` |
-
-Compare with `--vulkan-validation true` to see whether the Vulkan validation layer is involved.
-Recent builds print `Fatal win exception: code=..., rip=..., module=...` before an unhandled crash,
-and `Security failure: code=..., retaddr=...` when the MSVC `/GS` cookie trips before `__fastfail`.
-
-#### Hybrid laptop GPU (Intel + NVIDIA / AMD)
-
-On startup, KytyPS5 prints `Vulkan selected device: ...`. If you have a discrete GPU (e.g. RTX 4080)
-but see Intel integrated graphics instead, Windows may be running the emulator on the wrong GPU.
-
-**Automatic fix:** recent builds export `NvOptimusEnablement` / `AmdPowerXpressRequestHighPerformance`
-so the discrete GPU is preferred.
-
-**Manual fix:** Windows Settings → System → Display → Graphics → add `kyty_emulator.exe` →
-**High performance** (NVIDIA / AMD).
 
 ### AI Use
 

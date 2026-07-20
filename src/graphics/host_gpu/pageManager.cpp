@@ -43,9 +43,9 @@ thread_local bool g_in_fault_resolution = false;
 	if (written < 0) {
 		written = 0;
 	}
-	void* frames[16] {};
-	const auto frame_count = CaptureStackBackTrace(0, static_cast<DWORD>(std::size(frames)), frames,
-	                                               nullptr);
+	void*      frames[16] {};
+	const auto frame_count =
+	    CaptureStackBackTrace(0, static_cast<DWORD>(std::size(frames)), frames, nullptr);
 	const auto image_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
 	for (uint16_t i = 0; i < frame_count && written < static_cast<int>(sizeof(message)) - 1; i++) {
 		const auto address = reinterpret_cast<uintptr_t>(frames[i]);
@@ -654,17 +654,17 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 			if (access != PageFaultAccess::Read && access != PageFaultAccess::Write) {
 				return false;
 			}
-			bool& pending = (access == PageFaultAccess::Read ? page.late_read_pending
-			                                                 : page.late_write_pending);
+			bool&      pending = (access == PageFaultAccess::Read ? page.late_read_pending
+			                                                      : page.late_write_pending);
 			const bool allowed = Impl::AllowsAccess(fault_vaddr, access);
 			pending            = false;
 			if (waited && !allowed) {
 				FailFast("page remained inaccessible after waiting for its resolver");
 			}
 			// More than one CPU can fault before a protection transition becomes visible. The first
-			// delayed fault consumes the hint bit; later faults must also resume once the mapped page
-			// already permits the requested access. A genuinely read-only/no-access page still falls
-			// through to the guest exception path.
+			// delayed fault consumes the hint bit; later faults must also resume once the mapped
+			// page already permits the requested access. A genuinely read-only/no-access page still
+			// falls through to the guest exception path.
 			return allowed;
 		}
 		if ((access != PageFaultAccess::Read && access != PageFaultAccess::Write) ||

@@ -31,8 +31,9 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
-#include "graphics/host_gpu/utils.h"
+#include "graphics/host_gpu/transfer.h"
 #include "graphics/host_gpu/vma.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -49,7 +50,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <vulkan/vk_enum_string_helper.h>
 #include <vulkan/vk_platform.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -1196,7 +1196,7 @@ void WindowRun() {
 	std::_Exit(0);
 }
 
-VkSurfaceCapabilitiesKHR* VulkanGetSurfaceCapabilities() {
+vk::SurfaceCapabilitiesKHR* VulkanGetSurfaceCapabilities() {
 	EXIT_IF(g_window_ctx == nullptr);
 
 	Common::LockGuard lock(g_window_ctx->mutex);

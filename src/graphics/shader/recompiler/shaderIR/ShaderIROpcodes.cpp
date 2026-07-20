@@ -1,8 +1,7 @@
-#include "graphics/shader/recompiler/ShaderIR.h"
-
-#include "graphics/shader/recompiler/shaderIR/ShaderIRInternal.h"
 #include "common/assert.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/ShaderIR.h"
+#include "graphics/shader/recompiler/shaderIR/ShaderIRInternal.h"
 
 #include <algorithm>
 #include <fmt/format.h>
@@ -426,7 +425,6 @@ constexpr LowerMap LOWER_OPS[] = {
 #include "graphics/shader/recompiler/generated/Rdna2ExtraLowerOps.inc"
 #include "graphics/shader/recompiler/generated/Rdna2ExplicitLowerOps.inc"
 };
-
 
 } // namespace
 
