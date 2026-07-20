@@ -701,6 +701,7 @@ static void Phase43SeedNdJobDcb();
 static void Phase44ClearSnapshotForGuestRetry();
 static void Phase44CheckNdJobDcb();
 static void Phase44CaptureDcbBaselineIfNeeded();
+static void Phase44AttemptAbiReregister();
 
 void Phase41MenuHandoffAttempt() {
 	Phase41FlushKeep1Log();
@@ -717,21 +718,24 @@ void Phase41MenuHandoffAttempt() {
 	Phase42RearmNdJobEnqueue();
 	Phase44CheckNdJobDcb();
 
-	// Phase 44: defer snapshot so guest RegisterBuffers2 can claim empty slots first.
-	// Fallback snapshot at n==40 / n==80 / every 100 after clear retry.
+	// Host snapshot fallback while waiting for sustained frames (adopt keep-alive set).
+	// After clear-once for ABI Reg2, do not re-snapshot (avoids thrash).
 	if (!g_phase44_guest_reg2_ok.load(std::memory_order_acquire) &&
 	    !g_phase44_snapshot_done.load(std::memory_order_acquire) &&
+	    !g_phase44_snapshot_cleared.load(std::memory_order_acquire) &&
 	    (n == 40 || n == 80 || (n > 80 && (n % 100) == 0))) {
 		Phase41AttemptSnapshotReregister();
 	}
-	// After sustained frames: free snapshot slots so guest can ABI re-Register.
+	// After sustained frames: clear host set once, then ABI re-Register from MainThread.
 	if (g_phase43_menu_frames_ok.load(std::memory_order_acquire) &&
-	    !g_phase44_guest_reg2_ok.load(std::memory_order_acquire) &&
-	    g_phase44_snapshot_done.load(std::memory_order_acquire)) {
-		Phase44ClearSnapshotForGuestRetry();
+	    !g_phase44_guest_reg2_ok.load(std::memory_order_acquire)) {
+		if (g_phase44_snapshot_done.load(std::memory_order_acquire) &&
+		    !g_phase44_snapshot_cleared.load(std::memory_order_acquire)) {
+			Phase44ClearSnapshotForGuestRetry();
+		}
+		Phase44AttemptAbiReregister();
 	}
-	// Sustain flips while buffers are linked (snapshot or guest) — continue after
-	// menu_frames_ok until guest Reg2 so SoftIdle keeps the screen alive.
+	// Sustain flips while buffers are linked — continue after menu_frames_ok until Reg2.
 	if (g_phase42_reregister_ok.load(std::memory_order_acquire) && n >= 6) {
 		if (!g_phase43_menu_frames_ok.load(std::memory_order_acquire)) {
 			Phase43SeedNdJobDcb();
@@ -1613,6 +1617,11 @@ struct VideoOutBufferAttribute2 {
 	uint32_t pad0;
 	uint64_t reserved1[3];
 };
+
+// Phase 44: BootCards RegisterBuffers2 attribute (saved for ABI re-Register after Unreg).
+static VideoOutBufferAttribute2 g_phase34_attr {};
+static std::atomic<bool>        g_phase34_attr_valid {false};
+static std::atomic<int>         g_phase34_attr_category {0};
 
 // PS4/PS5 VideoOut FlipStatus (64 bytes) — matches shadPS4 / Orbis ABI.
 // Oversized copies previously overflowed guest buffers and corrupted BootCards state.
@@ -3310,12 +3319,66 @@ static void Phase44ClearSnapshotForGuestRetry() {
 	g_phase42_reregister_ok.store(false, std::memory_order_release);
 	g_phase44_snapshot_done.store(false, std::memory_order_release);
 	g_phase37_keepalive_stop.store(true, std::memory_order_release);
+	// Do NOT reset g_phase44_snapshot_cleared — clear-once forever (no thrash).
 	LOGF("FlipTrace: phase44 cleared snapshot set=%d for guest RegisterBuffers2 retry "
 	     "(keep-alive stop)\n",
 	     snap.set_id);
 	fprintf(stderr, "FlipTrace: phase44 cleared snapshot for guest Reg2 retry\n");
 	(void)LibKernel::PthreadWakeSubmissionCondWaitersUnlimited();
 	(void)LibKernel::EventQueue::KernelTriggerUserEventForAll(0x1800, nullptr);
+}
+
+// Phase 44: re-Register via VideoOutRegisterBuffers2 ABI from MainThread (guest divert
+// never returns to the title's own Reg2 call-site). Counts as ABI Reg2, not snapshot poke.
+static void Phase44AttemptAbiReregister() {
+	if (g_phase44_guest_reg2_ok.load(std::memory_order_acquire)) {
+		return;
+	}
+	if (!g_phase44_snapshot_cleared.load(std::memory_order_acquire)) {
+		return;
+	}
+	if (!g_phase34_attr_valid.load(std::memory_order_acquire) ||
+	    g_video_out_context == nullptr) {
+		return;
+	}
+	static std::atomic<bool> in_flight {false};
+	if (in_flight.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	Phase34MenuSnapshot snap;
+	VideoOutBufferAttribute2 attr {};
+	int category = 0;
+	{
+		std::lock_guard<std::mutex> lock(g_phase34_mu);
+		snap     = g_phase34_snap;
+		attr     = g_phase34_attr;
+		category = g_phase34_attr_category.load(std::memory_order_relaxed);
+	}
+	if (snap.buffer_num <= 0 || snap.addresses.empty() ||
+	    snap.addresses.size() != static_cast<size_t>(snap.buffer_num)) {
+		in_flight.store(false, std::memory_order_release);
+		return;
+	}
+	std::vector<VideoOutBuffers> bufs(static_cast<size_t>(snap.buffer_num));
+	for (int i = 0; i < snap.buffer_num; i++) {
+		bufs[static_cast<size_t>(i)].data =
+		    snap.addresses[static_cast<size_t>(i)];
+		bufs[static_cast<size_t>(i)].metadata =
+		    snap.infos.size() == static_cast<size_t>(snap.buffer_num)
+		        ? reinterpret_cast<const void*>(snap.infos[static_cast<size_t>(i)].metadata_address)
+		        : nullptr;
+		bufs[static_cast<size_t>(i)].reserved[0] = nullptr;
+		bufs[static_cast<size_t>(i)].reserved[1] = nullptr;
+	}
+	LOGF("FlipTrace: phase44 ABI RegisterBuffers2 attempt handle=%d set=%d num=%d tid=%d\n",
+	     snap.handle, snap.set_id, snap.buffer_num, Common::Thread::GetThreadIdUnique());
+	fprintf(stderr, "FlipTrace: phase44 ABI RegisterBuffers2 attempt set=%d\n", snap.set_id);
+	const int reg = VideoOutRegisterBuffers2(snap.handle, snap.set_id, snap.start_index,
+	                                         bufs.data(), snap.buffer_num, &attr, category,
+	                                         nullptr);
+	LOGF("FlipTrace: phase44 ABI RegisterBuffers2 result=%d set=%d\n", reg, snap.set_id);
+	fprintf(stderr, "FlipTrace: phase44 ABI RegisterBuffers2 result=%d\n", reg);
+	in_flight.store(false, std::memory_order_release);
 }
 
 static void Phase43CaptureBaselineIfNeeded() {
@@ -3526,7 +3589,6 @@ static void Phase41AttemptSnapshotReregister() {
 		g_phase42_flip_handle.store(snap.handle, std::memory_order_release);
 		g_phase42_flip_num.store(snap.buffer_num, std::memory_order_release);
 		g_phase44_snapshot_done.store(true, std::memory_order_release);
-		g_phase44_snapshot_cleared.store(false, std::memory_order_release);
 		Phase43CaptureBaselineIfNeeded();
 		LOGF("FlipTrace: phase41 snapshot re-Register OK set_id=%d num=%d tid=%d "
 		     "(host fallback, not ABI Reg2)\n",
@@ -4016,6 +4078,12 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	if (reg_result == OK) {
 		Phase34SaveMenuSnapshot(handle, set_index, buffer_index_start, buffer_num,
 		                        addresses.data(), infos);
+		{
+			std::lock_guard<std::mutex> lock(g_phase34_mu);
+			g_phase34_attr = *attribute;
+			g_phase34_attr_valid.store(true, std::memory_order_release);
+			g_phase34_attr_category.store(category, std::memory_order_release);
+		}
 		if (g_phase37_post_unreg.load(std::memory_order_acquire)) {
 			g_phase42_flip_handle.store(handle, std::memory_order_release);
 			g_phase42_flip_num.store(buffer_num, std::memory_order_release);
