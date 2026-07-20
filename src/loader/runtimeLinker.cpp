@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/fatalLog.h"
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
@@ -20,6 +21,7 @@
 #include "loader/jit.h"
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
+#include "graphics/presentation/videoOut.h"
 
 #include <algorithm>
 #include <atomic>
@@ -602,82 +604,134 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 #endif
 		} else {
-			LOGF("MemoryTrace: AV unresolvable addr=0x%016" PRIx64 " (skip recovery)\n",
-			     info->access_violation_vaddr);
-			fprintf(stderr, "MemoryTrace: AV unresolvable addr=0x%016" PRIx64 "\n",
-			        info->access_violation_vaddr);
-			std::fflush(stderr);
-			// Minimal fatal path only: ExceptionInfo already holds registers. Any guest-memory
-			// diagnostic here can nest another AV and mask the real fault.
-			LOGF("kyty_exception_handler: rip=%016" PRIx64 "\n", info->exception_address);
-			LOGF("exception: type=%s, av_type=%s, av_addr=%016" PRIx64 ", native_code=%08" PRIx32
-			     "\n",
-			     Common::EnumName(info->type).c_str(),
-			     Common::EnumName(info->access_violation_type).c_str(),
-			     info->access_violation_vaddr, info->native_code);
-			LOGF("regs: rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64
-			     "\n",
-			     info->rax, info->rbx, info->rcx, info->rdx);
-			LOGF("regs: rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64
-			     "\n",
-			     info->rsi, info->rdi, info->rbp, info->rsp);
-			LOGF("regs: r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64
-			     "\n",
-			     info->r8, info->r9, info->r10, info->r11);
-			LOGF("regs: r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64
-			     "\n",
-			     info->r12, info->r13, info->r14, info->r15);
+			// VEH-safe fatal path: no LOGF/EnumName/EXIT/stack walk (those can nest another AV).
+			const char* av_type = "Unknown";
+			switch (info->access_violation_type) {
+				case CoreAccess::Read: av_type = "Read"; break;
+				case CoreAccess::Write: av_type = "Write"; break;
+				case CoreAccess::Execute: av_type = "Execute"; break;
+				case CoreAccess::Unknown: break;
+			}
+			char line[384];
+			std::snprintf(line, sizeof(line),
+			              "MemoryTrace: AV unresolvable addr=0x%016" PRIx64 " rip=0x%016" PRIx64
+			              " av=%s",
+			              info->access_violation_vaddr, info->exception_address, av_type);
+			Common::LogFatalToFile(line);
+			std::snprintf(line, sizeof(line),
+			              "regs: rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64
+			              " rdx=%016" PRIx64,
+			              info->rax, info->rbx, info->rcx, info->rdx);
+			Common::LogFatalToFile(line);
+			std::snprintf(line, sizeof(line),
+			              "regs: rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64
+			              " rsp=%016" PRIx64,
+			              info->rsi, info->rdi, info->rbp, info->rsp);
+			Common::LogFatalToFile(line);
+			std::snprintf(line, sizeof(line),
+			              "regs: r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64
+			              " r11=%016" PRIx64,
+			              info->r8, info->r9, info->r10, info->r11);
+			Common::LogFatalToFile(line);
+			std::snprintf(line, sizeof(line),
+			              "regs: r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64
+			              " r15=%016" PRIx64,
+			              info->r12, info->r13, info->r14, info->r15);
+			Common::LogFatalToFile(line);
 			if (info->access_violation_vaddr == UINT64_MAX) {
-				LOGF("guest registers equal to -1:");
-				if (info->rax == UINT64_MAX) {
-					LOGF("\trax\n");
+				auto log_if_neg1 = [&](const char* name, uint64_t value) {
+					if (value == UINT64_MAX) {
+						char neg[64];
+						std::snprintf(neg, sizeof(neg), "guest reg -1: %s", name);
+						Common::LogFatalToFile(neg);
+					}
+				};
+				log_if_neg1("rax", info->rax);
+				log_if_neg1("rbx", info->rbx);
+				log_if_neg1("rcx", info->rcx);
+				log_if_neg1("rdx", info->rdx);
+				log_if_neg1("rsi", info->rsi);
+				log_if_neg1("rdi", info->rdi);
+				log_if_neg1("r8", info->r8);
+				log_if_neg1("r9", info->r9);
+				log_if_neg1("r10", info->r10);
+				log_if_neg1("r11", info->r11);
+				log_if_neg1("r12", info->r12);
+				log_if_neg1("r13", info->r13);
+				log_if_neg1("r14", info->r14);
+				log_if_neg1("r15", info->r15);
+			}
+			std::snprintf(line, sizeof(line),
+			              "Access violation: %s [%016" PRIx64 "] (non-canonical/poisoned)", av_type,
+			              info->access_violation_vaddr);
+			Common::LogFatalToFile(line);
+			// Host-only diagnostics: match RIP to unresolved-import thunk pages / hot stubs.
+			{
+				constexpr uint64_t kThunkSize = 162;
+				constexpr uint64_t kPageSize  = 4096;
+				bool              matched    = false;
+				for (uint64_t page: g_unresolved_stub_thunk_pages) {
+					if (info->exception_address < page ||
+					    info->exception_address >= page + kPageSize) {
+						continue;
+					}
+					std::snprintf(line, sizeof(line),
+					              "poison-rip in stub-thunk page=0x%016" PRIx64 " off=0x%llx", page,
+					              static_cast<unsigned long long>(info->exception_address - page));
+					Common::LogFatalToFile(line);
+					for (const auto& record: g_stubbed_imports) {
+						if (record.thunk_vaddr == 0) {
+							continue;
+						}
+						if (info->exception_address >= record.thunk_vaddr &&
+						    info->exception_address < record.thunk_vaddr + kThunkSize) {
+							std::snprintf(line, sizeof(line),
+							              "poison-rip stub: %s program=%s patch=0x%016" PRIx64
+							              " calls=%" PRIu64,
+							              record.name.c_str(), record.program.c_str(),
+							              record.patch_vaddr, record.call_count);
+							Common::LogFatalToFile(line);
+							matched = true;
+							break;
+						}
+					}
+					break;
 				}
-				if (info->rbx == UINT64_MAX) {
-					LOGF("\trbx\n");
+				if (!matched) {
+					Common::LogFatalToFile(
+					    "poison-rip not inside an unresolved-import thunk (likely guest caller "
+					    "after stub returned 0 / null)");
 				}
-				if (info->rcx == UINT64_MAX) {
-					LOGF("\trcx\n");
+				Libs::VideoOut::PhaseDescribeFaultRip(info->exception_address, info->rsp);
+				const StubbedImportRecord* top[12] = {};
+				for (const auto& record: g_stubbed_imports) {
+					if (record.call_count == 0) {
+						continue;
+					}
+					for (int i = 0; i < 12; i++) {
+						if (top[i] == nullptr || record.call_count > top[i]->call_count) {
+							for (int j = 11; j > i; j--) {
+								top[j] = top[j - 1];
+							}
+							top[i] = &record;
+							break;
+						}
+					}
 				}
-				if (info->rdx == UINT64_MAX) {
-					LOGF("\trdx\n");
-				}
-				if (info->rsi == UINT64_MAX) {
-					LOGF("\trsi\n");
-				}
-				if (info->rdi == UINT64_MAX) {
-					LOGF("\trdi\n");
-				}
-				if (info->r8 == UINT64_MAX) {
-					LOGF("\tr8\n");
-				}
-				if (info->r9 == UINT64_MAX) {
-					LOGF("\tr9\n");
-				}
-				if (info->r10 == UINT64_MAX) {
-					LOGF("\tr10\n");
-				}
-				if (info->r11 == UINT64_MAX) {
-					LOGF("\tr11\n");
-				}
-				if (info->r12 == UINT64_MAX) {
-					LOGF("\tr12\n");
-				}
-				if (info->r13 == UINT64_MAX) {
-					LOGF("\tr13\n");
-				}
-				if (info->r14 == UINT64_MAX) {
-					LOGF("\tr14\n");
-				}
-				if (info->r15 == UINT64_MAX) {
-					LOGF("\tr15\n");
+				for (const auto* record: top) {
+					if (record == nullptr) {
+						break;
+					}
+					std::snprintf(line, sizeof(line), "stub-hot: n=%" PRIu64 " %s prog=%s",
+					              record->call_count, record->name.c_str(),
+					              record->program.c_str());
+					Common::LogFatalToFile(line);
 				}
 			}
-			WriteStubbedImportReport("_ImportReport.txt");
-			EXIT("Access violation: %s [%016" PRIx64 "] %s\n",
-			     Common::EnumName(info->access_violation_type).c_str(),
-			     info->access_violation_vaddr,
-			     (info->access_violation_vaddr == g_invalid_memory ? "(Unpatched object)"
-			                                                       : "(non-canonical/poisoned)"));
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			TerminateProcess(GetCurrentProcess(), 321);
+#endif
+			std::_Exit(321);
 		}
 	}
 

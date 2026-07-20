@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/fatalLog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -6486,6 +6487,101 @@ static std::atomic<uint32_t>    g_phase40_active_idx {UINT32_MAX};
 static PVOID                    g_phase40_veh = nullptr;
 static thread_local uint32_t    g_phase40_tls_idx = UINT32_MAX;
 static thread_local uint64_t    g_phase40_saved_rsp = 0;
+
+void PhaseDescribeFaultRip(uint64_t rip) {
+	char line[320];
+	auto check = [&](const char* name, const uint8_t* base, uint64_t size) {
+		if (base == nullptr || size == 0) {
+			return false;
+		}
+		const uint64_t b = reinterpret_cast<uint64_t>(base);
+		if (rip < b || rip >= b + size) {
+			return false;
+		}
+		std::snprintf(line, sizeof(line), "poison-rip in %s base=0x%016" PRIx64 " off=0x%llx",
+		              name, b, static_cast<unsigned long long>(rip - b));
+		Common::LogFatalToFile(line);
+		return true;
+	};
+	bool hit = false;
+	hit |= check("phase41_keep1_thunk", g_phase41_keep1_thunk, 256);
+	hit |= check("phase41_keep1_live", g_phase41_keep1_live, 64);
+	hit |= check("phase41_call_thunk", g_phase41_call_thunk, 64);
+	hit |= check("phase53_worker_thunk", g_phase53_worker_thunk, 256);
+	hit |= check("phase53_worker_live", g_phase53_worker_live, 64);
+	hit |= check("phase53_fiber_thunk", g_phase53_fiber_thunk, 256);
+	hit |= check("phase53_fiber_live", g_phase53_fiber_live, 64);
+	hit |= check("phase55_mixed_thunk", g_phase55_mixed_thunk, 256);
+	hit |= check("phase55_mixed_live", g_phase55_mixed_live, 64);
+	for (uint32_t i = 0; i < 5; i++) {
+		char name[40];
+		std::snprintf(name, sizeof(name), "phase40_entry_thunk[%u]", i);
+		hit |= check(name, g_phase40_slots[i].entry_thunk, 256);
+		std::snprintf(name, sizeof(name), "phase40_live_entry[%u]", i);
+		hit |= check(name, g_phase40_slots[i].live_entry, 128);
+	}
+	std::snprintf(line, sizeof(line),
+	              "poison-ctx keep1_obj=0x%016" PRIx64 " keep1_rsi=0x%016" PRIx64
+	              " keep1_hits=%" PRIu64 " status_rdi=0x%016" PRIx64,
+	              g_phase41_keep1_obj.load(std::memory_order_relaxed),
+	              g_phase41_keep1_rsi.load(std::memory_order_relaxed),
+	              g_phase41_keep1_hits.load(std::memory_order_relaxed),
+	              g_phase41_status_rdi.load(std::memory_order_relaxed));
+	Common::LogFatalToFile(line);
+	if (!hit) {
+		Common::LogFatalToFile("poison-rip not in known Phase trampolines");
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION mbi {};
+	if (VirtualQuery(reinterpret_cast<const void*>(rip), &mbi, sizeof(mbi)) != 0 &&
+	    mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0) {
+		const auto* bytes = reinterpret_cast<const uint8_t*>(rip >= 16 ? rip - 16 : rip);
+		const uint32_t skip = rip >= 16 ? 0u : static_cast<uint32_t>(16 - rip);
+		int         pos   = std::snprintf(line, sizeof(line), "poison-bytes[-16]:");
+		for (uint32_t i = skip; i < 32 && pos > 0 && static_cast<size_t>(pos) + 3 < sizeof(line);
+		     i++) {
+			pos += std::snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos), " %02x",
+			                     bytes[i]);
+		}
+		Common::LogFatalToFile(line);
+		std::snprintf(line, sizeof(line),
+		              "poison-mbi base=0x%016" PRIx64 " size=0x%llx prot=0x%08" PRIx32
+		              " type=0x%08" PRIx32,
+		              reinterpret_cast<uint64_t>(mbi.BaseAddress),
+		              static_cast<unsigned long long>(mbi.RegionSize),
+		              static_cast<uint32_t>(mbi.Protect), static_cast<uint32_t>(mbi.Type));
+		Common::LogFatalToFile(line);
+		HMODULE owner = nullptr;
+		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+		                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                       reinterpret_cast<LPCSTR>(rip), &owner) != 0 &&
+		    owner != nullptr) {
+			char module_name[MAX_PATH] = {};
+			if (GetModuleFileNameA(owner, module_name, MAX_PATH) != 0) {
+				std::snprintf(line, sizeof(line),
+				              "poison-module %s base=0x%016" PRIx64 " rva=0x%08" PRIx64, module_name,
+				              reinterpret_cast<uint64_t>(owner),
+				              rip - reinterpret_cast<uint64_t>(owner));
+				Common::LogFatalToFile(line);
+			}
+		} else {
+			Common::LogFatalToFile("poison-module (none / not a PE module handle)");
+		}
+	}
+#endif
+}
+
+// Overload used from runtimeLinker with full register context.
+void PhaseDescribeFaultRip(uint64_t rip, uint64_t rsp) {
+	char line[160];
+	std::snprintf(line, sizeof(line), "poison-rsp align rsp=0x%016" PRIx64 " rsp&0xf=%u%s", rsp,
+	              static_cast<unsigned>(rsp & 0xfu),
+	              (rsp & 0xfu) == 8u
+	                  ? " (MISALIGNED for movaps — likely SSE #GP reported as AV/-1)"
+	                  : "");
+	Common::LogFatalToFile(line);
+	PhaseDescribeFaultRip(rip);
+}
 
 static bool Phase40LiveEnabled() {
 	const char* off = std::getenv("KYTY_PHASE40_LIVE");

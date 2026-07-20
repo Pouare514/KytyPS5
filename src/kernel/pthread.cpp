@@ -24,6 +24,7 @@
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <mutex>
@@ -440,6 +441,7 @@ struct PthreadPrivate {
 	uint64_t              host_thread_id;
 	HostCpuContext        host_return_ctx {};
 	bool                  host_return_valid = false;
+	uint64_t              host_return_value = 0;
 	uint64_t              cond_sequence = 0;
 	PthreadCondPrivate*   waiting_cond  = nullptr;
 	std::atomic<uint64_t> pending_signal_mask {0};
@@ -1105,27 +1107,47 @@ static void FreeGuestStack(PthreadAttr attr) {
 }
 
 extern "C" __attribute__((noreturn, noinline)) void GuestThreadFinishOnHost(uint64_t value) {
-	if (g_pthread_self == nullptr) {
-		EXIT("GuestThreadFinishOnHost without pthread self\n");
+	// Still on the guest stack here (arrived from GuestThreadReturnTrampoline).
+	// Do not LOGF/fmt/EXIT — those use movaps and require a 16-byte-aligned host stack.
+	// HostRestoreContext must use a non-zero sentinel: guest may legitimately return 0, and
+	// HostSaveContext also returns 0 on first entry.
+	auto* self = g_pthread_self;
+	if (self == nullptr || !self->host_return_valid) {
+		char line[160];
+		std::snprintf(line, sizeof(line),
+		              "GuestThreadFinishOnHost abort: self=%p valid=%d value=0x%016" PRIx64,
+		              static_cast<void*>(self),
+		              self != nullptr && self->host_return_valid ? 1 : 0, value);
+		Common::LogFatalToFile(line);
+		fprintf(stderr, "%s\n", line);
+		std::fflush(stderr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		TerminateProcess(GetCurrentProcess(), 321);
+#endif
+		std::_Exit(321);
 	}
-	LOGF("GuestThreadFinishOnHost tid=%d value=0x%016" PRIx64 "\n", g_pthread_self->unique_id,
-	     value);
-	fprintf(stderr, "GuestThreadFinishOnHost tid=%d\n", g_pthread_self->unique_id);
-	g_pthread_self->host_return_valid = false;
-	HostRestoreContext(&g_pthread_self->host_return_ctx, value);
+	self->host_return_value = value;
+	self->host_return_valid = false;
+	HostRestoreContext(&self->host_return_ctx, 1);
 }
 
 // Entered by guest `ret` with return value still in rax — must not clobber rax in a C prologue.
 #if defined(__x86_64__) || defined(_M_X64)
 extern "C" __attribute__((naked, noinline)) void GuestThreadReturnTrampoline() {
-	// Basic asm (naked): single '%' — extended asm %% escapes do not apply.
+	// Realign then call: guest rsp is often ≡8 mod 16 after ret; Finish/C++ must not see that.
 	asm volatile(
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	    "movq %rax, %rcx\n\t"
+	    "andq $-16, %rsp\n\t"
+	    "subq $0x28, %rsp\n\t"
+	    "call GuestThreadFinishOnHost\n\t"
 #else
 	    "movq %rax, %rdi\n\t"
+	    "andq $-16, %rsp\n\t"
+	    "subq $0x8, %rsp\n\t"
+	    "call GuestThreadFinishOnHost\n\t"
 #endif
-	    "jmp GuestThreadFinishOnHost\n\t");
+	    "ud2\n\t");
 }
 #else
 extern "C" __attribute__((noreturn, noinline)) void GuestThreadReturnTrampoline() {
@@ -1141,8 +1163,13 @@ uint64_t PthreadRunGuestOnStack(void* stack_top, void* entry, uint64_t arg0, uin
 
 	const uint64_t rc = HostSaveContext(&g_pthread_self->host_return_ctx);
 	if (rc != 0) {
+		// Resumed on the host stack from GuestThreadFinishOnHost → HostRestoreContext.
+		const uint64_t value = g_pthread_self->host_return_value;
 		g_pthread_self->host_return_valid = false;
-		return rc;
+		// fprintf only — avoid fmt/LOGF on this path (historically hit after bad stack restores).
+		fprintf(stderr, "GuestThreadFinishOnHost tid=%d value=0x%016" PRIx64 "\n",
+		        g_pthread_self->unique_id, value);
+		return value;
 	}
 	g_pthread_self->host_return_valid = true;
 
@@ -4354,9 +4381,9 @@ void KYTY_SYSV_ABI PthreadExit(void* value) {
 
 #if defined(__x86_64__) || defined(_M_X64)
 	if (g_pthread_self != nullptr && g_pthread_self->host_return_valid) {
+		g_pthread_self->host_return_value = reinterpret_cast<uint64_t>(value);
 		g_pthread_self->host_return_valid = false;
-		HostRestoreContext(&g_pthread_self->host_return_ctx,
-		                   reinterpret_cast<uint64_t>(value));
+		HostRestoreContext(&g_pthread_self->host_return_ctx, 1);
 	}
 #endif
 

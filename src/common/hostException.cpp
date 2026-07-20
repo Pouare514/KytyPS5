@@ -43,11 +43,8 @@ class FilterScope final {
 public:
 	FilterScope() noexcept {
 		if (g_in_exception_filter) {
-			// Prefer continuing the search over TerminateProcess so the outer handler can still
-			// emit its Access-violation EXIT with guest registers (diagnostics must stay
-			// exception-safe; nested faults should be rare after that).
 			Common::LogFatalToFile(
-			    "HostException: nested exception while resolving a host fault (continue search)");
+			    "HostException: nested exception while resolving a host fault");
 			nested = true;
 			return;
 		}
@@ -148,7 +145,7 @@ static LONG WINAPI UnhandledTopLevelFilter(PEXCEPTION_POINTERS exception) {
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 	FilterScope filter_scope;
 	if (filter_scope.IsNested()) {
-		return EXCEPTION_CONTINUE_SEARCH;
+		FailFast("nested exception while resolving a host fault");
 	}
 
 	auto* exception_record = exception->ExceptionRecord;

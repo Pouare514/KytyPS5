@@ -176,6 +176,10 @@ void Phase70Poll();
 void Phase71EmitHeatmap(const char* why);
 void Phase71Poll();
 
+// VEH-safe: classify a fault RIP against Phase41/53/55/40 host trampolines (no guest reads).
+void PhaseDescribeFaultRip(uint64_t rip);
+void PhaseDescribeFaultRip(uint64_t rip, uint64_t rsp);
+
 KYTY_SYSV_ABI int  VideoOutOpen(int user_id, int bus_type, int index, const void* param);
 KYTY_SYSV_ABI int  VideoOutClose(int handle);
 KYTY_SYSV_ABI void VideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribute,
