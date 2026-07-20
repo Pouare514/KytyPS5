@@ -8,6 +8,10 @@
 #include "common/platform/sysVirtual.h"
 #include "common/virtualMemory.h"
 
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
+
 #include <windows.h> // IWYU pragma: keep
 
 // IWYU pragma: no_include <basetsd.h>
@@ -296,12 +300,39 @@ bool SysVirtualDecommit(uint64_t address, uint64_t size) {
 }
 
 bool SysVirtualFree(uint64_t address) {
-	if (VirtualFree(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), 0, MEM_RELEASE) ==
+	if (VirtualFree(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), 0, MEM_RELEASE) !=
 	    0) {
-		printf("VirtualFree() failed: 0x%08" PRIx32 "\n", static_cast<uint32_t>(GetLastError()));
-		return false;
+		return true;
 	}
-	return true;
+
+	const auto err = static_cast<uint32_t>(GetLastError());
+	MEMORY_BASIC_INFORMATION info {};
+	const SIZE_T queried =
+	    VirtualQuery(reinterpret_cast<const void*>(static_cast<uintptr_t>(address)), &info,
+	                 sizeof(info));
+
+	static std::atomic<uint32_t> diag_count {0};
+	const auto                   n = diag_count.fetch_add(1, std::memory_order_relaxed);
+	if (n < 16) {
+		printf("VirtualFree() failed: 0x%08" PRIx32 " addr=0x%016" PRIx64
+		       " AllocationBase=0x%016" PRIx64 " BaseAddress=0x%016" PRIx64 " RegionSize=0x%016" PRIx64
+		       " State=0x%08" PRIx32 " Type=0x%08" PRIx32 " Protect=0x%08" PRIx32 " queried=%u\n",
+		       err, address,
+		       queried != 0 ? reinterpret_cast<uint64_t>(info.AllocationBase) : 0ull,
+		       queried != 0 ? reinterpret_cast<uint64_t>(info.BaseAddress) : 0ull,
+		       queried != 0 ? static_cast<uint64_t>(info.RegionSize) : 0ull,
+		       queried != 0 ? static_cast<uint32_t>(info.State) : 0u,
+		       queried != 0 ? static_cast<uint32_t>(info.Type) : 0u,
+		       queried != 0 ? static_cast<uint32_t>(info.Protect) : 0u,
+		       queried != 0 ? 1u : 0u);
+	}
+
+	// Idempotent double-free: address is already MEM_FREE.
+	if (err == ERROR_INVALID_ADDRESS && queried != 0 && info.State == MEM_FREE) {
+		return true;
+	}
+
+	return false;
 }
 
 bool SysVirtualFreeRange(uint64_t address, uint64_t size) {

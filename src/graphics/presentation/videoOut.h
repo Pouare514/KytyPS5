@@ -17,6 +17,7 @@ namespace Libs::VideoOut {
 struct VideoOutBufferAttribute2;
 struct VideoOutFlipStatus;
 struct VideoOutVblankStatus;
+struct VideoOutVrrStatus;
 struct VideoOutOutputStatus;
 struct VideoOutOutputOptions;
 struct VideoOutBuffers;
@@ -24,6 +25,18 @@ struct VideoOutColorSettings;
 
 void VideoOutInit(uint32_t width, uint32_t height);
 void VideoOutWaitFlipDone(int handle, int index);
+// Phase 35/36: Mixed host flip pump (black NOP DCB) — opt-in KYTY_PHASE35_HOST_FLIP=1.
+void Phase35ArmGuestMenuAfterUnregister();
+void Phase35TryGuestMenuFromSubmissionThread(const char* thread_name);
+// Phase 38/42: soft-idle waits on guest SubmitFlip post-Unregister (Register alone is not enough).
+// Phase 39: MainThread does not park until progress is seen (no timeout fallback).
+// Phase 43: park CRT divert on sustained presented frames (menu_frames_ok).
+bool Phase38GuestBootProgressSeen();
+void Phase38NudgeBootWorkers();
+// Phase 41/42: MainThread anti-CRT handoff (re-Register + SubmitFlip + NdJob rearm).
+void Phase41MenuHandoffAttempt();
+// Phase 44: true VideoOutRegisterBuffers2 ABI post-Unregister (not snapshot).
+bool Phase44GuestRegisterBuffers2Seen();
 
 KYTY_SYSV_ABI int  VideoOutOpen(int user_id, int bus_type, int index, const void* param);
 KYTY_SYSV_ABI int  VideoOutClose(int handle);
@@ -74,6 +87,15 @@ KYTY_SYSV_ABI int VideoOutLatencyControlWaitBeforeInput(int handle);
 KYTY_SYSV_ABI int VideoOutLatencyMeasureSetStartPoint(int handle, uint32_t point);
 KYTY_SYSV_ABI int VideoOutColorSettingsSetGamma(VideoOutColorSettings* settings, float gamma);
 KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* settings);
+// sceVideoOutAddVrrStatusFlagsPrivilege — always OK (Phase 20); wrong ABI caused 0x8029000B assert.
+KYTY_SYSV_ABI int VideoOutAddVrrStatusFlagsPrivilege(int handle, uint32_t flags, uint64_t arg2,
+                                                      uint64_t arg3);
+KYTY_SYSV_ABI int VideoOutGetVrrStatus(int handle, void* status);
+KYTY_SYSV_ABI int VideoOutGetBufferLabelAddress(int handle, uintptr_t* label_addr);
+KYTY_SYSV_ABI int VideoOutGetDeviceCapabilityInfo(int handle, void* info);
+KYTY_SYSV_ABI int VideoOutGetResolutionStatus(int handle, void* status);
+KYTY_SYSV_ABI int VideoOutUnknownNidStub0(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
+KYTY_SYSV_ABI int VideoOutUnknownNidStub1(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
 
 void VideoOutBeginVblank();
 void VideoOutEndVblank();

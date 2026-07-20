@@ -20,6 +20,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/fatalLog.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -39,14 +40,24 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 #include <vulkan/vk_enum_string_helper.h>
 #include <vulkan/vk_platform.h>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
@@ -364,15 +375,88 @@ void GameShowWindow(WindowGame* game, const Common::Timer& timer) {
 	p->mutex.Unlock();
 }
 
+static std::atomic<int64_t> g_ignore_quit_until_ms {0};
+static std::atomic<bool>    g_phase32_hold_process {false};
+static std::atomic<bool>    g_phase35_fiber_softack {false};
+
+void WindowArmIgnoreQuit(uint32_t seconds) {
+	using clock = std::chrono::steady_clock;
+	const auto until =
+	    std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch())
+	        .count() +
+	    static_cast<int64_t>(seconds) * 1000;
+	g_ignore_quit_until_ms.store(until, std::memory_order_release);
+	g_phase32_hold_process.store(true, std::memory_order_release);
+	LOGF("FlipTrace: WindowArmIgnoreQuit %us\n", seconds);
+	fprintf(stderr, "FlipTrace: WindowArmIgnoreQuit %us\n", seconds);
+	Common::LogFatalToFile("WindowArmIgnoreQuit");
+}
+
+void WindowDisarmIgnoreQuit() {
+	g_phase32_hold_process.store(false, std::memory_order_release);
+	g_ignore_quit_until_ms.store(0, std::memory_order_release);
+	LOGF("FlipTrace: WindowDisarmIgnoreQuit\n");
+	fprintf(stderr, "FlipTrace: WindowDisarmIgnoreQuit\n");
+}
+
+void WindowArmPhase35FiberSoftAck() {
+	g_phase35_fiber_softack.store(true, std::memory_order_release);
+	LOGF("FlipTrace: WindowArmPhase35FiberSoftAck\n");
+	fprintf(stderr, "FlipTrace: WindowArmPhase35FiberSoftAck\n");
+}
+
+bool WindowPhase35FiberSoftAckArmed() {
+	return g_phase35_fiber_softack.load(std::memory_order_acquire);
+}
+
+bool WindowShouldIgnoreQuit() {
+	using clock = std::chrono::steady_clock;
+	const int64_t until = g_ignore_quit_until_ms.load(std::memory_order_acquire);
+	if (until <= 0) {
+		if (g_phase32_hold_process.load(std::memory_order_acquire)) {
+			g_phase32_hold_process.store(false, std::memory_order_release);
+		}
+		return false;
+	}
+	const auto now =
+	    std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch())
+	        .count();
+	if (now < until) {
+		return true;
+	}
+	// Timed arm expired — clear sticky hold (Phase 33: no permanent park).
+	g_phase32_hold_process.store(false, std::memory_order_release);
+	g_ignore_quit_until_ms.store(0, std::memory_order_release);
+	return false;
+}
+
 void GameEventQuit(WindowGame* game) {
 	LOGF("Event: quit\n");
-
+	fprintf(stderr, "Event: quit\n");
+	Common::LogFatalToFile("Event: quit");
+	std::fflush(stderr);
+	if (WindowShouldIgnoreQuit()) {
+		LOGF("FlipTrace: ignoring SDL_QUIT (phase32 arm active)\n");
+		fprintf(stderr, "FlipTrace: ignoring SDL_QUIT (phase32 arm active)\n");
+		Common::LogFatalToFile("ignoring SDL_QUIT phase32");
+		std::fflush(stderr);
+		return;
+	}
 	game->m_game_need_exit = true;
 }
 
 void GameEventTerminate(WindowGame* game) {
 	LOGF("Event: terminate\n");
-
+	fprintf(stderr, "Event: terminate\n");
+	Common::LogFatalToFile("Event: terminate");
+	std::fflush(stderr);
+	if (WindowShouldIgnoreQuit()) {
+		LOGF("FlipTrace: ignoring SDL_TERMINATE (phase32 arm active)\n");
+		fprintf(stderr, "FlipTrace: ignoring SDL_TERMINATE (phase32 arm active)\n");
+		Common::LogFatalToFile("ignoring SDL_TERMINATE phase32");
+		std::fflush(stderr);
+		return;
+	}
 	game->m_game_need_exit = true;
 }
 
@@ -387,7 +471,15 @@ void GameEventKeyboard(WindowGame* game, const EventKeyboard* key) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (key->down) {
 		switch (key->key_code) {
-			case SDLK_ESCAPE: game->m_game_need_exit = true; break;
+			case SDLK_ESCAPE:
+				if (WindowShouldIgnoreQuit()) {
+					LOGF("FlipTrace: ignoring ESC quit (phase32 arm active)\n");
+					fprintf(stderr, "FlipTrace: ignoring ESC quit (phase32 arm active)\n");
+					Common::LogFatalToFile("ignoring ESC quit phase32");
+				} else {
+					game->m_game_need_exit = true;
+				}
+				break;
 			case SDLK_SPACE: SetPause(game, !game->m_game_is_paused); break;
 			case SDLK_F1:
 				if (!key->repeat) {
@@ -954,11 +1046,21 @@ void GameMainLoop(WindowGame* game, void* data) {
 	if (need_exit) {
 		if (init_failed) {
 			LOGF("GameMainLoop: exit during init\n");
+			std::fprintf(stderr, "GameMainLoop: exit during init\n");
+			Common::LogFatalToFile("GameMainLoop: exit during init");
 		} else if (game->m_game_need_exit) {
 			LOGF("GameMainLoop: exit requested (window/guest)\n");
+			std::fprintf(stderr, "GameMainLoop: exit requested (window/guest)\n");
+			Common::LogFatalToFile("GameMainLoop: exit requested (window/guest)");
 		} else {
 			LOGF("GameMainLoop: exit requested (render/update failure)\n");
+			std::fprintf(stderr, "GameMainLoop: exit requested (render/update failure)\n");
+			Common::LogFatalToFile("GameMainLoop: exit requested (render/update failure)");
 		}
+		std::fflush(stderr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		FlushFileBuffers(GetStdHandle(STD_ERROR_HANDLE));
+#endif
 	}
 
 	GameClose(game);
@@ -996,6 +1098,45 @@ static void WindowCreate(WindowContext* ctx) {
 	SDL_SetWindowResizable(ctx->window, SDL_FALSE);
 }
 
+void WindowEnsureVisible() {
+	EXIT_IF(g_window_ctx == nullptr);
+	if (g_window_ctx->window == nullptr) {
+		return;
+	}
+	// Show now for UX. Leave window_hidden=true so the first WindowPresentFrame still
+	// recreates the swapchain for the visible surface, then paints the blank frame.
+	WindowUpdateIcon();
+	SDL_ShowWindow(g_window_ctx->window);
+	SDL_RaiseWindow(g_window_ctx->window);
+	SDL_PumpEvents();
+	LOGF("FlipTrace: WindowEnsureVisible shown early (swapchain recreate deferred)\n");
+	fprintf(stderr, "FlipTrace: WindowEnsureVisible shown early\n");
+}
+
+void WindowHoldVisible(uint32_t seconds) {
+	EXIT_IF(g_window_ctx == nullptr);
+	LOGF("FlipTrace: hold_after_present %us\n", seconds);
+	fprintf(stderr, "FlipTrace: hold_after_present %us\n", seconds);
+	const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+	while (std::chrono::steady_clock::now() < end) {
+		// Keep the message pump alive so Windows does not mark the app "Not Responding".
+		SDL_PumpEvents();
+		SDL_Event event {};
+		while (SDL_PollEvent(&event) != 0) {
+			// Ignore QUIT during the visibility hold so a stray close does not kill UX timing.
+			if (event.type == SDL_QUIT) {
+				continue;
+			}
+		}
+		if (g_window_ctx->window != nullptr) {
+			SDL_RaiseWindow(g_window_ctx->window);
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+	LOGF("FlipTrace: hold_after_present done\n");
+	fprintf(stderr, "FlipTrace: hold_after_present done\n");
+}
+
 void WindowInit(uint32_t width, uint32_t height) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	EXIT_IF(g_window_ctx != nullptr);
@@ -1029,6 +1170,7 @@ void WindowRun() {
 
 		WindowCreate(g_window_ctx);
 		VulkanCreate(g_window_ctx);
+		WindowEnsureVisible();
 
 		g_window_ctx->game = &game;
 
@@ -1043,6 +1185,13 @@ void WindowRun() {
 
 	// TODO: replace std::_Exit shutdown with full Vulkan teardown, then destroy
 	// the VMA allocator immediately before vkDestroyDevice.
+	LOGF("WindowRun: GameMainLoop returned — shutting down (_Exit 0)\n");
+	std::fprintf(stderr, "WindowRun: GameMainLoop returned — shutting down (_Exit 0)\n");
+	Common::LogFatalToFile("WindowRun: GameMainLoop returned _Exit(0)");
+	std::fflush(stderr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	FlushFileBuffers(GetStdHandle(STD_ERROR_HANDLE));
+#endif
 	Common::SubsystemsListSingleton::Instance()->ShutdownAll();
 	std::_Exit(0);
 }

@@ -95,6 +95,14 @@ _ImportReport.txt
 /crash-*.log
 *.err
 
+# Local emulator test runs (stdout/stderr redirects, scratch scripts)
+/_kyty*
+/_vm*
+/_p[0-9]*
+/_build_p*
+/_run_p*
+*.pid
+
 # --- Python (aqtinstall, tooling) ----------------------------------------------
 
 __pycache__/

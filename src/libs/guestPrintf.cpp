@@ -11,11 +11,21 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "common/singleton.h"
+#include "kernel/memory.h"
 #include "libs/vaContext.h"
+#include "loader/runtimeLinker.h"
 
+#include <atomic>
 #include <cfloat>
+#include <cinttypes>
 #include <cmath>
+#include <cstring>
 #include <vector>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <intrin.h>
+#endif
 
 namespace Libs {
 
@@ -439,9 +449,113 @@ static inline unsigned int _strnlen_s(const char* str, size_t maxsize) {
 	return static_cast<unsigned int>(s - str);
 }
 
+static void MaybeLogNdInitializeMemoryPrintf(const char* format, VaList* va_list) {
+	if (format == nullptr || va_list == nullptr) {
+		return;
+	}
+
+	const bool too_large =
+	    std::strstr(format, "Code and Data section is too large") != nullptr;
+	const bool ram_cache = std::strstr(format, "RAM Cache is being disabled") != nullptr;
+	if (!too_large && !ram_cache) {
+		return;
+	}
+
+	static std::atomic<uint32_t> log_count {0};
+	const auto                   index = log_count.fetch_add(1);
+	if (index >= 4) {
+		return;
+	}
+
+	double measured = 0.0;
+	double limit    = 0.0;
+	if (too_large) {
+		VaList peek = *va_list;
+		measured    = VaArg_double(&peek);
+		limit       = VaArg_double(&peek);
+	}
+
+	uint64_t measured_bits = 0;
+	uint64_t limit_bits    = 0;
+	std::memcpy(&measured_bits, &measured, sizeof(measured_bits));
+	std::memcpy(&limit_bits, &limit, sizeof(limit_bits));
+
+	LOGF("NdMemoryPrintf[%u]: format=%s\n", index, format);
+	if (too_large) {
+		LOGF("NdMemoryPrintf[%u]: xmm0(measured)=%.6g bits=0x%016" PRIx64
+		     " xmm1(limit)=%.6g bits=0x%016" PRIx64 " sentinel_bytes=0x%016" PRIx64 "\n",
+		     index, measured, measured_bits, limit, limit_bits,
+		     static_cast<uint64_t>(16384ull << 30));
+	}
+
+	void* const approx_sp = _AddressOfReturnAddress();
+	const auto* stack     = reinterpret_cast<const uint64_t*>(approx_sp);
+	LOGF("NdMemoryPrintf[%u]: approx_sp=0x%016" PRIx64 "\n", index,
+	     reinterpret_cast<uint64_t>(approx_sp));
+	for (int i = 0; i < 8; i++) {
+		LOGF("NdMemoryPrintf[%u]: stack[%d]=0x%016" PRIx64 "\n", index, i, stack[i]);
+	}
+
+	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	if (rt == nullptr) {
+		return;
+	}
+
+	const auto proc_vaddr = rt->GetProcParam();
+	if (proc_vaddr == 0) {
+		LOGF("NdMemoryPrintf[%u]: proc_param=0\n", index);
+		return;
+	}
+
+	const auto* proc = reinterpret_cast<const uint64_t*>(proc_vaddr);
+	// GuestProcParam: size@0 sdk@0x10 libc_param@0x38 mem_param@0x40
+	LOGF("NdMemoryPrintf[%u]: proc_param=0x%016" PRIx64 " size=0x%016" PRIx64
+	     " magic_entry=0x%016" PRIx64 " sdk=0x%016" PRIx64 " libc_param=0x%016" PRIx64
+	     " mem_param=0x%016" PRIx64 "\n",
+	     index, proc_vaddr, proc[0], proc[1], proc[2], proc[7], proc[8]);
+
+	const auto mem_param = proc[8];
+	if (mem_param != 0) {
+		const auto* mem = reinterpret_cast<const uint64_t*>(mem_param);
+		LOGF("NdMemoryPrintf[%u]: mem_param size=0x%016" PRIx64 " ext_pt=0x%016" PRIx64
+		     " flex_ptr=0x%016" PRIx64 "\n",
+		     index, mem[0], mem[1], mem[2]);
+		if (mem[2] != 0) {
+			const auto* flex = reinterpret_cast<const uint64_t*>(mem[2]);
+			LOGF("NdMemoryPrintf[%u]: *flex_ptr=0x%016" PRIx64 "\n", index, *flex);
+		}
+	}
+
+	const auto libc_param = proc[7];
+	if (libc_param != 0) {
+		const auto* libc = reinterpret_cast<const uint64_t*>(libc_param);
+		LOGF("NdMemoryPrintf[%u]: libc_param size=0x%016" PRIx64 " heap_size_ptr=0x%016" PRIx64
+		     " need_sce_libc=0x%016" PRIx64 "\n",
+		     index, libc[0], libc[2], libc[9]);
+		if (libc[2] != 0) {
+			const auto* heap = reinterpret_cast<const uint64_t*>(libc[2]);
+			LOGF("NdMemoryPrintf[%u]: *heap_size_ptr=0x%016" PRIx64 "\n", index, *heap);
+		}
+	}
+
+	const auto fs_param = proc[9];
+	if (fs_param != 0) {
+		const auto* fs = reinterpret_cast<const uint64_t*>(fs_param);
+		LOGF("NdMemoryPrintf[%u]: fs_param=0x%016" PRIx64 " q0=0x%016" PRIx64 " q1=0x%016" PRIx64
+		     " q2=0x%016" PRIx64 " q3=0x%016" PRIx64 "\n",
+		     index, fs_param, fs[0], fs[1], fs[2], fs[3]);
+	}
+
+	if (Libs::LibKernel::Memory::IsNdMemoryValidationTraceActive()) {
+		LOGF("NdMemoryPrintf[%u]: nd_trace_still_active=1\n", index);
+	}
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* format,
                                 VaList* va_list) {
+	MaybeLogNdInitializeMemoryPrintf(format, va_list);
+
 	std::vector<char> buffer;
 
 	uint32_t flags     = 0;

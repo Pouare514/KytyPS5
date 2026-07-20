@@ -3,6 +3,7 @@
 
 #include "kernel/eventQueue.h"
 
+#include <atomic>
 #include <cstdint>
 
 namespace Libs::Graphics {
@@ -18,6 +19,21 @@ namespace Sync {
 void TriggerAgcUserInterrupt();
 void TriggerEopEvent(uint32_t context_id);
 void TriggerEopEventAtEndOfPipe(CommandBuffer* buffer, uint32_t context_id);
+
+namespace SubmitTrace {
+extern std::atomic<uint64_t> submit_dcb;
+extern std::atomic<uint64_t> submit_acb;
+extern std::atomic<uint64_t> add_eq;
+extern std::atomic<uint64_t> eop;
+
+void NoteSubmitDcb();
+void NoteSubmitAcb();
+void NoteAddEq();
+void NoteEop();
+void LogNdJobSyncTimeout();
+} // namespace SubmitTrace
+
+void OnNdJobSyncTimeout(LibKernel::EventQueue::KernelEqueue eq);
 
 void WriteAtEndOfPipe32(uint64_t submit_id, CommandBuffer* buffer, uint32_t* dst_gpu_addr,
                         uint32_t value);

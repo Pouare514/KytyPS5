@@ -2182,6 +2182,16 @@ int KYTY_SYSV_ABI SslFreeCaCerts(int ssl_ctx_id, void* ca_certs) {
 	return OK;
 }
 
+int KYTY_SYSV_ABI SslLoadCert() {
+	PRINT_NAME();
+	return OK;
+}
+
+int KYTY_SYSV_ABI SslGetMemoryPoolStats() {
+	PRINT_NAME();
+	return OK;
+}
+
 } // namespace Ssl
 
 namespace Http {

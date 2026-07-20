@@ -1,12 +1,14 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/crashDiagnostics.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <cstdio>
 #include <cstring>
 
 namespace Libs {
@@ -106,7 +108,9 @@ struct SystemServiceHdrToneMapLuminance {
 
 static int KYTY_SYSV_ABI SystemServiceHideSplashScreen() {
 	PRINT_NAME();
-
+	LOGF("FlipTrace: SystemServiceHideSplashScreen\n");
+	fprintf(stderr, "FlipTrace: SystemServiceHideSplashScreen\n");
+	Common::NoteHleCall("SystemService", "SystemService", "HideSplashScreen");
 	return OK;
 }
 

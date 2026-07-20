@@ -62,7 +62,9 @@ static void FreeTlsBlock(ThreadLocalStorage::Block* block) {
 	} else if (block->vm_alloc) {
 		Common::VirtualMemory::Free(reinterpret_cast<uint64_t>(block->ptr));
 	} else {
-		delete[] block->ptr;
+		// Legacy/corrupt block: never delete[] guest-heap pointers.
+		LOGF("FreeTlsBlock: dropping TLS ptr=0x%016" PRIx64 " without free_func/vm_alloc\n",
+		     reinterpret_cast<uint64_t>(block->ptr));
 	}
 
 	block->ptr       = nullptr;
@@ -117,7 +119,8 @@ struct StubbedImportRecord {
 	SymbolType  type = SymbolType::Unknown;
 	BindType    bind = BindType::Unknown;
 	std::string program;
-	uint64_t    call_count = 0;
+	uint64_t    call_count              = 0;
+	bool        called_during_nd_window = false;
 };
 
 // The structure will be passed via the stack
@@ -307,8 +310,16 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (record_id < g_stubbed_imports.size()) {
 		g_stubbed_imports[record_id].call_count++;
+		if (Libs::LibKernel::Memory::IsNdMemoryValidationTraceActive()) {
+			g_stubbed_imports[record_id].called_during_nd_window = true;
+		}
 	}
-	if (log_index < 1024) {
+	const bool force_agc_log =
+	    record_id < g_stubbed_imports.size() &&
+	    (g_stubbed_imports[record_id].name.find("AgcDriver") != std::string::npos ||
+	     g_stubbed_imports[record_id].name.find("[Agc_v1]") != std::string::npos ||
+	     g_stubbed_imports[record_id].name.find("[Agc]") != std::string::npos);
+	if (log_index < 1024 || force_agc_log) {
 		if (record_id < g_stubbed_imports.size()) {
 			const auto& record = g_stubbed_imports[record_id];
 			printf("Unresolved import stub called: %s\n", record.name.c_str());
@@ -317,6 +328,9 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 			     log_index, record.patch_vaddr, record.index, record.name.c_str(),
 			     Common::EnumName(record.type).c_str(), Common::EnumName(record.bind).c_str(),
 			     record.program.c_str());
+			if (force_agc_log && log_index >= 1024) {
+				fprintf(stderr, "Unresolved Agc stub called: %s\n", record.name.c_str());
+			}
 		} else {
 			printf("Unresolved import stub called: <bad-record>\n");
 			LOGF("Unresolved import stub called [%u]: record_id=%" PRIu64 " symbol=<bad-record>\n",
@@ -345,31 +359,10 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	auto* func = reinterpret_cast<entry_func_t>(addr);
 
 	if (stack_top != nullptr) {
-		const auto guest_rsp =
-		    reinterpret_cast<uintptr_t>(stack_top) & ~static_cast<uintptr_t>(0x0f);
-		const auto guest_rbp = guest_rsp - 4u * sizeof(uint64_t);
-
-		auto* guest_root_frame = reinterpret_cast<uintptr_t*>(guest_rbp);
-		guest_root_frame[0]    = 0;
-		guest_root_frame[1]    = 0;
-
-		asm volatile("pushq %%r12\n\t"
-		             "pushq %%r13\n\t"
-		             "movq %%rsp, %%r12\n\t"
-		             "movq %%rbp, %%r13\n\t"
-		             "movq %[guest_rsp], %%rsp\n\t"
-		             "movq %[guest_rbp], %%rbp\n\t"
-		             "callq *%[func]\n\t"
-		             "movq %%r13, %%rbp\n\t"
-		             "movq %%r12, %%rsp\n\t"
-		             "popq %%r13\n\t"
-		             "popq %%r12\n\t"
-		             :
-		             : [func] "r"(func), "D"(params),
-		               "S"(atexit_func), [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
-		             : "cc", "memory", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0",
-		               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
-		               "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+		// Same trampoline/jmp path as pthread workers (Phase 18) — no callq across stacks.
+		(void)Libs::LibKernel::PthreadRunGuestOnStack(stack_top, reinterpret_cast<void*>(func),
+		                                              reinterpret_cast<uint64_t>(params),
+		                                              reinterpret_cast<uint64_t>(atexit_func));
 		return;
 	}
 
@@ -448,9 +441,11 @@ static Common::VirtualMemory::Mode GetMode(Elf64_Word flags) {
 		case PF_R: return Common::VirtualMemory::Mode::Read;
 		case PF_W: return Common::VirtualMemory::Mode::Write;
 		case PF_R | PF_W: return Common::VirtualMemory::Mode::ReadWrite;
-		case PF_X: return Common::VirtualMemory::Mode::Execute;
+		// Windows PAGE_EXECUTE is not readable; ND InitializeMemory reads the image to size
+		// CODE_AND_DATA. Map PF_X as RX (hardware code pages are effectively readable).
+		case PF_X: return Common::VirtualMemory::Mode::ExecuteRead;
 		case PF_X | PF_R: return Common::VirtualMemory::Mode::ExecuteRead;
-		case PF_X | PF_W: return Common::VirtualMemory::Mode::ExecuteWrite;
+		case PF_X | PF_W: return Common::VirtualMemory::Mode::ExecuteReadWrite;
 		case PF_X | PF_W | PF_R: return Common::VirtualMemory::Mode::ExecuteReadWrite;
 
 		default: return Common::VirtualMemory::Mode::NoAccess;
@@ -534,6 +529,57 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		        info->access_violation_vaddr)) {
 			return true;
 		}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// Transient protect races: fault fires, then the page is already accessible again.
+		// Cap retries per address — a permanent fault must not spin the VEH forever.
+		{
+			MEMORY_BASIC_INFORMATION mbi {};
+			const auto               fault_addr = info->access_violation_vaddr;
+			if (VirtualQuery(reinterpret_cast<const void*>(fault_addr), &mbi, sizeof(mbi)) != 0 &&
+			    mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_GUARD) == 0 &&
+			    (mbi.Protect & PAGE_NOACCESS) == 0) {
+				const DWORD prot = mbi.Protect;
+				const bool readable =
+				    (prot & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ |
+				             PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) != 0;
+				const bool writable =
+				    (prot & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY |
+				             PAGE_EXECUTE_WRITECOPY)) != 0;
+				const bool executable =
+				    (prot & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+				             PAGE_EXECUTE_WRITECOPY)) != 0;
+				const bool ok =
+				    (info->access_violation_type == CoreAccess::Read && readable) ||
+				    (info->access_violation_type == CoreAccess::Write && writable) ||
+				    (info->access_violation_type == CoreAccess::Execute && executable);
+				if (ok) {
+					static std::atomic<uint64_t> last_retry_addr {0};
+					static std::atomic<uint32_t> last_retry_count {0};
+					const uint64_t               prev = last_retry_addr.load(std::memory_order_relaxed);
+					uint32_t                     count = 1;
+					if (prev == fault_addr) {
+						count = last_retry_count.fetch_add(1, std::memory_order_relaxed) + 1;
+					} else {
+						last_retry_addr.store(fault_addr, std::memory_order_relaxed);
+						last_retry_count.store(1, std::memory_order_relaxed);
+					}
+					LOGF("MemoryTrace: AV resolved-retry addr=0x%016" PRIx64 " prot=0x%08" PRIx32
+					     " count=%u\n",
+					     fault_addr, static_cast<uint32_t>(prot), count);
+					fprintf(stderr,
+					        "MemoryTrace: AV resolved-retry addr=0x%016" PRIx64 " count=%u\n",
+					        fault_addr, count);
+					std::fflush(stderr);
+					if (count <= 8) {
+						return true;
+					}
+					LOGF("MemoryTrace: AV resolved-retry exhausted addr=0x%016" PRIx64 "\n",
+					     fault_addr);
+				}
+			}
+		}
+#endif
 	}
 
 	LOGF("kyty_exception_handler: %016" PRIx64 "\n", info->exception_address);
@@ -1901,19 +1947,14 @@ uint8_t* RuntimeLinker::TlsGetAddr(Program* program) {
 		    program->tls.tcb_offset != 0 ? program->tls.tcb_offset : program->tls.image_size;
 		const auto alloc_size = AlignUp(tcb_offset, TCB_ALIGN) + TCB_SIZE;
 
-		void* allocated = nullptr;
-		if (program->rt != nullptr) {
-			allocated = program->rt->ApplicationHeapMalloc(alloc_size);
-		}
-		if (allocated == nullptr) {
-			allocated = reinterpret_cast<void*>(
-			    Common::VirtualMemory::Alloc(0, alloc_size, Common::VirtualMemory::Mode::ReadWrite));
-			tls.vm_alloc = true;
-		} else {
-			tls.vm_alloc = false;
-		}
-		tls.ptr       = reinterpret_cast<uint8_t*>(allocated);
+		// Always allocate TLS with host VirtualMemory. Using the guest application heap here
+		// forced CleanupThread to call guest free() from a host pthread teardown context, which
+		// is unsafe; the previous delete[] fallback caused STATUS_HEAP_CORRUPTION (0xc0000374).
+		void* allocated = reinterpret_cast<void*>(
+		    Common::VirtualMemory::Alloc(0, alloc_size, Common::VirtualMemory::Mode::ReadWrite));
+		tls.vm_alloc  = true;
 		tls.free_func = nullptr;
+		tls.ptr       = reinterpret_cast<uint8_t*>(allocated);
 
 		EXIT_IF(tls.ptr == nullptr);
 
@@ -1965,7 +2006,8 @@ static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 namespace {
 
 constexpr uint64_t FLEXIBLE_MEMORY_BASE        = 64ull * 1024ull * 1024ull;
-constexpr uint32_t ORBIS_PROC_PARAM_MAGIC      = 0x13bccf52u;
+constexpr uint32_t ORBIS_PROC_PARAM_MAGIC       = 0x13bccf52u;
+constexpr uint32_t ORBIS_PROC_PARAM_FILE_MAGIC  = 0x4942524fu; // "ORBI"
 constexpr uint64_t ORBIS_PROC_PARAM_STRUCT_SIZE = 0x60;
 constexpr uint64_t ORBIS_LIBC_PARAM_STRUCT_SIZE = 0x50;
 constexpr uint64_t PROC_PARAM_SYNTH_SIZE        = 0x120;
@@ -2014,6 +2056,110 @@ struct GuestLibcParam {
 static_assert(sizeof(GuestLibcParam) == 0x50);
 #pragma pack(pop)
 
+static bool IsValidProcParamMagic(uint32_t magic) {
+	return magic == ORBIS_PROC_PARAM_FILE_MAGIC || magic == ORBIS_PROC_PARAM_MAGIC;
+}
+
+static bool GuestAddrIsReadable(uint64_t addr, uint64_t size, const Program* program) {
+	if (addr == 0 || size == 0 || size > UINT64_MAX - addr) {
+		return false;
+	}
+
+	if (program != nullptr && addr >= program->base_vaddr &&
+	    addr + size <= program->base_vaddr + program->mapped_size) {
+		return true;
+	}
+
+	auto* loaded = Common::Singleton<RuntimeLinker>::Instance()->FindProgramByAddr(addr);
+	return loaded != nullptr && addr + size <= loaded->base_vaddr + loaded->mapped_size;
+}
+
+static bool MemParamHasValidExtendedMemory(const GuestKernelMemParam* mem) {
+	return mem != nullptr && mem->extended_memory_1 != 0 && mem->extended_memory_2 != 0;
+}
+
+static void LogProcParamPostRelocate(const Program* program) {
+	if (program == nullptr || program->proc_param_vaddr == 0) {
+		return;
+	}
+
+	const auto* proc = reinterpret_cast<const GuestProcParam*>(program->proc_param_vaddr);
+	LOGF("ProcParam post-reloc: proc=0x%016" PRIx64 " magic=0x%08" PRIx32
+	     " mem_param=0x%016" PRIx64 " libc_param=0x%016" PRIx64 "\n",
+	     program->proc_param_vaddr, proc->magic, proc->mem_param, proc->libc_param);
+
+	if (proc->mem_param == 0) {
+		return;
+	}
+
+	const auto* dump = reinterpret_cast<const uint8_t*>(proc->mem_param);
+	for (size_t row = 0; row < 0x40; row += 16) {
+		LOGF("  mem_param+%04zx: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		     row, dump[row + 0], dump[row + 1], dump[row + 2], dump[row + 3], dump[row + 4],
+		     dump[row + 5], dump[row + 6], dump[row + 7], dump[row + 8], dump[row + 9],
+		     dump[row + 10], dump[row + 11], dump[row + 12], dump[row + 13], dump[row + 14],
+		     dump[row + 15]);
+	}
+}
+
+static void LogProcParamStructures(const char* tag, const GuestProcParam* proc) {
+	if (proc == nullptr) {
+		return;
+	}
+
+	const auto* raw = reinterpret_cast<const uint8_t*>(proc);
+	LOGF("ProcParam %s: size=0x%016" PRIx64 " magic=0x%08" PRIx32 " entry_count=%" PRIu32
+	     " sdk=0x%016" PRIx64 " libc_param=0x%016" PRIx64 " mem_param=0x%016" PRIx64
+	     " stack_size=0x%016" PRIx64 "\n",
+	     tag, proc->size, proc->magic, proc->entry_count, proc->sdk_version, proc->libc_param,
+	     proc->mem_param, proc->main_thread_stack_size);
+	for (size_t row = 0; row < 0x60; row += 16) {
+		LOGF("  proc+%04zx: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		     row, raw[row + 0], raw[row + 1], raw[row + 2], raw[row + 3], raw[row + 4],
+		     raw[row + 5], raw[row + 6], raw[row + 7], raw[row + 8], raw[row + 9], raw[row + 10],
+		     raw[row + 11], raw[row + 12], raw[row + 13], raw[row + 14], raw[row + 15]);
+	}
+
+	if (proc->libc_param != 0) {
+		const auto* libc = reinterpret_cast<const GuestLibcParam*>(proc->libc_param);
+		const auto* dump = reinterpret_cast<const uint8_t*>(proc->libc_param);
+		LOGF("ProcParam %s libc: size=0x%016" PRIx64 " heap_size_ptr=0x%016" PRIx64
+		     " need_sce_libc=0x%016" PRIx64 "\n",
+		     tag, libc->size, libc->heap_size, libc->need_sce_libc);
+		for (size_t row = 0; row < 0x50; row += 16) {
+			LOGF("  libc+%04zx: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			     row, dump[row + 0], dump[row + 1], dump[row + 2], dump[row + 3], dump[row + 4],
+			     dump[row + 5], dump[row + 6], dump[row + 7], dump[row + 8], dump[row + 9],
+			     dump[row + 10], dump[row + 11], dump[row + 12], dump[row + 13], dump[row + 14],
+			     dump[row + 15]);
+		}
+		if (libc->heap_size != 0) {
+			LOGF("ProcParam %s *heap_size_ptr=0x%016" PRIx64 "\n", tag,
+			     *reinterpret_cast<const uint64_t*>(libc->heap_size));
+		}
+	}
+
+	if (proc->mem_param != 0) {
+		const auto* mem  = reinterpret_cast<const GuestKernelMemParam*>(proc->mem_param);
+		const auto* dump = reinterpret_cast<const uint8_t*>(proc->mem_param);
+		LOGF("ProcParam %s mem: size=0x%016" PRIx64 " flex_ptr=0x%016" PRIx64
+		     " ext1=0x%016" PRIx64 " ext2=0x%016" PRIx64 "\n",
+		     tag, mem->size, mem->flexible_memory_size, mem->extended_memory_1,
+		     mem->extended_memory_2);
+		for (size_t row = 0; row < 0x40; row += 16) {
+			LOGF("  mem+%04zx: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			     row, dump[row + 0], dump[row + 1], dump[row + 2], dump[row + 3], dump[row + 4],
+			     dump[row + 5], dump[row + 6], dump[row + 7], dump[row + 8], dump[row + 9],
+			     dump[row + 10], dump[row + 11], dump[row + 12], dump[row + 13], dump[row + 14],
+			     dump[row + 15]);
+		}
+		if (mem->flexible_memory_size != 0) {
+			LOGF("ProcParam %s *flex_ptr=0x%016" PRIx64 "\n", tag,
+			     *reinterpret_cast<const uint64_t*>(mem->flexible_memory_size));
+		}
+	}
+}
+
 static bool IsSystemModuleFilename(const std::string& name) {
 	const auto lower = Common::ToLower(name);
 	return Common::EndsWith(lower, "libc.prx") || Common::EndsWith(lower, "libkernel.prx") ||
@@ -2025,6 +2171,8 @@ static void RegisterLoadedProgramMemory(Program* program) {
 	Libs::LibKernel::Memory::RegisterProgramFlexibleQuota(program->base_size_aligned,
 	                                                     module_name.c_str());
 }
+
+static bool MakeGuestRegionWritable(uint64_t vaddr, uint64_t size);
 
 static void WireGuestMemParamExtended(GuestKernelMemParam* mem, uint64_t proc_vaddr,
                                       uint64_t synth_size) {
@@ -2052,23 +2200,78 @@ static void WireGuestMemParamExtended(GuestKernelMemParam* mem, uint64_t proc_va
 }
 
 static bool PatchFlexibleScalarInProcParam(GuestProcParam* proc, uint64_t flex_scalar,
-                                           uint64_t proc_vaddr, uint64_t synth_size) {
+                                           uint64_t proc_vaddr, uint64_t synth_size,
+                                           const Program* program) {
 	if (proc == nullptr || proc->mem_param == 0) {
 		return false;
 	}
 
-	auto* mem = reinterpret_cast<GuestKernelMemParam*>(proc->mem_param);
-	if (mem->size < offsetof(GuestKernelMemParam, flexible_memory_size) + sizeof(uint64_t) ||
-	    mem->flexible_memory_size == 0) {
+	if (!GuestAddrIsReadable(proc->mem_param, sizeof(GuestKernelMemParam), program)) {
+		LOGF("PatchFlexibleScalarInProcParam: mem_param 0x%016" PRIx64 " not readable\n",
+		     proc->mem_param);
 		return false;
 	}
 
-	auto* flex_ptr = reinterpret_cast<uint64_t*>(mem->flexible_memory_size);
-	LOGF("SynthesizeProgramProcParam: patching flex scalar at 0x%016" PRIx64 " (was 0x%016" PRIx64
-	     ")\n",
-	     mem->flexible_memory_size, *flex_ptr);
+	auto* mem = reinterpret_cast<GuestKernelMemParam*>(proc->mem_param);
+	if (mem->size < offsetof(GuestKernelMemParam, flexible_memory_size) + sizeof(uint64_t)) {
+		return false;
+	}
+
+	uint64_t flex_ptr_addr = mem->flexible_memory_size;
+	if (flex_ptr_addr == 0) {
+		// mem_param+sizeof(mem) is fs_param on this title — never store the scalar there.
+		// Use padding inside the writable proc_param synth region instead.
+		flex_ptr_addr = AlignUp(proc_vaddr + sizeof(GuestProcParam), 8ull);
+		if (flex_ptr_addr + sizeof(uint64_t) > proc_vaddr + synth_size) {
+			LOGF("PatchFlexibleScalarInProcParam: no room for flex scalar in proc_param synth\n");
+			return false;
+		}
+		if (!MakeGuestRegionWritable(proc_vaddr, synth_size)) {
+			LOGF("PatchFlexibleScalarInProcParam: failed to make proc_param writable\n");
+			return false;
+		}
+		if (!MakeGuestRegionWritable(proc->mem_param, sizeof(GuestKernelMemParam))) {
+			LOGF("PatchFlexibleScalarInProcParam: failed to make mem_param writable at 0x%016"
+			     PRIx64 "\n",
+			     proc->mem_param);
+			return false;
+		}
+		mem->flexible_memory_size = flex_ptr_addr;
+		LOGF("PatchFlexibleScalarInProcParam: wired flex_ptr into proc_param pad at 0x%016" PRIx64
+		     " (avoided fs_param overlap)\n",
+		     flex_ptr_addr);
+	} else if (!MakeGuestRegionWritable(proc->mem_param, sizeof(GuestKernelMemParam))) {
+		LOGF("PatchFlexibleScalarInProcParam: failed to make mem_param writable at 0x%016" PRIx64
+		     "\n",
+		     proc->mem_param);
+	}
+
+	if (!GuestAddrIsReadable(flex_ptr_addr, sizeof(uint64_t), program)) {
+		LOGF("PatchFlexibleScalarInProcParam: flex_ptr 0x%016" PRIx64 " not readable\n",
+		     flex_ptr_addr);
+		return false;
+	}
+
+	if (!MakeGuestRegionWritable(flex_ptr_addr, sizeof(uint64_t))) {
+		LOGF("PatchFlexibleScalarInProcParam: failed to make flex_ptr writable at 0x%016" PRIx64 "\n",
+		     flex_ptr_addr);
+		return false;
+	}
+
+	auto* flex_ptr     = reinterpret_cast<uint64_t*>(flex_ptr_addr);
+	const auto flex_before = *flex_ptr;
+	LOGF("PatchFlexibleScalarInProcParam: mem_param=0x%016" PRIx64 " flex_ptr=0x%016" PRIx64
+	     " *flex_ptr=0x%016" PRIx64 "\n",
+	     proc->mem_param, flex_ptr_addr, flex_before);
 	*flex_ptr = flex_scalar;
-	WireGuestMemParamExtended(mem, proc_vaddr, synth_size);
+	LOGF("PatchFlexibleScalarInProcParam: *flex_ptr after=0x%016" PRIx64 "\n", *flex_ptr);
+
+	if (!MemParamHasValidExtendedMemory(mem)) {
+		WireGuestMemParamExtended(mem, proc_vaddr, synth_size);
+	} else {
+		LOGF("PatchFlexibleScalarInProcParam: preserved ELF extended_memory\n");
+	}
+
 	Libs::LibKernel::Memory::ApplyMemoryRegionsFromProcParam(flex_scalar);
 	return true;
 }
@@ -2098,6 +2301,53 @@ static bool MakeGuestRegionWritable(uint64_t vaddr, uint64_t size) {
 	Libs::LibKernel::Memory::UpdateProgramMemoryProtection(vaddr, size,
 	                                                       Common::VirtualMemory::Mode::ReadWrite);
 	return true;
+}
+
+static void WireGuestProcParamPointers(GuestProcParam* proc, uint64_t proc_vaddr,
+                                       uint64_t synth_size) {
+	// Synth layout after the 0x60 header:
+	//   +0x60: flex scalar (u64) — owned by PatchFlexibleScalarInProcParam
+	//   +0x68: main_thread_stack_size value (u32)
+	//   +0x70: heap_size scalar (u64) for ELF libc_param when heap_size ptr is null
+	const auto stack_val_vaddr = AlignUp(proc_vaddr + sizeof(GuestProcParam) + sizeof(uint64_t), 8ull);
+	const auto heap_val_vaddr  = AlignUp(stack_val_vaddr + sizeof(uint32_t), 8ull);
+
+	if (heap_val_vaddr + sizeof(uint64_t) > proc_vaddr + synth_size) {
+		LOGF("WireGuestProcParamPointers: proc_param synth too small\n");
+		return;
+	}
+
+	if (proc->main_thread_stack_size == 0) {
+		auto* stack_val = reinterpret_cast<uint32_t*>(stack_val_vaddr);
+		*stack_val                    = 0x200000u;
+		proc->main_thread_stack_size  = stack_val_vaddr;
+		LOGF("WireGuestProcParamPointers: stack_size_ptr=0x%016" PRIx64 " *val=0x%x\n",
+		     stack_val_vaddr, *stack_val);
+	}
+
+	if (proc->libc_param == 0) {
+		return;
+	}
+
+	// PS5 libc_param is 0xa8; heap_size pointer remains at offset 0x10 like PS4.
+	auto* libc_words = reinterpret_cast<uint64_t*>(proc->libc_param);
+	const auto libc_size = libc_words[0];
+	if (libc_size < 0x18) {
+		return;
+	}
+
+	if (libc_words[2] == 0) {
+		if (!MakeGuestRegionWritable(proc->libc_param, libc_size)) {
+			LOGF("WireGuestProcParamPointers: failed to make libc_param writable\n");
+			return;
+		}
+		auto* heap_val = reinterpret_cast<uint64_t*>(heap_val_vaddr);
+		*heap_val      = UINT64_MAX;
+		libc_words[2]  = heap_val_vaddr;
+		LOGF("WireGuestProcParamPointers: libc heap_size_ptr=0x%016" PRIx64 " *val=0x%016" PRIx64
+		     "\n",
+		     heap_val_vaddr, *heap_val);
+	}
 }
 
 static void WireGuestLibcParam(GuestProcParam* proc, uint64_t proc_vaddr, uint64_t synth_size) {
@@ -2137,27 +2387,13 @@ void SynthesizeProgramProcParam(Program* program) {
 	const auto proc_vaddr = program->proc_param_vaddr;
 	const auto synth_size = std::max(program->proc_param_size, PROC_PARAM_SYNTH_SIZE);
 
-	if (program->elf != nullptr) {
-		const auto* ehdr = program->elf->GetEhdr();
-		const auto* phdr = program->elf->GetPhdr();
-		if (ehdr != nullptr && phdr != nullptr) {
-			for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
-				if (phdr[i].p_type == PT_OS_PROCPARAM && phdr[i].p_filesz > 0) {
-					program->elf->LoadSegment(proc_vaddr, phdr[i].p_offset, phdr[i].p_filesz);
-					LOGF("SynthesizeProgramProcParam: reloaded proc_param from ELF (0x%016" PRIx64
-					     " bytes)\n",
-					     phdr[i].p_filesz);
-					break;
-				}
-			}
-		}
-	}
+	LogProcParamPostRelocate(program);
 
 	std::vector<uint8_t> elf_backup(synth_size);
 	std::memcpy(elf_backup.data(), reinterpret_cast<void*>(proc_vaddr), synth_size);
 	const auto* elf_proc = reinterpret_cast<const GuestProcParam*>(elf_backup.data());
 	const bool  elf_template =
-	    elf_proc->magic == ORBIS_PROC_PARAM_MAGIC && elf_proc->size >= sizeof(GuestProcParam);
+	    IsValidProcParamMagic(elf_proc->magic) && elf_proc->size >= sizeof(GuestProcParam);
 	LOGF("SynthesizeProgramProcParam: backup magic=0x%08" PRIx32 " size=0x%016" PRIx64
 	     " elf_template=%d\n",
 	     elf_proc->magic, elf_proc->size, elf_template ? 1 : 0);
@@ -2173,27 +2409,41 @@ void SynthesizeProgramProcParam(Program* program) {
 	if (elf_template) {
 		std::memcpy(proc, elf_backup.data(), synth_size);
 		LOGF("SynthesizeProgramProcParam: merging ELF proc_param template at 0x%016" PRIx64
-		     " sdk=0x%016" PRIx64 "\n",
-		     proc_vaddr, proc->sdk_version);
-		if (proc->sdk_version == 0) {
-			proc->sdk_version = GetProgramSdkVersion(program);
+		     " sdk=0x%016" PRIx64 " magic=0x%08" PRIx32 "\n",
+		     proc_vaddr, proc->sdk_version, proc->magic);
+		// ELF sdk_version 0x0500003309590001 looks like a relocated/packed value; ND budget
+		// init may key off a normal 0xMMmmmpp00 SDK word (e.g. 0x05000000).
+		const auto elf_sdk = proc->sdk_version;
+		proc->sdk_version  = GetProgramSdkVersion(program);
+		LOGF("SynthesizeProgramProcParam: sdk normalized 0x%016" PRIx64 " -> 0x%016" PRIx64 "\n",
+		     elf_sdk, proc->sdk_version);
+		// Runtime/kernel consumers expect 0x13bccf52; keep ELF body but normalize magic.
+		if (proc->magic == ORBIS_PROC_PARAM_FILE_MAGIC) {
+			proc->magic = ORBIS_PROC_PARAM_MAGIC;
+			LOGF("SynthesizeProgramProcParam: normalized magic ORBI -> 0x%08" PRIx32 "\n",
+			     proc->magic);
 		}
-		if (proc->main_thread_stack_size == 0) {
-			proc->main_thread_stack_size = 0x200000ull;
-		}
-		if (PatchFlexibleScalarInProcParam(proc, flex_scalar, proc_vaddr, synth_size)) {
+		// main_thread_stack_size / libc heap_size are guest pointers — wire into synth pad.
+		WireGuestProcParamPointers(proc, proc_vaddr, synth_size);
+		if (PatchFlexibleScalarInProcParam(proc, flex_scalar, proc_vaddr, synth_size, program)) {
 			if (proc->libc_param == 0) {
 				WireGuestLibcParam(proc, proc_vaddr, synth_size);
 			} else {
 				LOGF("WireGuestLibcParam: preserved ELF libc_param=0x%016" PRIx64 "\n",
 				     proc->libc_param);
 			}
+			LogProcParamStructures("post-merge-patched", proc);
 			return;
 		}
-		LOGF("SynthesizeProgramProcParam: ELF template missing mem_param flex chain, synthesizing\n");
+		LOGF("SynthesizeProgramProcParam: ELF template preserved without flex scalar patch "
+		     "(mem_param=0x%016" PRIx64 ")\n",
+		     proc->mem_param);
+		Libs::LibKernel::Memory::ApplyMemoryRegionsFromProcParam(flex_scalar);
+		LogProcParamStructures("post-merge-nopatch", proc);
+		return;
 	}
 
-	if (PatchFlexibleScalarInProcParam(proc, flex_scalar, proc_vaddr, synth_size)) {
+	if (PatchFlexibleScalarInProcParam(proc, flex_scalar, proc_vaddr, synth_size, program)) {
 		if (proc->libc_param == 0) {
 			WireGuestLibcParam(proc, proc_vaddr, synth_size);
 		}
@@ -2543,7 +2793,7 @@ static void InstallRelocateHandler(Program* program) {
 		    Jit::CallPlt(program->custom_call_plt_num);
 		code->SetPltGot(pltgot_vaddr);
 		Common::VirtualMemory::Protect(program->custom_call_plt_vaddr, size,
-		                               Common::VirtualMemory::Mode::Execute);
+		                               Common::VirtualMemory::Mode::ExecuteRead);
 		Common::VirtualMemory::FlushInstructionCache(program->custom_call_plt_vaddr, size);
 	}
 }
@@ -2730,7 +2980,7 @@ void RuntimeLinker::SetupTlsHandler(Program* program) {
 	}
 
 	if (!Common::VirtualMemory::Protect(program->tls.handler_vaddr, Jit::SafeCall::GetSize(),
-	                                    Common::VirtualMemory::Mode::Execute)) {
+	                                    Common::VirtualMemory::Mode::ExecuteRead)) {
 		EXIT("failed to protect program TLS handler\n");
 	}
 	Common::VirtualMemory::FlushInstructionCache(program->tls.handler_vaddr,
@@ -2842,6 +3092,10 @@ void* RuntimeLinker::ApplicationHeapMalloc(uint64_t size) {
 	return m_application_heap_malloc != nullptr ? m_application_heap_malloc(size) : nullptr;
 }
 
+application_heap_free_func_t RuntimeLinker::ApplicationHeapFreeFunc() const {
+	return m_application_heap_free;
+}
+
 std::vector<StubbedImportSummary> GetStubbedImportReport() {
 	std::vector<StubbedImportSummary> report;
 	report.reserve(g_stubbed_imports.size());
@@ -2892,6 +3146,18 @@ bool WriteStubbedImportReport(const std::filesystem::path& file_path) {
 		file.Printf("[%s] calls=%" PRIu64 " index=%" PRIu32 " program=%s\n", entry.name.c_str(),
 		            entry.call_count, entry.registration_index, entry.program.c_str());
 	}
+
+	file.Printf("\n# called_during_nd_window\n");
+	uint64_t nd_window_called = 0;
+	for (const auto& record: g_stubbed_imports) {
+		if (!record.called_during_nd_window) {
+			continue;
+		}
+		nd_window_called++;
+		file.Printf("[%s] calls=%" PRIu64 " index=%" PRIu32 " program=%s\n", record.name.c_str(),
+		            record.call_count, record.index, record.program.c_str());
+	}
+	file.Printf("# nd_window_called=%" PRIu64 "\n", nd_window_called);
 
 	file.Close();
 	LOGF("Wrote stub import report (%" PRIu64 " entries, %" PRIu64 " called): %s\n", registered,

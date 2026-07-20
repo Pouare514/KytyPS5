@@ -4,11 +4,13 @@
 #include "common/common.h"
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
+#include "common/fatalLog.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/presentation/videoOut.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -19,7 +21,9 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cinttypes>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <mutex>
@@ -346,6 +350,78 @@ struct PthreadGuestData {
 
 static_assert(sizeof(PthreadGuestData) == 4096);
 
+// Mirrors FiberCpuContext: non-local return from guest stack without retq on guest RSP.
+struct HostCpuContext {
+	uint64_t rbx;
+	uint64_t rbp;
+	uint64_t rdi;
+	uint64_t rsi;
+	uint64_t r12;
+	uint64_t r13;
+	uint64_t r14;
+	uint64_t r15;
+	uint64_t rsp;
+	uint64_t rip;
+};
+
+static_assert(sizeof(HostCpuContext) == 80);
+
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((noinline, returns_twice)) static uint64_t HostSaveContext(HostCpuContext* ctx) {
+	uint64_t ret = 0;
+	asm volatile("movq %[ctx], %%r10\n\t"
+	             "movq %%rbx, 0(%%r10)\n\t"
+	             "movq %%rbp, 8(%%r10)\n\t"
+	             "movq %%rdi, 16(%%r10)\n\t"
+	             "movq %%rsi, 24(%%r10)\n\t"
+	             "movq %%r12, 32(%%r10)\n\t"
+	             "movq %%r13, 40(%%r10)\n\t"
+	             "movq %%r14, 48(%%r10)\n\t"
+	             "movq %%r15, 56(%%r10)\n\t"
+	             "leaq 8(%%rsp), %%r11\n\t"
+	             "movq %%r11, 64(%%r10)\n\t"
+	             "movq (%%rsp), %%r11\n\t"
+	             "movq %%r11, 72(%%r10)\n\t"
+	             "xorq %%rax, %%rax\n\t"
+	             : "=a"(ret)
+	             : [ctx] "r"(ctx)
+	             : "memory", "r10", "r11");
+	return ret;
+}
+
+__attribute__((noreturn, noinline)) static void HostRestoreContext(HostCpuContext* ctx,
+                                                                   uint64_t         ret) {
+	asm volatile("movq %[ctx], %%r10\n\t"
+	             "movq 72(%%r10), %%r11\n\t"
+	             "movq 0(%%r10), %%rbx\n\t"
+	             "movq 8(%%r10), %%rbp\n\t"
+	             "movq 16(%%r10), %%rdi\n\t"
+	             "movq 24(%%r10), %%rsi\n\t"
+	             "movq 32(%%r10), %%r12\n\t"
+	             "movq 40(%%r10), %%r13\n\t"
+	             "movq 48(%%r10), %%r14\n\t"
+	             "movq 56(%%r10), %%r15\n\t"
+	             "movq 64(%%r10), %%rsp\n\t"
+	             "movq %[ret], %%rax\n\t"
+	             "jmp *%%r11\n\t"
+	             :
+	             : [ctx] "r"(ctx), [ret] "r"(ret)
+	             : "memory", "rax", "r10", "r11");
+	__builtin_unreachable();
+}
+#else
+static uint64_t HostSaveContext(HostCpuContext* ctx) {
+	(void)ctx;
+	return 0;
+}
+
+[[noreturn]] static void HostRestoreContext(HostCpuContext* ctx, uint64_t ret) {
+	(void)ctx;
+	(void)ret;
+	EXIT("Host context switching is only implemented on x86_64\n");
+}
+#endif
+
 struct PthreadPrivate {
 	PthreadGuestData      guest;
 	std::string           name;
@@ -357,17 +433,16 @@ struct PthreadPrivate {
 	std::atomic_bool      detached;
 	std::atomic_bool      almost_done;
 	std::atomic_bool      free;
+	std::atomic_bool      joining;
+	// False while recycled/creating or after join — Setprio must not touch stale pthread_t.
+	std::atomic_bool      p_valid;
+	std::mutex            life_mutex;
 	uint64_t              host_thread_id;
-	uintptr_t             guest_host_rbx;
-	uintptr_t             guest_host_rsp;
-	uintptr_t             guest_host_rbp;
+	HostCpuContext        host_return_ctx {};
+	bool                  host_return_valid = false;
 	uint64_t              cond_sequence = 0;
 	PthreadCondPrivate*   waiting_cond  = nullptr;
 	std::atomic<uint64_t> pending_signal_mask {0};
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	uintptr_t guest_host_gs8;
-	uintptr_t guest_host_gs10;
-#endif
 };
 
 static PthreadAttrPrivate* GetPthreadAttrValue(const PthreadAttr* attr, const char* func_name) {
@@ -423,12 +498,32 @@ struct PthreadCondPrivate {
 	std::vector<Pthread>    waiters;
 };
 
+static bool IsSubmissionRelatedName(const std::string& name) {
+	return name.find("Mixed") != std::string::npos || name.find("Compute") != std::string::npos ||
+	       name.find("Submit") != std::string::npos;
+}
+
 static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	EXIT_IF(cond == nullptr);
 	EXIT_IF(thread == nullptr);
 
 	thread->waiting_cond = cond;
 	cond->waiters.push_back(thread);
+
+	const bool main_related =
+	    thread->unique_id == 8 || thread->name == "MainThread" ||
+	    thread->name.find("Main") != std::string::npos ||
+	    thread->name.find("BootCards") != std::string::npos;
+	if (IsSubmissionRelatedName(thread->name) || main_related) {
+		static std::atomic<uint32_t> logs {0};
+		if (logs.fetch_add(1, std::memory_order_relaxed) < 96) {
+			const uint64_t ra = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+			LOGF("SubmitTrace: CondWait name=%s tid=%d cond=%s ra=0x%016" PRIx64 "\n",
+			     thread->name.c_str(), thread->unique_id, cond->name.c_str(), ra);
+			fprintf(stderr, "SubmitTrace: CondWait name=%s tid=%d cond=%s\n", thread->name.c_str(),
+			        thread->unique_id, cond->name.c_str());
+		}
+	}
 }
 
 static bool CondRemoveWaiter(PthreadCondPrivate* cond, Pthread thread) {
@@ -614,7 +709,14 @@ public:
 
 	Pthread Create();
 
-	void FreeDetachedThreads();
+	void   FreeDetachedThreads();
+	void   DumpSubmissionThreads(const char* reason);
+	void   DumpAllGuestThreads(const char* reason);
+	size_t WakeSubmissionCondWaiters();
+	size_t SuspendAllGuests();
+	size_t ResumeAllGuests();
+	size_t SuspendMainRelatedGuests();
+	size_t ResumeMainRelatedGuests();
 
 private:
 	std::vector<Pthread> m_threads;
@@ -659,11 +761,10 @@ private:
 	std::atomic<thread_dtors_func_t> m_thread_dtors = nullptr;
 };
 
-thread_local Pthread        g_pthread_self           = nullptr;
-static Pthread              g_pthread_main           = nullptr;
-PThreadContext*             g_pthread_context        = nullptr;
-thread_local uintptr_t      g_guest_entry_return_rsp = 0;
-static std::atomic<int32_t> g_pthread_thread_id      = 0;
+thread_local Pthread        g_pthread_self      = nullptr;
+static Pthread              g_pthread_main      = nullptr;
+PThreadContext*             g_pthread_context   = nullptr;
+static std::atomic<int32_t> g_pthread_thread_id = 0;
 
 static Common::Mutex g_guest_stack_mutex;
 static uint64_t      g_guest_stack_last = 0;
@@ -754,95 +855,85 @@ static void FreeGuestStack(PthreadAttr attr) {
 	attr->stack_map_size = 0;
 }
 
-static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top) {
+extern "C" __attribute__((noreturn, noinline)) void GuestThreadFinishOnHost(uint64_t value) {
+	if (g_pthread_self == nullptr) {
+		EXIT("GuestThreadFinishOnHost without pthread self\n");
+	}
+	LOGF("GuestThreadFinishOnHost tid=%d value=0x%016" PRIx64 "\n", g_pthread_self->unique_id,
+	     value);
+	fprintf(stderr, "GuestThreadFinishOnHost tid=%d\n", g_pthread_self->unique_id);
+	g_pthread_self->host_return_valid = false;
+	HostRestoreContext(&g_pthread_self->host_return_ctx, value);
+}
+
+// Entered by guest `ret` with return value still in rax — must not clobber rax in a C prologue.
 #if defined(__x86_64__) || defined(_M_X64)
-	void*      ret       = nullptr;
-	const auto guest_rsp = reinterpret_cast<uintptr_t>(stack_top) & ~static_cast<uintptr_t>(0x0f);
-	const auto guest_rbp = guest_rsp - 4u * sizeof(uint64_t);
+extern "C" __attribute__((naked, noinline)) void GuestThreadReturnTrampoline() {
+	// Basic asm (naked): single '%' — extended asm %% escapes do not apply.
+	asm volatile(
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	    "movq %rax, %rcx\n\t"
+#else
+	    "movq %rax, %rdi\n\t"
+#endif
+	    "jmp GuestThreadFinishOnHost\n\t");
+}
+#else
+extern "C" __attribute__((noreturn, noinline)) void GuestThreadReturnTrampoline() {
+	EXIT("GuestThreadReturnTrampoline is only implemented on x86_64\n");
+}
+#endif
+
+uint64_t PthreadRunGuestOnStack(void* stack_top, void* entry, uint64_t arg0, uint64_t arg1) {
+#if defined(__x86_64__) || defined(_M_X64)
+	EXIT_IF(stack_top == nullptr);
+	EXIT_IF(entry == nullptr);
+	EXIT_IF(g_pthread_self == nullptr);
+
+	const uint64_t rc = HostSaveContext(&g_pthread_self->host_return_ctx);
+	if (rc != 0) {
+		g_pthread_self->host_return_valid = false;
+		return rc;
+	}
+	g_pthread_self->host_return_valid = true;
+
+	auto guest_top = reinterpret_cast<uintptr_t>(stack_top) & ~static_cast<uintptr_t>(0x0f);
+	const auto guest_rbp = guest_top - 4u * sizeof(uint64_t);
 
 	auto* guest_root_frame = reinterpret_cast<uintptr_t*>(guest_rbp);
 	guest_root_frame[0]    = 0;
 	guest_root_frame[1]    = 0;
 
-	g_guest_entry_return_rsp = guest_rsp - sizeof(uint64_t);
+	// Synthetic call frame: [rsp]=trampoline, rsp ≡ 8 (mod 16) as after a real call.
+	guest_top -= sizeof(uint64_t);
+	*reinterpret_cast<uint64_t*>(guest_top) =
+	    reinterpret_cast<uint64_t>(&GuestThreadReturnTrampoline);
 
-	uintptr_t host_rsp = 0;
-	uintptr_t host_rbp = 0;
-	uintptr_t host_rbx = 0;
-	asm volatile("movq %%rsp, %0\n\t"
-	             "movq %%rbp, %1\n\t"
-	             "movq %%rbx, %2\n\t"
-	             : "=r"(host_rsp), "=r"(host_rbp), "=r"(host_rbx)
-	             :
-	             : "memory");
+	const auto guest_rsp = guest_top;
+	auto*      entry_fn  = entry;
 
-	if (g_pthread_self != nullptr) {
-		g_pthread_self->guest_host_rbx = host_rbx;
-		g_pthread_self->guest_host_rsp = host_rsp - (2u * sizeof(uint64_t));
-		g_pthread_self->guest_host_rbp = host_rbp;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		uintptr_t host_gs8  = 0;
-		uintptr_t host_gs10 = 0;
-		asm volatile("movq %%gs:0x08, %0\n\t"
-		             "movq %%gs:0x10, %1\n\t"
-		             : "=r"(host_gs8), "=r"(host_gs10)
-		             :
-		             : "memory");
-		g_pthread_self->guest_host_rsp -= 2u * sizeof(uint64_t);
-		g_pthread_self->guest_host_gs8  = host_gs8;
-		g_pthread_self->guest_host_gs10 = host_gs10;
-#endif
-	}
-
-	// The guest ABI expects the entry argument in rdi and a 16-byte aligned stack before call.
-	asm volatile("pushq %%r12\n\t"
-	             "pushq %%r13\n\t"
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	             "pushq %%r14\n\t"
-	             "pushq %%r15\n\t"
-	             "movq %%gs:0x08, %%r14\n\t"
-	             "movq %%gs:0x10, %%r15\n\t"
-	             "xorq %%rcx, %%rcx\n\t"
-	             "movq %%rcx, %%gs:0x08\n\t"
-	             "movq %%rcx, %%gs:0x10\n\t"
-#endif
-	             "movq %%rsp, %%r12\n\t"
-	             "movq %%rbp, %%r13\n\t"
-	             "movq %[guest_rsp], %%rsp\n\t"
+	// Guest SysV: rdi=arg0, rsi=arg1. Never callq — jmp only; return via trampoline.
+	asm volatile("movq %[guest_rsp], %%rsp\n\t"
 	             "movq %[guest_rbp], %%rbp\n\t"
-	             "callq *%%rsi\n\t"
-	             "movq %%r13, %%rbp\n\t"
-	             "movq %%r12, %%rsp\n\t"
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	             "movq %%r14, %%gs:0x08\n\t"
-	             "movq %%r15, %%gs:0x10\n\t"
-	             "popq %%r15\n\t"
-	             "popq %%r14\n\t"
-#endif
-	             "popq %%r13\n\t"
-	             "popq %%r12\n\t"
-	             : "=a"(ret), "+D"(arg), "+S"(func)
-	             : [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
-	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
-	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
-	               "xmm12", "xmm13", "xmm14", "xmm15");
-
-	g_guest_entry_return_rsp = 0;
-	if (g_pthread_self != nullptr) {
-		g_pthread_self->guest_host_rbx = 0;
-		g_pthread_self->guest_host_rsp = 0;
-		g_pthread_self->guest_host_rbp = 0;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		g_pthread_self->guest_host_gs8  = 0;
-		g_pthread_self->guest_host_gs10 = 0;
-#endif
-	}
-
-	return ret;
+	             "movq %[arg0], %%rdi\n\t"
+	             "movq %[arg1], %%rsi\n\t"
+	             "jmpq *%[entry]\n\t"
+	             :
+	             : [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp), [arg0] "r"(arg0),
+	               [arg1] "r"(arg1), [entry] "r"(entry_fn)
+	             : "memory", "cc", "rax", "rcx", "rdx", "rdi", "rsi", "r8", "r9", "r10", "r11");
+	__builtin_unreachable();
 #else
 	(void)stack_top;
-	return func(arg);
+	using Fn = KYTY_SYSV_ABI uint64_t (*)(uint64_t, uint64_t);
+	return reinterpret_cast<Fn>(entry)(arg0, arg1);
 #endif
+}
+
+static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top) {
+	const uint64_t rc = PthreadRunGuestOnStack(stack_top, reinterpret_cast<void*>(func),
+	                                           reinterpret_cast<uint64_t>(arg), 0);
+	return reinterpret_cast<void*>(static_cast<uintptr_t>(rc));
 }
 
 static void UpdateCurrentThreadStackAttr(PthreadAttr* attr) {
@@ -892,6 +983,8 @@ void PthreadInitSelfForMainThread() {
 	g_pthread_self->guest.thread_id = ++g_pthread_thread_id;
 	g_pthread_self->unique_id       = Common::Thread::GetThreadIdUnique();
 	g_pthread_self->free            = false;
+	g_pthread_self->joining         = false;
+	g_pthread_self->p_valid         = true;
 	g_pthread_self->detached        = false;
 	g_pthread_self->almost_done     = false;
 	g_pthread_self->entry           = nullptr;
@@ -1387,7 +1480,13 @@ Pthread PthreadPool::Create() {
 
 	for (auto* p: m_threads) {
 		if (p->free) {
-			p->free = false;
+			std::lock_guard life(p->life_mutex);
+			p->free     = false;
+			p->joining  = false;
+			p->p_valid  = false;
+			p->p        = {};
+			p->detached = false;
+			p->almost_done = false;
 			return p;
 		}
 	}
@@ -1395,6 +1494,8 @@ Pthread PthreadPool::Create() {
 	auto* ret = new PthreadPrivate {};
 
 	ret->free        = false;
+	ret->joining     = false;
+	ret->p_valid     = false;
 	ret->detached    = false;
 	ret->almost_done = false;
 	ret->attr        = nullptr;
@@ -1412,6 +1513,341 @@ void PthreadPool::FreeDetachedThreads() {
 			PthreadJoin(p, nullptr);
 		}
 	}
+}
+
+static bool IsSubmissionRelatedName(const std::string& name);
+
+void PthreadPool::DumpSubmissionThreads(const char* reason) {
+	Common::LockGuard lock(m_mutex);
+	const char*       why = reason != nullptr ? reason : "?";
+	for (auto* p: m_threads) {
+		if (p == nullptr || p->free || !IsSubmissionRelatedName(p->name)) {
+			continue;
+		}
+		LOGF("SubmitTrace: SubmissionThreadDump reason=%s name=%s tid=%d guest_tid=%d "
+		     "entry=0x%016" PRIx64 " arg=0x%016" PRIx64 " waiting_cond=%d cond=%s cond_ptr=0x%016"
+		     PRIx64 " almost_done=%d\n",
+		     why, p->name.c_str(), p->unique_id, p->guest.thread_id,
+		     reinterpret_cast<uint64_t>(p->entry), reinterpret_cast<uint64_t>(p->arg),
+		     p->waiting_cond != nullptr ? 1 : 0,
+		     p->waiting_cond != nullptr ? p->waiting_cond->name.c_str() : "-",
+		     reinterpret_cast<uint64_t>(p->waiting_cond), p->almost_done.load() ? 1 : 0);
+		fprintf(stderr,
+		        "SubmitTrace: SubmissionThreadDump name=%s tid=%d cond_ptr=0x%016" PRIx64 "\n",
+		        p->name.c_str(), p->unique_id, reinterpret_cast<uint64_t>(p->waiting_cond));
+	}
+}
+
+void PthreadPool::DumpAllGuestThreads(const char* reason) {
+	Common::LockGuard lock(m_mutex);
+	const char*       why = reason != nullptr ? reason : "?";
+	uint32_t          n   = 0;
+	for (auto* p: m_threads) {
+		if (p == nullptr || p->free) {
+			continue;
+		}
+		LOGF("GuestExit: phase40 threadSnap reason=%s name=%s tid=%d guest_tid=%d "
+		     "entry=0x%016" PRIx64 " waiting_cond=%d cond=%s almost_done=%d\n",
+		     why, p->name.c_str(), p->unique_id, p->guest.thread_id,
+		     reinterpret_cast<uint64_t>(p->entry), p->waiting_cond != nullptr ? 1 : 0,
+		     p->waiting_cond != nullptr ? p->waiting_cond->name.c_str() : "-",
+		     p->almost_done.load() ? 1 : 0);
+		fprintf(stderr, "GuestExit: phase40 threadSnap name=%s tid=%d cond=%s\n", p->name.c_str(),
+		        p->unique_id, p->waiting_cond != nullptr ? p->waiting_cond->name.c_str() : "-");
+		if (++n >= 64) {
+			break;
+		}
+	}
+	LOGF("GuestExit: phase40 threadSnap done count=%u reason=%s\n", n, why);
+	fprintf(stderr, "GuestExit: phase40 threadSnap done count=%u\n", n);
+}
+
+// Phase 26: Mixed/Compute sit on an anonymous job-queue cond that is never signaled pre-submit.
+// Wake those waiters once when synthetic EOP / AGC user interrupt runs.
+size_t PthreadPool::WakeSubmissionCondWaiters() {
+	Common::LockGuard lock(m_mutex);
+	size_t            woken = 0;
+	for (auto* p: m_threads) {
+		if (p == nullptr || p->free || !IsSubmissionRelatedName(p->name) ||
+		    p->waiting_cond == nullptr) {
+			continue;
+		}
+		auto* cond = p->waiting_cond;
+		bool  notify = false;
+		{
+			std::lock_guard cond_lock(cond->m);
+			notify = CondWakeWaiter(cond, p);
+		}
+		if (notify) {
+			cond->cv.notify_all();
+			++woken;
+			LOGF("SubmitTrace: WakeSubmissionCond name=%s tid=%d cond_ptr=0x%016" PRIx64 "\n",
+			     p->name.c_str(), p->unique_id, reinterpret_cast<uint64_t>(cond));
+			fprintf(stderr, "SubmitTrace: WakeSubmissionCond name=%s\n", p->name.c_str());
+		}
+	}
+	return woken;
+}
+
+bool PthreadCurrentIsSubmissionRelated() {
+	auto* self = g_pthread_self;
+	return self != nullptr && IsSubmissionRelatedName(self->name);
+}
+
+bool PthreadCurrentIsMainRelated() {
+	auto* self = g_pthread_self;
+	if (self == nullptr) {
+		return false;
+	}
+	// MainThread or unique_id==8 (BootCards / producer in TLOU traces).
+	return self->unique_id == 8 || self->name == "MainThread" ||
+	       self->name.find("Main") != std::string::npos ||
+	       self->name.find("BootCards") != std::string::npos;
+}
+
+void PthreadDumpSubmissionThreads(const char* reason) {
+	static std::atomic<uint32_t> dumps {0};
+	if (dumps.fetch_add(1, std::memory_order_relaxed) >= 4) {
+		return;
+	}
+	if (g_pthread_context == nullptr || g_pthread_context->GetPthreadPool() == nullptr) {
+		return;
+	}
+	g_pthread_context->GetPthreadPool()->DumpSubmissionThreads(reason);
+}
+
+void PthreadDumpAllGuestThreads(const char* reason) {
+	if (g_pthread_context == nullptr || g_pthread_context->GetPthreadPool() == nullptr) {
+		return;
+	}
+	g_pthread_context->GetPthreadPool()->DumpAllGuestThreads(reason);
+}
+
+size_t PthreadWakeSubmissionCondWaiters() {
+	static std::atomic<uint32_t> wakes {0};
+	// Empty-queue re-wait is expected; a few kicks are enough to prove / attempt progress.
+	if (wakes.fetch_add(1, std::memory_order_relaxed) >= 4) {
+		return 0;
+	}
+	if (g_pthread_context == nullptr || g_pthread_context->GetPthreadPool() == nullptr) {
+		return 0;
+	}
+	return g_pthread_context->GetPthreadPool()->WakeSubmissionCondWaiters();
+}
+
+size_t PthreadWakeSubmissionCondWaitersAfterFlip() {
+	static std::atomic<uint32_t> wakes {0};
+	// Separate budget from bootstrap IRQ wakes — post-blank handshake needs its own kicks.
+	if (wakes.fetch_add(1, std::memory_order_relaxed) >= 8) {
+		return 0;
+	}
+	if (g_pthread_context == nullptr || g_pthread_context->GetPthreadPool() == nullptr) {
+		return 0;
+	}
+	return g_pthread_context->GetPthreadPool()->WakeSubmissionCondWaiters();
+}
+
+size_t PthreadWakeSubmissionCondWaitersUnlimited() {
+	if (g_pthread_context == nullptr || g_pthread_context->GetPthreadPool() == nullptr) {
+		return 0;
+	}
+	return g_pthread_context->GetPthreadPool()->WakeSubmissionCondWaiters();
+}
+
+size_t PthreadPool::SuspendAllGuests() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Common::LockGuard lock(m_mutex);
+	size_t            suspended = 0;
+	const DWORD       self_tid  = GetCurrentThreadId();
+	for (auto* p: m_threads) {
+		if (p == nullptr || p->free || p->host_thread_id == 0 ||
+		    p->host_thread_id == self_tid) {
+			continue;
+		}
+		HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME, FALSE,
+		                           static_cast<DWORD>(p->host_thread_id));
+		if (handle == nullptr) {
+			continue;
+		}
+		if (SuspendThread(handle) != static_cast<DWORD>(-1)) {
+			++suspended;
+		}
+		CloseHandle(handle);
+	}
+	return suspended;
+#else
+	return 0;
+#endif
+}
+
+size_t PthreadPool::ResumeAllGuests() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Common::LockGuard lock(m_mutex);
+	size_t            resumed = 0;
+	const DWORD       self_tid = GetCurrentThreadId();
+	for (auto* p: m_threads) {
+		if (p == nullptr || p->free || p->host_thread_id == 0 ||
+		    p->host_thread_id == self_tid) {
+			continue;
+		}
+		HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME, FALSE,
+		                           static_cast<DWORD>(p->host_thread_id));
+		if (handle == nullptr) {
+			continue;
+		}
+		// Resume until the suspend count reaches 0 (best-effort).
+		for (;;) {
+			const DWORD prev = ResumeThread(handle);
+			if (prev == static_cast<DWORD>(-1) || prev <= 1) {
+				if (prev != static_cast<DWORD>(-1) && prev == 1) {
+					++resumed;
+				}
+				break;
+			}
+		}
+		CloseHandle(handle);
+	}
+	return resumed;
+#else
+	return 0;
+#endif
+}
+
+size_t PthreadSuspendAllGuests() {
+	if (g_pthread_context == nullptr || g_pthread_context->GetPthreadPool() == nullptr) {
+		return 0;
+	}
+	return g_pthread_context->GetPthreadPool()->SuspendAllGuests();
+}
+
+size_t PthreadResumeAllGuests() {
+	if (g_pthread_context == nullptr || g_pthread_context->GetPthreadPool() == nullptr) {
+		return 0;
+	}
+	return g_pthread_context->GetPthreadPool()->ResumeAllGuests();
+}
+
+static bool IsMainRelatedPthread(const PthreadPrivate* p) {
+	if (p == nullptr) {
+		return false;
+	}
+	return p->unique_id == 8 || p->name == "MainThread" ||
+	       p->name.find("Main") != std::string::npos ||
+	       p->name.find("BootCards") != std::string::npos;
+}
+
+size_t PthreadPool::SuspendMainRelatedGuests() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Common::LockGuard lock(m_mutex);
+	size_t            suspended = 0;
+	const DWORD       self_tid  = GetCurrentThreadId();
+	for (auto* p: m_threads) {
+		if (p == nullptr || p->free || p->host_thread_id == 0 ||
+		    p->host_thread_id == self_tid || !IsMainRelatedPthread(p)) {
+			continue;
+		}
+		HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME, FALSE,
+		                           static_cast<DWORD>(p->host_thread_id));
+		if (handle == nullptr) {
+			continue;
+		}
+		if (SuspendThread(handle) != static_cast<DWORD>(-1)) {
+			++suspended;
+			LOGF("FlipTrace: suspended main-related name=%s tid=%d\n", p->name.c_str(),
+			     p->unique_id);
+			fprintf(stderr, "FlipTrace: suspended main-related name=%s tid=%d\n", p->name.c_str(),
+			        p->unique_id);
+		}
+		CloseHandle(handle);
+	}
+	return suspended;
+#else
+	return 0;
+#endif
+}
+
+size_t PthreadPool::ResumeMainRelatedGuests() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Common::LockGuard lock(m_mutex);
+	size_t            resumed  = 0;
+	const DWORD       self_tid = GetCurrentThreadId();
+	for (auto* p: m_threads) {
+		if (p == nullptr || p->free || p->host_thread_id == 0 ||
+		    p->host_thread_id == self_tid || !IsMainRelatedPthread(p)) {
+			continue;
+		}
+		HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME, FALSE,
+		                           static_cast<DWORD>(p->host_thread_id));
+		if (handle == nullptr) {
+			continue;
+		}
+		for (;;) {
+			const DWORD prev = ResumeThread(handle);
+			if (prev == static_cast<DWORD>(-1) || prev <= 1) {
+				if (prev != static_cast<DWORD>(-1) && prev == 1) {
+					++resumed;
+				}
+				break;
+			}
+		}
+		CloseHandle(handle);
+	}
+	return resumed;
+#else
+	return 0;
+#endif
+}
+
+size_t PthreadSuspendMainRelatedGuests() {
+	size_t suspended = 0;
+	if (g_pthread_context != nullptr && g_pthread_context->GetPthreadPool() != nullptr) {
+		suspended += g_pthread_context->GetPthreadPool()->SuspendMainRelatedGuests();
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// MainThread is not in the pthread pool — suspend it explicitly.
+	if (g_pthread_main != nullptr && g_pthread_main->host_thread_id != 0 &&
+	    g_pthread_main->host_thread_id != GetCurrentThreadId()) {
+		HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME, FALSE,
+		                           static_cast<DWORD>(g_pthread_main->host_thread_id));
+		if (handle != nullptr) {
+			if (SuspendThread(handle) != static_cast<DWORD>(-1)) {
+				++suspended;
+				LOGF("FlipTrace: suspended MainThread tid=%d\n", g_pthread_main->unique_id);
+				fprintf(stderr, "FlipTrace: suspended MainThread tid=%d\n",
+				        g_pthread_main->unique_id);
+			}
+			CloseHandle(handle);
+		}
+	}
+#endif
+	return suspended;
+}
+
+size_t PthreadResumeMainRelatedGuests() {
+	size_t resumed = 0;
+	if (g_pthread_context != nullptr && g_pthread_context->GetPthreadPool() != nullptr) {
+		resumed += g_pthread_context->GetPthreadPool()->ResumeMainRelatedGuests();
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (g_pthread_main != nullptr && g_pthread_main->host_thread_id != 0 &&
+	    g_pthread_main->host_thread_id != GetCurrentThreadId()) {
+		HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME, FALSE,
+		                           static_cast<DWORD>(g_pthread_main->host_thread_id));
+		if (handle != nullptr) {
+			for (;;) {
+				const DWORD prev = ResumeThread(handle);
+				if (prev == static_cast<DWORD>(-1) || prev <= 1) {
+					if (prev != static_cast<DWORD>(-1) && prev == 1) {
+						++resumed;
+					}
+					break;
+				}
+			}
+			CloseHandle(handle);
+		}
+	}
+#endif
+	return resumed;
 }
 
 bool PthreadKeys::Create(int* key, pthread_key_destructor_func_t destructor) {
@@ -2670,20 +3106,36 @@ int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
 
 	int  result = 0;
 	bool notify = false;
+	bool mixed_waiter = false;
 	{
 		std::lock_guard lock((*cond)->m);
+		for (auto* waiter: (*cond)->waiters) {
+			if (waiter != nullptr && IsSubmissionRelatedName(waiter->name)) {
+				mixed_waiter = true;
+				break;
+			}
+		}
 		if (!(*cond)->waiters.empty()) {
 			(*cond)->sequence++;
 			CondClearWaiters(*cond);
 			notify = true;
 		}
 	}
+	if (mixed_waiter) {
+		static std::atomic<uint32_t> logs {0};
+		if (logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+			auto* self = g_pthread_self;
+			LOGF("SubmitTrace: MixedCondBroadcast cond_ptr=0x%016" PRIx64 " cond=%s by=%s "
+			     "notify=%d\n",
+			     reinterpret_cast<uint64_t>(*cond), (*cond)->name.c_str(),
+			     self != nullptr ? self->name.c_str() : "?", notify ? 1 : 0);
+			fprintf(stderr, "SubmitTrace: MixedCondBroadcast cond_ptr=0x%016" PRIx64 " by=%s\n",
+			        reinterpret_cast<uint64_t>(*cond), self != nullptr ? self->name.c_str() : "?");
+		}
+	}
 	if (notify) {
 		(*cond)->cv.notify_all();
 	}
-
-	// LOGF("\tcond broadcast: %s(0x%016" PRIx64 "), %d\n", (*cond)->name.c_str(),
-	// reinterpret_cast<uint64_t>(cond), result);
 
 	if (result == 0) {
 		return OK;
@@ -2773,16 +3225,33 @@ int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 
 	int  result = 0;
 	bool notify = false;
+	bool mixed_waiter = false;
 	{
 		std::lock_guard lock((*cond)->m);
+		for (auto* waiter: (*cond)->waiters) {
+			if (waiter != nullptr && IsSubmissionRelatedName(waiter->name)) {
+				mixed_waiter = true;
+				break;
+			}
+		}
 		notify = CondWakeWaiter(*cond, nullptr);
+	}
+	if (mixed_waiter) {
+		static std::atomic<uint32_t> logs {0};
+		if (logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+			auto* self = g_pthread_self;
+			LOGF("SubmitTrace: MixedCondSignal cond_ptr=0x%016" PRIx64 " cond=%s by=%s notify=%d\n",
+			     reinterpret_cast<uint64_t>(*cond), (*cond)->name.c_str(),
+			     self != nullptr ? self->name.c_str() : "?", notify ? 1 : 0);
+			fprintf(stderr,
+			        "SubmitTrace: MixedCondSignal cond_ptr=0x%016" PRIx64 " by=%s notify=%d\n",
+			        reinterpret_cast<uint64_t>(*cond), self != nullptr ? self->name.c_str() : "?",
+			        notify ? 1 : 0);
+		}
 	}
 	if (notify) {
 		(*cond)->cv.notify_all();
 	}
-
-	// LOGF("\tcond signal: %s(0x%016" PRIx64 "), %d\n", (*cond)->name.c_str(),
-	// reinterpret_cast<uint64_t>(cond), result);
 
 	if (result == 0) {
 		return OK;
@@ -2893,6 +3362,10 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	}
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
+
+	if (result == OK && thread != nullptr && !thread->name.empty()) {
+		Libs::VideoOut::Phase35TryGuestMenuFromSubmissionThread(thread->name.c_str());
+	}
 
 	int lock_result = NativeMutexLockRecurse(mutex_value, recurse);
 	if (result == OK) {
@@ -3047,6 +3520,11 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
 
+	// Phase 35: after Mixed Submission wakes post-Unregister, run guest menu path once.
+	if (thread != nullptr && !thread->name.empty()) {
+		Libs::VideoOut::Phase35TryGuestMenuFromSubmissionThread(thread->name.c_str());
+	}
+
 	result = NativeMutexLockRecurse(mutex_value, recurse);
 
 	switch (result) {
@@ -3132,18 +3610,9 @@ int PthreadGetPriorityForKernel(Pthread thread) {
 		return 700;
 	}
 
-	sched_param param {};
-	int         pol = 0;
-
-	if (pthread_getschedparam(thread->p, &pol, &param) != 0) {
+	std::lock_guard lock(thread->life_mutex);
+	if (thread->free || thread->joining || !thread->p_valid) {
 		return 700;
-	}
-
-	if (param.sched_priority <= -2) {
-		return 767;
-	}
-	if (param.sched_priority >= +2) {
-		return 256;
 	}
 	return 700;
 }
@@ -3256,13 +3725,16 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 		result =
 		    pthread_create(&created_thread->p, &created_thread->attr->p, RunThread, created_thread);
 
-		if (result != 0) {
+		if (result == 0) {
+			created_thread->p_valid = true;
+		} else {
 			FreeGuestStack(created_thread->attr);
 		}
 	}
 
 	if (result != 0) {
-		created_thread->free = true;
+		created_thread->p_valid = false;
+		created_thread->free    = true;
 	}
 
 	LOGF("\tthread create: %s, id = %d, %d\n", created_thread->name.c_str(),
@@ -3289,7 +3761,7 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 int KYTY_SYSV_ABI PthreadDetach(Pthread thread) {
 	PRINT_NAME();
 
-	if (thread == nullptr) {
+	if (thread == nullptr || thread->free || thread->joining) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
@@ -3307,17 +3779,33 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	int result = pthread_join(thread->p, value);
+	pthread_t native {};
+	{
+		std::lock_guard lock(thread->life_mutex);
+		if (thread->free || thread->joining.exchange(true)) {
+			return KERNEL_ERROR_ESRCH;
+		}
+		native = thread->p;
+	}
+
+	int result = pthread_join(native, value);
 
 	if (PRINT_NAME_ENABLED) {
 		LOGF("\tthread join: %s, %d\n", thread->name.c_str(), result);
 	}
 
-	if (result == 0) {
-		FreeGuestStack(thread->attr);
+	{
+		std::lock_guard lock(thread->life_mutex);
+		if (result == 0) {
+			FreeGuestStack(thread->attr);
 
-		thread->almost_done = false;
-		thread->free        = true;
+			thread->almost_done = false;
+			thread->p_valid     = false;
+			// Mark free before clearing joining so Setprio/Getprio never observe a joined
+			// pthread_t with free==false (TOCTOU → winpthread/ntdll heap corruption).
+			thread->free = true;
+		}
+		thread->joining = false;
 	}
 
 	switch (result) {
@@ -3336,6 +3824,11 @@ int KYTY_SYSV_ABI PthreadCancel(Pthread thread) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	std::lock_guard lock(thread->life_mutex);
+	if (thread->free || thread->joining || !thread->p_valid) {
+		return KERNEL_ERROR_ESRCH;
+	}
+
 	int result = pthread_cancel(thread->p);
 
 	LOGF("\tthread cancel: %s, %d\n", thread->name.c_str(), result);
@@ -3350,7 +3843,7 @@ int KYTY_SYSV_ABI PthreadCancel(Pthread thread) {
 int KYTY_SYSV_ABI PthreadSetaffinity(Pthread thread, KernelCpumask mask) {
 	PRINT_NAME();
 
-	if (thread == nullptr) {
+	if (thread == nullptr || thread->free || thread->joining) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
@@ -3362,7 +3855,7 @@ int KYTY_SYSV_ABI PthreadSetaffinity(Pthread thread, KernelCpumask mask) {
 int KYTY_SYSV_ABI PthreadGetaffinity(Pthread thread, KernelCpumask* mask) {
 	PRINT_NAME();
 
-	if (thread == nullptr) {
+	if (thread == nullptr || thread->free || thread->joining) {
 		return KERNEL_ERROR_ESRCH;
 	}
 	if (mask == nullptr) {
@@ -3439,59 +3932,30 @@ int KYTY_SYSV_ABI PthreadGetprio(Pthread thread, int* prio) {
 
 	EXIT_NOT_IMPLEMENTED(prio == nullptr);
 
-	sched_param param {};
-	int         pol = 0;
-
-	int result = pthread_getschedparam(thread->p, &pol, &param);
-
-	if (result == 0) {
-		if (param.sched_priority <= -2) {
-			*prio = 767;
-		} else if (param.sched_priority >= +2) {
-			*prio = 256;
-		} else {
-			*prio = 700;
-		}
-
-		LOGF("\t PthreadGetprio: %d, %d\n", thread->unique_id, *prio);
-
-		return OK;
+	std::lock_guard lock(thread->life_mutex);
+	if (thread->free || thread->joining || !thread->p_valid) {
+		return KERNEL_ERROR_ESRCH;
 	}
 
-	return KERNEL_ERROR_EINVAL;
+	*prio = 700;
+	LOGF("\t PthreadGetprio: %d, %d\n", thread->unique_id, *prio);
+	return OK;
 }
 
 int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
-	PRINT_NAME();
-
 	if (thread == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
-	sched_param param {};
-	int         pol = 0;
-
-	int result = pthread_getschedparam(thread->p, &pol, &param);
-
-	if (result == 0) {
-		if (prio <= 478) {
-			param.sched_priority = +2;
-		} else if (prio >= 733) {
-			param.sched_priority = -2;
-		} else {
-			param.sched_priority = 0;
-		}
-
-		result = pthread_setschedparam(thread->p, pol, &param);
-
-		if (result == 0) {
-			LOGF("\t PthreadSetprio: %d, %d\n", thread->unique_id, prio);
-
-			return OK;
-		}
+	std::lock_guard lock(thread->life_mutex);
+	if (thread->free || thread->joining || !thread->p_valid) {
+		return KERNEL_ERROR_ESRCH;
 	}
 
-	return KERNEL_ERROR_EINVAL;
+	// Avoid winpthread pthread_setschedparam during mass Setprio storms (TLOU boot).
+	// Skip PRINT_NAME/LOGF on the guest-stack HLE hot path.
+	(void)prio;
+	return OK;
 }
 
 void KYTY_SYSV_ABI PthreadTestcancel() {
@@ -3504,39 +3968,10 @@ void KYTY_SYSV_ABI PthreadExit(void* value) {
 	PRINT_NAME();
 
 #if defined(__x86_64__) || defined(_M_X64)
-	if (g_guest_entry_return_rsp != 0) {
-		const auto return_rsp    = g_guest_entry_return_rsp;
-		g_guest_entry_return_rsp = 0;
-
-		if (g_pthread_self != nullptr && g_pthread_self->guest_host_rsp != 0) {
-			const auto host_rbx = g_pthread_self->guest_host_rbx;
-			const auto host_rsp = g_pthread_self->guest_host_rsp;
-			const auto host_rbp = g_pthread_self->guest_host_rbp;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			const auto host_gs8  = g_pthread_self->guest_host_gs8;
-			const auto host_gs10 = g_pthread_self->guest_host_gs10;
-#endif
-
-			asm volatile("movq %2, %%rbx\n\t"
-			             "movq %3, %%r12\n\t"
-			             "movq %4, %%r13\n\t"
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			             "movq %5, %%r14\n\t"
-			             "movq %6, %%r15\n\t"
-#endif
-			             "movq %0, %%rax\n\t"
-			             "movq %1, %%rsp\n\t"
-			             "retq\n\t"
-			             :
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			             : "m"(value), "m"(return_rsp), "m"(host_rbx), "m"(host_rsp), "m"(host_rbp),
-			               "m"(host_gs8), "m"(host_gs10)
-#else
-			             : "m"(value), "m"(return_rsp), "m"(host_rbx), "m"(host_rsp), "m"(host_rbp)
-#endif
-			             : "rax", "memory");
-			__builtin_unreachable();
-		}
+	if (g_pthread_self != nullptr && g_pthread_self->host_return_valid) {
+		g_pthread_self->host_return_valid = false;
+		HostRestoreContext(&g_pthread_self->host_return_ctx,
+		                   reinterpret_cast<uint64_t>(value));
 	}
 #endif
 
@@ -3560,7 +3995,7 @@ int KYTY_SYSV_ABI PthreadEqual(Pthread thread1, Pthread thread2) {
 int KYTY_SYSV_ABI PthreadGetname(Pthread thread, char* name) {
 	PRINT_NAME();
 
-	if (thread == nullptr) {
+	if (thread == nullptr || thread->free || thread->joining) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
@@ -3577,7 +4012,7 @@ int KYTY_SYSV_ABI PthreadGetname(Pthread thread, char* name) {
 int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 	PRINT_NAME();
 
-	if (thread == nullptr) {
+	if (thread == nullptr || thread->free || thread->joining) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
@@ -4057,8 +4492,9 @@ int KYTY_SYSV_ABI pthread_getschedparam(LibKernel::Pthread thread, int* policy,
                                         LibKernel::KernelSchedParam* param) {
 	PRINT_NAME();
 
-	if (thread == nullptr || policy == nullptr || param == nullptr) {
-		return POSIX_EINVAL;
+	if (thread == nullptr || thread->free || thread->joining || policy == nullptr ||
+	    param == nullptr) {
+		return thread != nullptr && (thread->free || thread->joining) ? POSIX_ESRCH : POSIX_EINVAL;
 	}
 
 	int result = LibKernel::PthreadAttrGetschedpolicy(&thread->attr, policy);
@@ -4071,8 +4507,8 @@ int KYTY_SYSV_ABI pthread_setschedparam(LibKernel::Pthread thread, int policy,
                                         const LibKernel::KernelSchedParam* param) {
 	PRINT_NAME();
 
-	if (thread == nullptr || param == nullptr) {
-		return POSIX_EINVAL;
+	if (thread == nullptr || thread->free || thread->joining || param == nullptr) {
+		return thread != nullptr && (thread->free || thread->joining) ? POSIX_ESRCH : POSIX_EINVAL;
 	}
 
 	int result = LibKernel::PthreadAttrSetschedpolicy(&thread->attr, policy);

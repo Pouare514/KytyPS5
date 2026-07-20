@@ -2,11 +2,13 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/fatalLog.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/presentation/window.h"
 #include "kernel/eventFlag.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
@@ -60,6 +62,18 @@ namespace LibKernel {
 using KernelModule                   = int32_t;
 using get_thread_atexit_count_func_t = KYTY_SYSV_ABI int (*)(KernelModule);
 using thread_atexit_report_func_t    = KYTY_SYSV_ABI void (*)(KernelModule);
+
+static std::atomic<uint32_t> g_nd_libkernel_trace_count {0};
+
+static void NdTraceLibKernelCall(const char* func) {
+	if (!Memory::IsNdMemoryValidationTraceActive()) {
+		return;
+	}
+	const auto index = g_nd_libkernel_trace_count.fetch_add(1);
+	if (index < 64) {
+		LOGF("NdMemoryTrace libKernel: %s()\n", func);
+	}
+}
 
 static uint32_t sha1_rol(uint32_t value, uint32_t bits) {
 	return (value << bits) | (value >> (32u - bits));
@@ -1434,6 +1448,7 @@ int KYTY_SYSV_ABI KernelGetModuleInfoForUnwind(uint64_t addr, int flags,
 	}
 
 	if (Memory::IsNdMemoryValidationTraceActive()) {
+		NdTraceLibKernelCall(__func__);
 		LOGF("NdMemoryTrace GetModuleInfoForUnwind: addr=0x%016" PRIx64 " name=%s seg0_addr=0x%016"
 		     PRIx64 " seg0_size=0x%016" PRIx64 "\n",
 		     addr, info->name, info->seg0_addr, info->seg0_size);
@@ -1467,6 +1482,7 @@ static int KYTY_SYSV_ABI KernelGetModuleInfoFromAddr(uint64_t addr, int n, Modul
 	LOGF("\thandle: %d\n", r->handle);
 
 	if (Memory::IsNdMemoryValidationTraceActive()) {
+		NdTraceLibKernelCall(__func__);
 		LOGF("NdMemoryTrace GetModuleInfoFromAddr: addr=0x%016" PRIx64 " handle=%d\n", addr,
 		     r->handle);
 	}
@@ -1484,7 +1500,52 @@ static void KYTY_SYSV_ABI KernelDebugRaiseException(int /*c1*/, int /*c2*/) {
 
 static void KYTY_SYSV_ABI exit(int code) {
 	PRINT_NAME();
-
+	fprintf(stderr, "GuestExit: libKernel::exit code=%d\n", code);
+	LOGF("GuestExit: libKernel::exit code=%d\n", code);
+	char msg[96];
+	std::snprintf(msg, sizeof(msg), "GuestExit: libKernel::exit code=%d", code);
+	Common::LogFatalToFile(msg);
+	std::fflush(stderr);
+	if (Libs::Graphics::WindowShouldIgnoreQuit()) {
+		const char* park = std::getenv("KYTY_PHASE32_PARK_EXIT");
+		if (park != nullptr && park[0] == '1') {
+			LOGF("GuestExit: suppressing libKernel exit(%d) (phase32 arm) — park thread\n",
+			     code);
+			fprintf(stderr, "GuestExit: suppressing libKernel exit(%d) (phase32 arm)\n", code);
+			std::fflush(stderr);
+			for (;;) {
+				std::this_thread::sleep_for(std::chrono::seconds(1));
+				(void)PthreadWakeSubmissionCondWaitersAfterFlip();
+			}
+		}
+		const char* divert = std::getenv("KYTY_PHASE33_DIVERT");
+		if (divert != nullptr && divert[0] == '1') {
+			LOGF("GuestExit: suppressing libKernel exit(%d) (phase33 divert)\n", code);
+			fprintf(stderr, "GuestExit: suppressing libKernel exit(%d) (phase33 divert)\n",
+			        code);
+			std::fflush(stderr);
+			while (Libs::Graphics::WindowShouldIgnoreQuit()) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(16));
+				(void)PthreadWakeSubmissionCondWaitersAfterFlip();
+			}
+			for (;;) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+				(void)PthreadWakeSubmissionCondWaitersAfterFlip();
+			}
+		}
+		LOGF("GuestExit: suppressing libKernel exit(%d) — phase34 soft-idle\n", code);
+		fprintf(stderr, "GuestExit: suppressing libKernel exit(%d) — phase34 soft-idle\n",
+		        code);
+		std::fflush(stderr);
+		for (int tick = 0;; ++tick) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(16));
+			(void)PthreadWakeSubmissionCondWaitersAfterFlip();
+			if ((tick % 30) == 0) {
+				(void)EventQueue::KernelTriggerUserEventForAll(0x1800, nullptr);
+				Libs::Graphics::WindowArmIgnoreQuit(60);
+			}
+		}
+	}
 	::exit(code);
 }
 
@@ -2150,6 +2211,10 @@ static bool FiberWaitAndEnterRunning(FiberObject* fiber, uint32_t* observed_stat
 	uint32_t   spin  = 0;
 	auto&      state = fiber->state;
 	auto       ref   = std::atomic_ref<uint32_t>(state);
+	// Phase 36/41: wait longer for RUNNING→IDLE races (5ms was too tight under BootCards load).
+	const auto wait_budget =
+	    Libs::Graphics::WindowPhase35FiberSoftAckArmed() ? std::chrono::milliseconds(200)
+	                                                     : std::chrono::milliseconds(50);
 
 	for (;;) {
 		uint32_t expected = FIBER_STATE_IDLE;
@@ -2164,7 +2229,7 @@ static bool FiberWaitAndEnterRunning(FiberObject* fiber, uint32_t* observed_stat
 		if (expected != FIBER_STATE_RUNNING) {
 			return false;
 		}
-		if (std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(5)) {
+		if (std::chrono::steady_clock::now() - start >= wait_budget) {
 			return false;
 		}
 		if (spin++ < 64) {
@@ -2175,16 +2240,55 @@ static bool FiberWaitAndEnterRunning(FiberObject* fiber, uint32_t* observed_stat
 	}
 }
 
+static bool FiberOwnerThreadAlive(uint64_t owner) {
+	if (owner == 0) {
+		return false;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	HANDLE h = ::OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(owner));
+	if (h == nullptr) {
+		// Access denied / transient — assume still alive (do NOT reclaim).
+		return true;
+	}
+	DWORD exit_code = 0;
+	const BOOL ok   = ::GetExitCodeThread(h, &exit_code);
+	::CloseHandle(h);
+	return ok == 0 || exit_code == STILL_ACTIVE;
+#else
+	(void)owner;
+	return true;
+#endif
+}
+
 static bool FiberRepairStaleRunningOnThisThread(FiberObject* fiber, uint32_t observed_state) {
 	if (observed_state != FIBER_STATE_RUNNING || fiber == g_current_fiber) {
 		return false;
 	}
 
 	const auto owner = FiberGetOwner(fiber);
-	if (owner != 0) {
+	const auto self  = FiberCurrentHostThreadId();
+	bool        reclaim = false;
+	const char* why     = nullptr;
+	if (owner == 0) {
+		reclaim = true;
+		why     = "no-owner";
+	} else if (owner == self) {
+		// Owner map says this host thread but we are not the current fiber — orphaned.
+		reclaim = true;
+		why     = "orphan-self";
+	} else if (!FiberOwnerThreadAlive(owner)) {
+		// Only when OpenThread succeeded and exit code != STILL_ACTIVE.
+		reclaim = true;
+		why     = "dead-owner";
+	}
+	if (!reclaim) {
 		return false;
 	}
 
+	LOGF("SubmitTrace: FiberRepair stale RUNNING fiber=%p name=%s owner=%" PRIu64 " why=%s\n",
+	     static_cast<void*>(fiber), fiber->name, owner, why != nullptr ? why : "?");
+	fprintf(stderr, "SubmitTrace: FiberRepair stale RUNNING name=%s why=%s\n", fiber->name,
+	        why != nullptr ? why : "?");
 	return FiberCompareExchangeState(fiber, FIBER_STATE_RUNNING, FIBER_STATE_IDLE);
 }
 
@@ -2194,8 +2298,14 @@ static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 }
 
 #if defined(__x86_64__) || defined(_M_X64)
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// fiberContext_win.S — must be called directly (no C wrapper) so saved rip is the
+// caller's return site (FiberRun / FiberSwitch), not a thunk.
+extern "C" __attribute__((returns_twice)) int FiberSaveContext(FiberCpuContext* ctx);
+extern "C" __attribute__((noreturn)) void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret);
+#else
 __attribute__((noinline, returns_twice)) static int FiberSaveContext(FiberCpuContext* ctx) {
-	int ret = 0;
+	int ret;
 	asm volatile("movq %[ctx], %%r10\n\t"
 	             "movq %%rbx, 0(%%r10)\n\t"
 	             "movq %%rbp, 8(%%r10)\n\t"
@@ -2236,6 +2346,7 @@ __attribute__((noreturn, noinline)) static void FiberRestoreContext(FiberCpuCont
 	             : "memory", "rax", "r10", "r11");
 	__builtin_unreachable();
 }
+#endif
 #else
 static int FiberSaveContext(FiberCpuContext* ctx) {
 	(void)ctx;
@@ -2252,6 +2363,14 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 [[noreturn]] static void FiberStartTrampoline();
 
 [[noreturn]] static void FiberStartOnGuestStack(FiberObject* fiber) {
+	if (fiber->addr_context == nullptr || fiber->size_context < 0x100) {
+		LOGF("SubmitTrace: FiberStartOnGuestStack REJECT fiber=%p name=%s ctx=%p size=0x%" PRIx64
+		     "\n",
+		     static_cast<void*>(fiber), fiber->name, fiber->addr_context, fiber->size_context);
+		fprintf(stderr, "SubmitTrace: FiberStartOnGuestStack REJECT name=%s size=0x%" PRIx64 "\n",
+		        fiber->name, fiber->size_context);
+		EXIT("FiberStartOnGuestStack: invalid guest fiber stack\n");
+	}
 	FiberCpuContext ctx {};
 	const auto      stack_top = reinterpret_cast<uintptr_t>(fiber->addr_context) +
 	                            static_cast<uintptr_t>(fiber->size_context);
@@ -2408,11 +2527,20 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	fiber->arg_on_return  = 0;
 	g_thread_return_fiber = nullptr;
 
-	if (FiberSaveContext(&g_thread_fiber_context) == 0) {
+	const int save_rc = FiberSaveContext(&g_thread_fiber_context);
+	if (save_rc == 0) {
 		if (fiber->context_valid) {
 			FiberRestoreContext(&fiber->saved_context, 1);
 		}
 		FiberStartOnGuestStack(fiber);
+		EXIT("FiberRun: FiberStartOnGuestStack returned\n");
+	}
+
+	static std::atomic<int> resume_log {0};
+	if (resume_log.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("SubmitTrace: FiberRun resume-from-fiber name=%s save_rc=%d\n", fiber->name, save_rc);
+		fprintf(stderr, "SubmitTrace: FiberRun resume-from-fiber name=%s save_rc=%d\n", fiber->name,
+		        save_rc);
 	}
 
 	FiberCommitDeferredIdle();
@@ -2432,10 +2560,93 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 	PRINT_NAME();
 
 	if (!FiberIsValid(fiber)) {
+		static std::atomic<int> inv {0};
+		if (inv.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("SubmitTrace: FiberSwitch INVALID fiber=%p\n", static_cast<void*>(fiber));
+			fprintf(stderr, "SubmitTrace: FiberSwitch INVALID fiber=%p\n",
+			        static_cast<void*>(fiber));
+		}
 		return FIBER_ERROR_INVALID;
 	}
 	if (g_current_fiber == nullptr) {
-		return FIBER_ERROR_PERMISSION;
+		const auto self = FiberCurrentHostThreadId();
+		// Recover current fiber if this host thread still owns a RUNNING fiber
+		// (TLS can be cleared while guest still expects to be inside a fiber).
+		{
+			std::lock_guard lock(g_fiber_owner_mutex);
+			for (const auto& [owned, owner]: g_fiber_owner_thread) {
+				if (owner == self && owned != nullptr &&
+				    FiberLoadState(owned) == FIBER_STATE_RUNNING) {
+					g_current_fiber                     = owned;
+					g_fiber_current_by_thread[self]     = owned;
+					break;
+				}
+			}
+		}
+		if (g_current_fiber == nullptr) {
+			static std::atomic<int> perm {0};
+			if (perm.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("SubmitTrace: FiberSwitch PERMISSION→Run (no current fiber) tgt=%p "
+				     "name=%s tid=%d\n",
+				     static_cast<void*>(fiber), fiber->name,
+				     Common::Thread::GetThreadIdUnique());
+				fprintf(stderr, "SubmitTrace: FiberSwitch PERMISSION→Run name=%s tid=%d\n",
+				        fiber->name, Common::Thread::GetThreadIdUnique());
+			}
+			return FiberRun(fiber, arg_on_run, arg_on_return);
+		}
+		static std::atomic<int> adopt {0};
+		if (adopt.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("SubmitTrace: FiberSwitch ADOPT current=%p name=%s tid=%d\n",
+			     static_cast<void*>(g_current_fiber), g_current_fiber->name,
+			     Common::Thread::GetThreadIdUnique());
+			fprintf(stderr, "SubmitTrace: FiberSwitch ADOPT name=%s\n", g_current_fiber->name);
+		}
+	}
+
+	// Soft-ACK remains diag-only (KYTY_PHASE35_FIBER_SOFTACK / PHASE33). Phase 36 default =
+	// real FiberSwitch with stale-RUNNING reclaim.
+	const char* fiber_p35 = std::getenv("KYTY_PHASE35_FIBER_SOFTACK");
+	const bool  soft_all =
+	    fiber_p35 != nullptr && fiber_p35[0] == '1' &&
+	    Libs::Graphics::WindowPhase35FiberSoftAckArmed();
+	const char* fiber_soft = std::getenv("KYTY_PHASE33_FIBER_SOFTACK");
+	const bool  soft_main =
+	    fiber_soft != nullptr && fiber_soft[0] == '1' &&
+	    Libs::Graphics::WindowShouldIgnoreQuit() &&
+	    Common::Thread::GetThreadIdUnique() == 8;
+	if (soft_all || soft_main) {
+		static std::atomic<int> soft_switches {0};
+		const int               n   = soft_switches.fetch_add(1, std::memory_order_relaxed);
+		const int               cap = soft_all ? 128 : 16;
+		if (n < cap) {
+			if (n < 32) {
+				LOGF("SubmitTrace: FiberSwitch soft-ACK (phase35) n=%d tid=%d fiber=%p\n", n,
+				     Common::Thread::GetThreadIdUnique(), static_cast<void*>(fiber));
+				fprintf(stderr, "SubmitTrace: FiberSwitch soft-ACK (phase35) n=%d tid=%d\n", n,
+				        Common::Thread::GetThreadIdUnique());
+			}
+			if (arg_on_return != nullptr) {
+				*arg_on_return = arg_on_run;
+			}
+			return OK;
+		}
+	}
+
+	const bool diag =
+	    Libs::Graphics::WindowPhase35FiberSoftAckArmed() ||
+	    (std::getenv("KYTY_PHASE32_PENDING0") != nullptr &&
+	     std::getenv("KYTY_PHASE32_PENDING0")[0] == '1');
+	static std::atomic<int> real_switches {0};
+	const int               n_real = real_switches.fetch_add(1, std::memory_order_relaxed);
+	if (diag && n_real < 64) {
+		LOGF("SubmitTrace: FiberSwitch REAL n=%d tid=%d fiber=%p name=%s state=%u "
+		     "ctx_valid=%d ctx=%p size=0x%" PRIx64 " owner=%" PRIu64 " cur=%p\n",
+		     n_real, Common::Thread::GetThreadIdUnique(), static_cast<void*>(fiber), fiber->name,
+		     FiberLoadState(fiber), fiber->context_valid ? 1 : 0, fiber->addr_context,
+		     fiber->size_context, FiberGetOwner(fiber), static_cast<void*>(g_current_fiber));
+		fprintf(stderr, "SubmitTrace: FiberSwitch REAL n=%d name=%s state=%u ctx_valid=%d\n",
+		        n_real, fiber->name, FiberLoadState(fiber), fiber->context_valid ? 1 : 0);
 	}
 
 	for (;;) {
@@ -2446,6 +2657,13 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 		if (FiberRepairStaleRunningOnThisThread(fiber, observed_state)) {
 			continue;
 		}
+		if (diag) {
+			LOGF("SubmitTrace: FiberSwitch ERROR_STATE fiber=%p name=%s observed=%u "
+			     "owner=%" PRIu64 "\n",
+			     static_cast<void*>(fiber), fiber->name, observed_state, FiberGetOwner(fiber));
+			fprintf(stderr, "SubmitTrace: FiberSwitch ERROR_STATE name=%s observed=%u\n",
+			        fiber->name, observed_state);
+		}
 		return FIBER_ERROR_STATE;
 	}
 
@@ -2454,10 +2672,32 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 	fiber->arg_on_run    = arg_on_run;
 	fiber->arg_on_return = 0;
 
+	if (!fiber->context_valid &&
+	    (fiber->addr_context == nullptr || fiber->size_context < 0x100)) {
+		LOGF("SubmitTrace: FiberSwitch refuse start — bad stack fiber=%p name=%s\n",
+		     static_cast<void*>(fiber), fiber->name);
+		fprintf(stderr, "SubmitTrace: FiberSwitch refuse start name=%s\n", fiber->name);
+		FiberStoreState(fiber, FIBER_STATE_IDLE);
+		return FIBER_ERROR_STATE;
+	}
+
 	if (FiberSaveContext(&caller->saved_context) == 0) {
 		FiberSetContextValid(caller, true);
 		FiberDeferIdle(caller);
+		FiberSetCurrentFiber(fiber); // must be current before entering target
 		if (fiber->context_valid) {
+			const uint64_t rip = fiber->saved_context.rip;
+			const uint64_t rsp = fiber->saved_context.rsp;
+			// Only scrub clearly-corrupt contexts after Unregister (BootCards uses real fibers).
+			if (Libs::Graphics::WindowPhase35FiberSoftAckArmed() &&
+			    (rip < 0x1000 || rsp < 0x1000)) {
+				LOGF("SubmitTrace: FiberSwitch BAD saved ctx name=%s rip=0x%" PRIx64
+				     " rsp=0x%" PRIx64 " — start fresh\n",
+				     fiber->name, rip, rsp);
+				fprintf(stderr, "SubmitTrace: FiberSwitch BAD saved ctx name=%s\n", fiber->name);
+				FiberSetContextValid(fiber, false);
+				FiberStartOnGuestStack(fiber);
+			}
 			FiberRestoreContext(&fiber->saved_context, 1);
 		}
 		FiberStartOnGuestStack(fiber);

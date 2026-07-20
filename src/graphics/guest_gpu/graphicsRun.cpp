@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/objects/label.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -27,6 +28,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cstdio>
 #include <list>
 #include <thread>
@@ -292,7 +294,9 @@ void Gpu::SubmitCompute(uint32_t queue, uint32_t* cmd_buffer, uint32_t num_dw,
 }
 
 void Gpu::SubmitFlipPreparation() {
-	GpuMutexLock lock(m_mutex);
+	// Do not take GpuMutexLock. PauseSubmissions / GraphicsRunSubmissionLock hold that mutex
+	// for long stretches (memory, texture sync). VideoOutSubmitFlip already Reserves before
+	// calling here — blocking on the GPU mutex leaves flipPendingNum>0 with no PrepareCpuFlip.
 	m_gfx_ring->SubmitFlipPreparation();
 }
 
@@ -732,6 +736,11 @@ void GraphicsRing::Submit(OwnedCmdBuffer draw_buffer, OwnedCmdBuffer const_buffe
 	buf.flip.flip_arg                 = flip_arg;
 	buf.trigger_agc_interrupt_on_done = trigger_agc_interrupt_on_done;
 
+	if (boot_trace_log()) {
+		LOGF("FlipTrace: GraphicsRing::Submit handle=%d index=%d mode=%d arg=%" PRId64 "\n", handle,
+		     index, flip_mode, flip_arg);
+	}
+
 	m_idle = false;
 	m_cond_var.Signal();
 }
@@ -750,9 +759,13 @@ void GraphicsRing::SubmitFlipPreparation() {
 		m_cp->Reset();
 	}
 
-	auto& batch            = m_cmd_batches.emplace_back();
+	// Prefer CPU flip prep over pending DCBs so presentation is not stuck behind long runs.
+	CmdBatch batch {};
 	batch.prepare_cpu_flip = true;
-	m_idle                 = false;
+	m_cmd_batches.push_front(std::move(batch));
+	LOGF("FlipTrace: GraphicsRing::SubmitFlipPreparation queued batches=%zu idle=%d\n",
+	     m_cmd_batches.size(), m_idle ? 1 : 0);
+	m_idle = false;
 	m_cond_var.Signal();
 }
 
@@ -1809,8 +1822,9 @@ void CommandProcessor::Flip() {
 
 	CheckBuffer();
 
-	if (GraphicsRunDebugDumpEnabled()) {
-		LOGF("CommandProcessor::Flip()\n");
+	if (GraphicsRunDebugDumpEnabled() || boot_trace_log()) {
+		LOGF("FlipTrace: CommandProcessor::Flip handle=%d index=%d mode=%d arg=%" PRId64 "\n",
+		     m_flip.handle, m_flip.index, m_flip.flip_mode, m_flip.flip_arg);
 	}
 
 	auto* command = CurrentBuffer();
@@ -1872,6 +1886,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 }
 
 void CommandProcessor::PrepareCpuFlip() {
+	LOGF("FlipTrace: PrepareCpuFlip begin\n");
 	Common::LockGuard lock(m_mutex);
 	CheckBuffer();
 	if (g_current_run_cp != nullptr) {
@@ -1884,8 +1899,10 @@ void CommandProcessor::PrepareCpuFlip() {
 	RunScope run_scope(this);
 
 	auto prepared_id = Presentation::DisplayBufferPrepareNextFlipOnGpu(CurrentBuffer());
+	LOGF("FlipTrace: PrepareCpuFlip prepared_id=%" PRIu64 " flushing\n", prepared_id);
 	m_scheduler.Flush();
 	Presentation::DisplayBufferCompleteFlipFromGpu(prepared_id);
+	LOGF("FlipTrace: PrepareCpuFlip end id=%" PRIu64 "\n", prepared_id);
 }
 
 void CommandProcessor::SynchronizeGpu() {

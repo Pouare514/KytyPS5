@@ -69,6 +69,10 @@ LIB_DEFINE(InitSystemService_1);
 LIB_DEFINE(InitUserService_1);
 LIB_DEFINE(InitVideoOut_1);
 
+namespace LibTextToSpeech2 {
+LIB_DEFINE(InitTextToSpeech2_1);
+} // namespace LibTextToSpeech2
+
 void InitAll(Loader::SymbolDatabase* s) {
 	LIB_LOAD(InitAudio_1);
 	LIB_LOAD(InitAmpr_1);
@@ -104,6 +108,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	LIB_LOAD(InitUserService_1);
 	LIB_LOAD(VideoDec2::InitVideoDec2_1);
 	LIB_LOAD(InitVideoOut_1);
+	LIB_LOAD(LibTextToSpeech2::InitTextToSpeech2_1);
 }
 
 namespace LibContentExport {
@@ -233,5 +238,25 @@ LIB_DEFINE(InitContentDelete_1) {
 }
 
 } // namespace LibContentDelete
+
+namespace LibTextToSpeech2 {
+
+LIB_VERSION("TextToSpeech2", 1, "TextToSpeech2", 1, 1);
+
+namespace {
+
+static KYTY_SYSV_ABI int TextToSpeech2Entry() {
+	PRINT_NAME();
+	return 0;
+}
+
+} // namespace
+
+LIB_DEFINE(InitTextToSpeech2_1) {
+	PRINT_NAME_ENABLE(true);
+	LIB_FUNC("+352WTlGCQI", TextToSpeech2Entry);
+}
+
+} // namespace LibTextToSpeech2
 
 } // namespace Libs

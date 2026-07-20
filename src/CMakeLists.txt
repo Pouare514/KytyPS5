@@ -174,6 +174,21 @@ list(APPEND kyty_emulator_src
 	emulator.h
 	emulator.cpp
 )
+# clang-cl does not assemble .S via CMake ASM; build with clang driver explicitly.
+if (WIN32)
+	set(_kyty_fiber_s "${CMAKE_CURRENT_SOURCE_DIR}/libs/fiberContext_win.S")
+	set(_kyty_fiber_obj "${CMAKE_CURRENT_BINARY_DIR}/fiberContext_win.obj")
+	find_program(KYTY_CLANG_ASM NAMES clang clang.exe REQUIRED)
+	add_custom_command(
+		OUTPUT "${_kyty_fiber_obj}"
+		COMMAND "${KYTY_CLANG_ASM}" -c -target x86_64-pc-windows-msvc
+			-o "${_kyty_fiber_obj}" "${_kyty_fiber_s}"
+		DEPENDS "${_kyty_fiber_s}"
+		COMMENT "Assembling fiberContext_win.S"
+		VERBATIM
+	)
+	list(APPEND kyty_emulator_src "${_kyty_fiber_obj}")
+endif()
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
 if (KYTY_CLANG_CL)
@@ -240,6 +255,7 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	../tests/PageManagerTests.cpp
 	graphics/host_gpu/pageManager.cpp
 )
+target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
 
 add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
@@ -343,7 +359,7 @@ set(KYTY_EMULATOR_MAP_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/${KYTY_EMULATOR_MAP
 set(KYTY_EMULATOR_PDB_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/kyty_emulator.pdb")
 
 if(KYTY_CLANG_CL)
-	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "/DYNAMICBASE:NO /DEBUG:FULL /PDB:${KYTY_EMULATOR_PDB_LINK_PATH} /lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}")
+	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "/DYNAMICBASE:NO /CETCOMPAT:NO /DEBUG:FULL /PDB:${KYTY_EMULATOR_PDB_LINK_PATH} /lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}")
 	add_custom_command(TARGET kyty_emulator POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:kyty_emulator>/libwinpthread-1.dll)
 elseif(WIN32 OR LINUX)
 	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS} -Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")

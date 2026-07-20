@@ -77,13 +77,14 @@ void RenderContext::DeleteEopEq(LibKernel::EventQueue::KernelEqueue eq, int id) 
 
 void RenderContext::TriggerEopEvent(uint32_t context_id) {
 	Common::LockGuard lock(m_eop_mutex);
+	(void)context_id; // context is not carried in event.data (shadPS4: data = event_type)
 
 	for (auto& eop_entry: m_eop_eqs) {
 		if (eop_entry.eq != nullptr) {
 			const auto id     = static_cast<uintptr_t>(eop_entry.id);
 			auto       result = LibKernel::EventQueue::KernelTriggerEvent(
 			    eop_entry.eq, id, LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS,
-			    reinterpret_cast<void*>(static_cast<uintptr_t>(context_id)));
+			    reinterpret_cast<void*>(id));
 			EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_ENOENT);
 		}
 	}

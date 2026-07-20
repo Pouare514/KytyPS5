@@ -73,6 +73,10 @@ void  PthreadInitSelfForMainThread();
 void* PthreadCreateMainGuestStack();
 void  PthreadDeleteStaticObjects(Loader::Program* program);
 
+// Run entry on a guest stack without callq/ret across host↔guest (Phase 18).
+// Returns the guest return value in rax via HostRestoreContext.
+uint64_t PthreadRunGuestOnStack(void* stack_top, void* entry, uint64_t arg0, uint64_t arg1);
+
 int KYTY_SYSV_ABI PthreadMutexattrInit(PthreadMutexattr* attr);
 int KYTY_SYSV_ABI PthreadMutexattrDestroy(PthreadMutexattr* attr);
 int KYTY_SYSV_ABI PthreadMutexattrSettype(PthreadMutexattr* attr, int type);
@@ -87,6 +91,19 @@ int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex);
 Pthread KYTY_SYSV_ABI PthreadSelf();
 Pthread               PthreadSelfOrNull();
 Pthread               PthreadSwapSelfForSignal(Pthread thread);
+[[nodiscard]] bool    PthreadCurrentIsSubmissionRelated();
+[[nodiscard]] bool    PthreadCurrentIsMainRelated();
+void                  PthreadDumpSubmissionThreads(const char* reason);
+void                  PthreadDumpAllGuestThreads(const char* reason);
+size_t                PthreadWakeSubmissionCondWaiters();
+size_t                PthreadWakeSubmissionCondWaitersAfterFlip();
+// Phase 41: no wake budget — used by post-Unregister boot nudge / anti-CRT handoff.
+size_t                PthreadWakeSubmissionCondWaitersUnlimited();
+// Phase 29: freeze guest progress after first present so the black window stays visible.
+size_t                PthreadSuspendAllGuests();
+size_t                PthreadResumeAllGuests();
+size_t                PthreadSuspendMainRelatedGuests();
+size_t                PthreadResumeMainRelatedGuests();
 int KYTY_SYSV_ABI     PthreadCreate(Pthread* thread, const PthreadAttr* attr,
                                     pthread_entry_func_t entry, void* arg, const char* name);
 int KYTY_SYSV_ABI     PthreadDetach(Pthread thread);

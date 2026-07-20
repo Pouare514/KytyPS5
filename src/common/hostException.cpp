@@ -1,5 +1,6 @@
 #include "common/hostException.h"
 
+#include "common/crashDiagnostics.h"
 #include "common/fatalLog.h"
 
 #include <atomic>
@@ -29,9 +30,10 @@ static_assert(decltype(g_handler)::is_always_lock_free);
 static_assert(decltype(g_install_state)::is_always_lock_free);
 
 [[noreturn]] static void FailFast(const char* reason) noexcept {
-	std::fputs("HostException fail-fast: ", stderr);
-	std::fputs(reason != nullptr ? reason : "unspecified", stderr);
-	std::fputc('\n', stderr);
+	char message[256];
+	std::snprintf(message, sizeof(message), "HostException fail-fast: %s",
+	              reason != nullptr ? reason : "unspecified");
+	Common::LogFatalToFile(message);
 	std::fflush(stderr);
 	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(EXCEPTION_NONCONTINUABLE_EXCEPTION));
 	std::_Exit(321);
@@ -65,14 +67,47 @@ static void LogFatalWinException(PEXCEPTION_POINTERS exception) {
 		(void)GetModuleFileNameA(owner_module, module_name, MAX_PATH);
 	}
 
-	char message[512];
+	char message[640];
+	const auto info0 =
+	    exception_record->NumberParameters > 0 ? exception_record->ExceptionInformation[0] : 0;
+	const auto info1 =
+	    exception_record->NumberParameters > 1 ? exception_record->ExceptionInformation[1] : 0;
 	std::snprintf(message, sizeof(message),
 	              "Fatal win exception: code=0x%08" PRIx32 ", addr=0x%016" PRIx64
-	              ", rip=0x%016" PRIx64 ", rsp=0x%016" PRIx64 ", module=%s",
+	              ", rip=0x%016" PRIx64 ", rsp=0x%016" PRIx64 ", info0=0x%016" PRIx64
+	              ", info1=0x%016" PRIx64 ", module=%s",
 	              static_cast<uint32_t>(exception_record->ExceptionCode),
 	              reinterpret_cast<uint64_t>(exception_record->ExceptionAddress), rip, context->Rsp,
+	              static_cast<uint64_t>(info0), static_cast<uint64_t>(info1),
 	              module_name[0] != '\0' ? module_name : "(unknown)");
 	LogFatalToFile(message);
+	Common::FlushHleRingToFatal("host_exception_fatal");
+
+	void* stack[32] = {};
+	const USHORT frames =
+	    CaptureStackBackTrace(0, static_cast<DWORD>(sizeof(stack) / sizeof(stack[0])), stack,
+	                          nullptr);
+	for (USHORT i = 0; i < frames; ++i) {
+		char      frame_module[MAX_PATH] = {};
+		HMODULE   frame_owner            = nullptr;
+		const auto frame_addr            = reinterpret_cast<uint64_t>(stack[i]);
+		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+		                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                       reinterpret_cast<LPCSTR>(stack[i]), &frame_owner) != 0 &&
+		    frame_owner != nullptr) {
+			(void)GetModuleFileNameA(frame_owner, frame_module, MAX_PATH);
+		}
+		char frame_message[384];
+		const auto frame_rva =
+		    frame_owner != nullptr
+		        ? frame_addr - reinterpret_cast<uint64_t>(frame_owner)
+		        : frame_addr;
+		std::snprintf(frame_message, sizeof(frame_message),
+		              "  fatal stack[%u]: 0x%016" PRIx64 " +0x%08" PRIx64 " %s",
+		              static_cast<unsigned>(i), frame_addr, frame_rva,
+		              frame_module[0] != '\0' ? frame_module : "(unknown)");
+		LogFatalToFile(frame_message);
+	}
 }
 
 static bool IsFatalUnhandledWinException(uint32_t code) {

@@ -5,10 +5,14 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <limits>
 #include <unordered_map>
 #include <vector>
@@ -293,6 +297,24 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	if (PthreadCurrentIsSubmissionRelated() || PthreadCurrentIsMainRelated()) {
+		static std::atomic<uint32_t> logs {0};
+		const auto                   n = logs.fetch_add(1, std::memory_order_relaxed);
+		if (n < 64) {
+			char name[32] = {};
+			auto* self    = PthreadSelfOrNull();
+			if (self != nullptr) {
+				PthreadGetname(self, name);
+			}
+			const uint64_t ra = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+			LOGF("SubmitTrace: SemaWait name=%s tid=%d sem=%s need=%d timo=%s ra=0x%016" PRIx64 "\n",
+			     name, PthreadGetUniqueId(self), sem->GetName().c_str(), need,
+			     time == nullptr ? "inf" : "set", ra);
+			fprintf(stderr, "SubmitTrace: SemaWait name=%s tid=%d sem=%s\n", name,
+			        PthreadGetUniqueId(self), sem->GetName().c_str());
+		}
+	}
+
 	auto result = sem->Wait(need, time);
 
 	int ret = OK;
@@ -335,6 +357,20 @@ int KYTY_SYSV_ABI KernelPollSema(KernelSema sem, int need) {
 int KYTY_SYSV_ABI KernelSignalSema(KernelSema sem, int count) {
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
+	}
+
+	if (PthreadCurrentIsSubmissionRelated()) {
+		static std::atomic<uint32_t> logs {0};
+		const auto                   n = logs.fetch_add(1, std::memory_order_relaxed);
+		if (n < 32) {
+			char name[32] = {};
+			auto* self    = PthreadSelfOrNull();
+			if (self != nullptr) {
+				PthreadGetname(self, name);
+			}
+			LOGF("SubmitTrace: MixedSignalSema name=%s tid=%d sem=%s count=%d\n", name,
+			     PthreadGetUniqueId(self), sem->GetName().c_str(), count);
+		}
 	}
 
 	auto result = sem->Signal(count);

@@ -3,9 +3,15 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <atomic>
+#include <cstdio>
 #include <cstring>
 
 namespace Libs {
+
+namespace LibAgc {
+LIB_DEFINE(InitAgc_1);
+} // namespace LibAgc
 
 namespace LibGen5 {
 
@@ -316,9 +322,102 @@ LIB_DEFINE(InitGraphicsDriver_1) {
 
 } // namespace LibGen5Driver
 
+namespace LibAgcDriver {
+
+LIB_VERSION("AgcDriver", 1, "AgcDriver", 1, 1);
+
+namespace Gen5Driver = Graphics::Gen5Driver;
+
+// Soft-stub for TLOU AgcDriver_v1 NIDs that have no Graphics5Driver alias yet.
+// Always logs so Mixed Submission blockers are visible (Phase 22 soft-stubs were silent/never hit).
+#define KYTY_AGC_DRIVER_STUB(fn)                                                                   \
+	static KYTY_SYSV_ABI uint64_t fn(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,            \
+	                                 uint64_t a4, uint64_t a5) {                                    \
+		(void)a0;                                                                                  \
+		(void)a1;                                                                                  \
+		(void)a2;                                                                                  \
+		(void)a3;                                                                                  \
+		(void)a4;                                                                                  \
+		(void)a5;                                                                                  \
+		static std::atomic<uint32_t> call_count {0};                                               \
+		const auto                   n = call_count.fetch_add(1, std::memory_order_relaxed);       \
+		LOGF("AgcDriverStub: NID=%s call=%u\n", #fn, n);                                           \
+		if (n < 64) {                                                                              \
+			fprintf(stderr, "AgcDriverStub: NID=%s call=%u\n", #fn, n);                            \
+		}                                                                                          \
+		return 0;                                                                                  \
+	}
+
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_Xq5WmbwPTnQ)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_SAfhzJPcjuk)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_FOwvmNlFLjM)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_qspAL8bgcBY)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_plus_TN0oRTBxJQ)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_rJUyMrDdxJg)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_n5ElQVYsU1A)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_emP3ckeS2uo)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_ZLJk9r2_2Aw)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_SCoAN5fYlUM)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_5l3IfCFJxBs)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_M9yBzRKkjPc)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_rI9lNAXPMIw)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_NghWEUXp1qM)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_ls4jfY576lw)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_VOMSpd9_vxU)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_mXn_K9E_wOA)
+KYTY_AGC_DRIVER_STUB(AgcDriverStub_LepGrgk77sM)
+
+#undef KYTY_AGC_DRIVER_STUB
+
+LIB_DEFINE(InitAgcDriver_1) {
+	PRINT_NAME_ENABLE(true);
+
+	// Alias known Graphics5Driver entry points under AgcDriver (same NIDs).
+	LIB_FUNC("UglJIZjGssM", Gen5Driver::GraphicsDriverSubmitDcb);
+	LIB_FUNC("AhGvpITrf4M", Gen5Driver::GraphicsDriverSubmitDcb);
+	LIB_FUNC("6UzEidRZwkg", Gen5Driver::GraphicsDriverSubmitMultiDcbs);
+	LIB_FUNC("+T8Xo6LtFJI", Gen5Driver::GraphicsDriverSubmitMultiDcbs);
+	LIB_FUNC("b4fpgH5ZXxQ", Gen5Driver::GraphicsDriverSubmitCommandBuffer);
+	LIB_FUNC("Fj7r9EHzF38", Gen5Driver::GraphicsDriverSubmitMultiCommandBuffers);
+	LIB_FUNC("gSRnr79F8tQ", Gen5Driver::GraphicsDriverSubmitAcb);
+	LIB_FUNC("HF3YllT3mXU", Gen5Driver::GraphicsDriverSubmitMultiAcbs);
+	LIB_FUNC("w2rJhmD+dsE", Gen5Driver::GraphicsDriverAddEqEvent);
+	LIB_FUNC("DL2RXaXOy88", Gen5Driver::GraphicsDriverDeleteEqEvent);
+	LIB_FUNC("5CdQTZIQPxM", Gen5Driver::GraphicsDriverGetEqEventType);
+	LIB_FUNC("Zw7uUVPulbw", Gen5Driver::GraphicsDriverGetEqContextId);
+	LIB_FUNC("XlNp7jzGiPo", Gen5Driver::GraphicsDriverSetTFRing);
+	LIB_FUNC("MM4IZSEYytQ", Gen5Driver::GraphicsDriverSetHsOffchipParam);
+	LIB_FUNC("Ddwk4gLT5j0", Gen5Driver::GraphicsDriverIsCaptureInProgress);
+	LIB_FUNC("U9ueyEhSkF4", Gen5Driver::GraphicsDriverUnknownU9ueyEhSkF4);
+
+	// TLOU Part I AgcDriver_v1-only NIDs (Phase 22 relocate list).
+	LIB_FUNC("Xq5WmbwPTnQ", AgcDriverStub_Xq5WmbwPTnQ);
+	LIB_FUNC("SAfhzJPcjuk", AgcDriverStub_SAfhzJPcjuk);
+	LIB_FUNC("FOwvmNlFLjM", AgcDriverStub_FOwvmNlFLjM);
+	LIB_FUNC("qspAL8bgcBY", AgcDriverStub_qspAL8bgcBY);
+	LIB_FUNC("+TN0oRTBxJQ", AgcDriverStub_plus_TN0oRTBxJQ);
+	LIB_FUNC("rJUyMrDdxJg", AgcDriverStub_rJUyMrDdxJg);
+	LIB_FUNC("n5ElQVYsU1A", AgcDriverStub_n5ElQVYsU1A);
+	LIB_FUNC("emP3ckeS2uo", AgcDriverStub_emP3ckeS2uo);
+	LIB_FUNC("ZLJk9r2+2Aw", AgcDriverStub_ZLJk9r2_2Aw);
+	LIB_FUNC("SCoAN5fYlUM", AgcDriverStub_SCoAN5fYlUM);
+	LIB_FUNC("5l3IfCFJxBs", AgcDriverStub_5l3IfCFJxBs);
+	LIB_FUNC("M9yBzRKkjPc", AgcDriverStub_M9yBzRKkjPc);
+	LIB_FUNC("rI9lNAXPMIw", AgcDriverStub_rI9lNAXPMIw);
+	LIB_FUNC("NghWEUXp1qM", AgcDriverStub_NghWEUXp1qM);
+	LIB_FUNC("ls4jfY576lw", AgcDriverStub_ls4jfY576lw);
+	LIB_FUNC("VOMSpd9+vxU", AgcDriverStub_VOMSpd9_vxU);
+	LIB_FUNC("mXn+K9E-wOA", AgcDriverStub_mXn_K9E_wOA);
+	LIB_FUNC("LepGrgk77sM", AgcDriverStub_LepGrgk77sM);
+}
+
+} // namespace LibAgcDriver
+
 LIB_DEFINE(InitGraphicsDriver_1) {
 	LibGen5::InitGraphicsDriver_1(s);
 	LibGen5Driver::InitGraphicsDriver_1(s);
+	LibAgcDriver::InitAgcDriver_1(s);
+	LibAgc::InitAgc_1(s);
 }
 
 } // namespace Libs

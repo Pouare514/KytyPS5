@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_LIBS_LIBS_H_
 
 #include "common/abi.h"
+#include "common/crashDiagnostics.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -57,14 +58,17 @@
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME()                                                                               \
-	if (PRINT_NAME_ENABLED) {                                                                      \
-		if (Log::GetDirection() != Log::Direction::Silent) {                                       \
-			const auto print_name_time = Loader::Timer::GetTime().ToString("HH24:MI:SS.FFF");      \
-			LOGF_COLOR(Log::Color::Cyan, "[%d][%s] %s::%s::%s()\n",                                \
-			           Common::Thread::GetThreadIdUnique(), print_name_time.c_str(), g_library,    \
-			           g_module, __func__);                                                        \
+	do {                                                                                           \
+		Common::NoteHleCall(g_library, g_module, __func__);                                       \
+		if (PRINT_NAME_ENABLED) {                                                                  \
+			if (Log::GetDirection() != Log::Direction::Silent) {                                   \
+				const auto print_name_time = Loader::Timer::GetTime().ToString("HH24:MI:SS.FFF");  \
+				LOGF_COLOR(Log::Color::Cyan, "[%d][%s] %s::%s::%s()\n",                            \
+				           Common::Thread::GetThreadIdUnique(), print_name_time.c_str(), g_library,\
+				           g_module, __func__);                                                    \
+			}                                                                                      \
 		}                                                                                          \
-	}
+	} while (0)
 
 namespace Loader {
 class SymbolDatabase;

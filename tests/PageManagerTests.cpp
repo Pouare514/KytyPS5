@@ -555,6 +555,66 @@ void TestExternalDirtyTransferDuringResolution() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestRemapLeavesExecuteReadWriteWhileWatched() {
+  FaultContext context;
+  PageManager manager(InvalidateFault, &context);
+  context.manager = &manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  manager.OnGpuMap(address, page_size);
+  manager.UpdatePageWatchers(true, address, page_size);
+  Check(Protection(memory) == PAGE_READONLY, "watch did not install RO");
+
+  // Direct/placeholder remaps often recreate the view as EXECUTE_READWRITE while the
+  // tracker still expects RO/RW. Protect must treat that as access-equivalent.
+  DWORD old_protection = 0;
+  Check(VirtualProtect(memory, page_size, PAGE_EXECUTE_READWRITE, &old_protection) != 0,
+        "failed to simulate remap XRW");
+  Check(old_protection == PAGE_READONLY, "unexpected protect before remap simulation");
+
+  manager.UpdatePageWatchers(false, address, page_size);
+  Check(Protection(memory) == PAGE_READWRITE ||
+            Protection(memory) == PAGE_EXECUTE_READWRITE,
+        "unwatch after XRW remap failed");
+
+  manager.UpdatePageWatchers(true, address, page_size);
+  Check(Protection(memory) == PAGE_READONLY, "rewatch after XRW remap failed");
+
+  manager.UpdatePageWatchers(false, address, page_size);
+  manager.OnGpuUnmap(address, page_size);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+void TestAlreadyAtTargetProtectionIsNoOp() {
+  FaultContext context;
+  PageManager manager(InvalidateFault, &context);
+  context.manager = &manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  manager.OnGpuMap(address, page_size);
+  manager.UpdatePageWatchers(true, address, page_size);
+  Check(Protection(memory) == PAGE_READONLY, "watch did not install RO");
+
+  DWORD old_protection = 0;
+  Check(VirtualProtect(memory, page_size, PAGE_READONLY, &old_protection) != 0,
+        "failed to reaffirm RO");
+
+  // Unwatch expects to transition RO -> RW; if VirtualProtect fails but page is already RW
+  // after an external change, HostProtectionMatches should accept it. Here: leave at RO,
+  // then unwatch — normal path. Also force page already at RW before unwatch:
+  Check(VirtualProtect(memory, page_size, PAGE_READWRITE, &old_protection) != 0,
+        "failed to pre-set RW before unwatch");
+  manager.UpdatePageWatchers(false, address, page_size);
+  Check(IsWritable(memory), "unwatch with pre-set RW failed");
+
+  manager.OnGpuUnmap(address, page_size);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestMappingDoesNotRequireCpuWriteAccess() {
   FaultContext context;
   PageManager manager(InvalidateFault, &context);
@@ -617,6 +677,8 @@ int main(int argc, char **argv) {
   TestCrossRegionRange();
   TestConcurrentFault();
   TestExternalDirtyTransferDuringResolution();
+  TestRemapLeavesExecuteReadWriteWhileWatched();
+  TestAlreadyAtTargetProtectionIsNoOp();
   TestMappingDoesNotRequireCpuWriteAccess();
   TestGpuAccessPermissions();
   TestFatalPaths();

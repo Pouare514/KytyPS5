@@ -84,7 +84,10 @@ void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, uint32_t* cmd_buffer)
 
 namespace Gen5 {
 
-LIB_NAME("Graphics5", "Graphics5");
+// Phase 23: default PRINT on so CB-builder / submit HLE calls are visible on all threads.
+[[maybe_unused]] static thread_local bool PRINT_NAME_ENABLED = true;
+static constexpr char                     g_library[]        = "Graphics5";
+static constexpr char                     g_module[]         = "Graphics5";
 
 struct RegisterDefaults {
 	ShaderRegister** tbl0                = nullptr;
@@ -1479,7 +1482,8 @@ int KYTY_SYSV_ABI GraphicsDriverRegisterOwner() {
 int KYTY_SYSV_ABI GraphicsDriverRegisterResource() {
 	PRINT_NAME();
 
-	return static_cast<int>(0x8a6c9018u);
+	// Phase 27: magic 0x8a6c9018 soft-disabled resources; return 0 so guest treats registration as OK.
+	return 0;
 }
 
 int KYTY_SYSV_ABI GraphicsDriverUnregisterResource() {
@@ -3631,6 +3635,9 @@ uint32_t* KYTY_SYSV_ABI GraphicsDcbSetFlip(CommandBuffer* buf, uint32_t video_ou
 	     "\t flip_mode            = %" PRIu32 "\n"
 	     "\t flip_arg             = %" PRId64 "\n",
 	     video_out_handle, display_buffer_index, flip_mode, flip_arg);
+	LOGF("FlipTrace: AGC GraphicsDcbSetFlip handle=%" PRIu32 " index=%" PRId32 " mode=%" PRIu32
+	     " arg=%" PRId64 "\n",
+	     video_out_handle, display_buffer_index, flip_mode, flip_arg);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
@@ -3654,7 +3661,10 @@ uint32_t* KYTY_SYSV_ABI GraphicsDcbSetFlip(CommandBuffer* buf, uint32_t video_ou
 
 namespace Gen5Driver {
 
-LIB_NAME("Graphics5Driver", "Graphics5Driver");
+// Phase 23: default PRINT on for driver submit / eq path.
+[[maybe_unused]] static thread_local bool PRINT_NAME_ENABLED = true;
+static constexpr char                     g_library[]        = "Graphics5Driver";
+static constexpr char                     g_module[]         = "Graphics5Driver";
 
 struct TessellationDriverState {
 	uint64_t tf_ring_base      = 0;
@@ -3854,6 +3864,9 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitDcb(const Packet* packet) {
 	EXIT_NOT_IMPLEMENTED(packet == nullptr);
 	EXIT_NOT_IMPLEMENTED(packet->pad[0] != 0);
 
+	Sync::SubmitTrace::NoteSubmitDcb();
+	LOGF("SubmitTrace: SubmitDcb addr=0x%016" PRIx64 " dw_num=0x%08" PRIx32 "\n",
+	     reinterpret_cast<uint64_t>(packet->addr), packet->dw_num);
 	LOGF("\t addr   = 0x%016" PRIx64 "\n"
 	     "\t dw_num = 0x%08" PRIx32 "\n",
 	     reinterpret_cast<uint64_t>(packet->addr), packet->dw_num);
@@ -3868,6 +3881,8 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
                                                 uint32_t         count) {
 	PRINT_NAME();
 
+	Sync::SubmitTrace::NoteSubmitDcb();
+	LOGF("SubmitTrace: SubmitMultiDcbs count=%" PRIu32 "\n", count);
 	LOGF("\t count = %" PRIu32 "\n", count);
 
 	if (count == 0) {
@@ -3898,6 +3913,10 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitCommandBuffer(uint32_t queue, uint32_t* dc
                                                     uint32_t size_in_dwords) {
 	PRINT_NAME();
 
+	Sync::SubmitTrace::NoteSubmitDcb();
+	LOGF("SubmitTrace: SubmitCommandBuffer queue=0x%08" PRIx32 " dcb=0x%016" PRIx64
+	     " size=0x%08" PRIx32 "\n",
+	     queue, reinterpret_cast<uint64_t>(dcb), size_in_dwords);
 	LOGF("\t queue = 0x%08" PRIx32 "\n"
 	     "\t dcb   = 0x%016" PRIx64 "\n"
 	     "\t size  = 0x%08" PRIx32 "\n",
@@ -3972,6 +3991,9 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 int KYTY_SYSV_ABI GraphicsDriverSubmitAcb(uint32_t queue, const Packet* packet) {
 	PRINT_NAME();
 
+	Sync::SubmitTrace::NoteSubmitAcb();
+	LOGF("SubmitTrace: SubmitAcb queue=0x%08" PRIx32 " packet=0x%016" PRIx64 "\n", queue,
+	     reinterpret_cast<uint64_t>(packet));
 	LOGF("\t queue = 0x%08" PRIx32 "\n"
 	     "\t packet = 0x%016" PRIx64 "\n",
 	     queue, reinterpret_cast<uint64_t>(packet));
@@ -3993,6 +4015,8 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const*
                                                 const uint32_t* sizes_in_dwords, uint32_t count) {
 	PRINT_NAME();
 
+	Sync::SubmitTrace::NoteSubmitAcb();
+	LOGF("SubmitTrace: SubmitMultiAcbs queue=0x%08" PRIx32 " count=%" PRIu32 "\n", queue, count);
 	LOGF("\t queue = 0x%08" PRIx32 "\n"
 	     "\t count = %" PRIu32 "\n",
 	     queue, count);
@@ -4014,6 +4038,9 @@ int KYTY_SYSV_ABI GraphicsDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const*
 int KYTY_SYSV_ABI GraphicsDriverAddEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id,
                                            void* udata) {
 	PRINT_NAME();
+
+	LOGF("SubmitTrace: GraphicsDriverAddEqEvent id=%d eq=0x%016" PRIx64 "\n", id,
+	     reinterpret_cast<uint64_t>(eq));
 
 	if (eq == nullptr) {
 		return LibKernel::KERNEL_ERROR_EBADF;
@@ -4039,6 +4066,7 @@ int KYTY_SYSV_ABI GraphicsDriverGetEqEventType(const LibKernel::EventQueue::Kern
 		return 0;
 	}
 
+	// Phase 28: GRAPHICS event type is always ident (IRQ0 data=0 is normal).
 	if (ev->filter == LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS) {
 		return static_cast<int>(ev->ident);
 	}
@@ -4054,7 +4082,7 @@ uint32_t KYTY_SYSV_ABI GraphicsDriverGetEqContextId(const LibKernel::EventQueue:
 	}
 
 	if (ev->filter == LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS) {
-		return static_cast<uint32_t>(ev->data);
+		return 0;
 	}
 
 	return static_cast<uint32_t>(ev->ident);

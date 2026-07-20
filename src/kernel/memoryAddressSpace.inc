@@ -205,47 +205,45 @@ public:
 			return false;
 		}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// Never VirtualFree a MEM_RESERVE container to make room for MapView — that releases the
+		// entire AllocationBase and can destroy neighboring live Direct views in the same arena.
+		MEMORY_BASIC_INFORMATION reserve_info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &reserve_info,
+		                 sizeof(reserve_info)) != 0 &&
+		    reserve_info.State == MEM_RESERVE) {
+			const auto region_base = reinterpret_cast<uint64_t>(reserve_info.BaseAddress);
+			const auto region_end  = region_base + reserve_info.RegionSize;
+			const auto target_end  = vaddr + size;
+			if (vaddr < region_base || target_end > region_end) {
+				SetFailure(failure_reason, FailureReason::PlaceholderReserveFailed);
+				return false;
+			}
+			if (region_base < vaddr &&
+			    !SplitPlaceholder(region_base, vaddr - region_base)) {
+				SetFailure(failure_reason, FailureReason::PlaceholderReserveFailed);
+				return false;
+			}
+			if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &reserve_info,
+			                 sizeof(reserve_info)) == 0 ||
+			    reserve_info.State != MEM_RESERVE ||
+			    reinterpret_cast<uint64_t>(reserve_info.BaseAddress) != vaddr ||
+			    reserve_info.RegionSize < size) {
+				SetFailure(failure_reason, FailureReason::PlaceholderReserveFailed);
+				return false;
+			}
+			if (reserve_info.RegionSize > size && !SplitPlaceholder(vaddr, size)) {
+				SetFailure(failure_reason, FailureReason::PlaceholderReserveFailed);
+				return false;
+			}
+			return MapExistingPlaceholderFixed(vaddr, size, backing_offset, mode, failure_reason);
+		}
+#endif
+
 		void* mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (mapped == nullptr && ReleaseExactHostAllocation(vaddr, size)) {
 			mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
-		}
-		if (mapped == nullptr) {
-			ReleasedReservedHostAllocation released {};
-			if (ReleaseReservedHostAllocationForMap(vaddr, size, &released, failure_reason)) {
-				mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
-				if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
-					if (mapped != nullptr) {
-						UnmapView(mapped, size);
-						mapped = nullptr;
-					}
-					RestoreReleasedReservedHostAllocation(released);
-				} else if (!ReserveReleasedReservedHostRemainders(released)) {
-					UnmapView(mapped, size);
-					mapped = nullptr;
-					RestoreReleasedReservedHostAllocation(released);
-					SetFailure(failure_reason, FailureReason::ReservedContainerRestoreFailed);
-				}
-			}
-		}
-		if (mapped == nullptr) {
-			std::vector<ReleasedReservedHostAllocation> released_ranges;
-			if (ReleaseReservedHostAllocationsForMap(vaddr, size, &released_ranges,
-			                                         failure_reason)) {
-				mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
-				if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
-					if (mapped != nullptr) {
-						UnmapView(mapped, size);
-						mapped = nullptr;
-					}
-					RestoreReleasedReservedHostAllocations(released_ranges);
-				} else if (!ReserveReleasedReservedHostRemainders(released_ranges)) {
-					UnmapView(mapped, size);
-					mapped = nullptr;
-					RestoreReleasedReservedHostAllocations(released_ranges);
-					SetFailure(failure_reason, FailureReason::ReservedContainerRestoreFailed);
-				}
-			}
 		}
 #endif
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
@@ -278,18 +276,48 @@ public:
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		void* mapped = ReplacePlaceholderView(vaddr, size, backing_offset, mode, failure_reason);
-		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
-			if (mapped != nullptr) {
-				UnmapView(mapped, size);
-				SetFailure(failure_reason, FailureReason::WrongHostAddress);
+		// Sub-64K Direct maps are reserved as multiple placeholder fragments (one per page inside
+		// each 64K container). Replace each fragment in order — a single MapViewOfFile3 over the
+		// full span fails when the VA is not one contiguous placeholder.
+		std::vector<MapEntry> entries;
+		uint64_t              mapped = 0;
+		while (mapped < size) {
+			MEMORY_BASIC_INFORMATION info {};
+			const auto               current = vaddr + mapped;
+			if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) == 0 ||
+			    info.State != MEM_RESERVE) {
+				for (const auto& entry: entries) {
+					UnmapView(reinterpret_cast<void*>(entry.vaddr), entry.size);
+				}
+				SetFailure(failure_reason, FailureReason::PlaceholderMapFailed);
+				return false;
 			}
-			return false;
+			const auto region_base = reinterpret_cast<uint64_t>(info.BaseAddress);
+			const auto region_end  = region_base + info.RegionSize;
+			if (current < region_base || current >= region_end) {
+				for (const auto& entry: entries) {
+					UnmapView(reinterpret_cast<void*>(entry.vaddr), entry.size);
+				}
+				SetFailure(failure_reason, FailureReason::PlaceholderMapFailed);
+				return false;
+			}
+			const auto part_size = std::min<uint64_t>(region_end - current, size - mapped);
+			if (ReplacePlaceholderView(current, part_size, backing_offset + mapped, mode,
+			                           failure_reason) == nullptr) {
+				for (const auto& entry: entries) {
+					UnmapView(reinterpret_cast<void*>(entry.vaddr), entry.size);
+				}
+				return false;
+			}
+			entries.push_back(MapEntry {current, part_size, backing_offset + mapped, mode});
+			mapped += part_size;
 		}
 
 		{
 			std::lock_guard lock(m_mutex);
-			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+			for (const auto& entry: entries) {
+				EXIT_IF(!m_maps.emplace(entry.vaddr, entry).second);
+			}
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
@@ -325,10 +353,15 @@ public:
 
 			const auto entry_end = entry.vaddr + entry.size;
 			const auto part_size = std::min(end, entry_end) - current;
-			const bool preserve_part_placeholder =
-			    preserve_placeholder && current == vaddr && part_size == size;
-			if (!UnmapOne(current, part_size, preserve_part_placeholder, placeholder_preserved)) {
+			// Preserve each covered MapEntry when requested. Restricting preserve to a single
+			// exact UnmapOne call left multi-entry spans destroying placeholders while the
+			// caller still expected a restorable free-list range.
+			bool part_preserved = false;
+			if (!UnmapOne(current, part_size, preserve_placeholder, &part_preserved)) {
 				return false;
+			}
+			if (part_preserved && placeholder_preserved != nullptr) {
+				*placeholder_preserved = true;
 			}
 
 			current += part_size;
@@ -379,39 +412,46 @@ public:
 		const uint64_t right_size = old_end - right_addr;
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
-			bool ok = true;
-			if (left_size != 0 && left_size != old.size) {
-				ok = SplitPlaceholder(old.vaddr, left_size) && ok;
-			}
-			if (right_size != 0) {
-				ok = SplitPlaceholder(vaddr, size) && ok;
-			}
-			if (left_size != 0) {
-				ok = MapExistingPlaceholderFixed(old.vaddr, left_size, old.backing_offset,
-				                                 old.mode) &&
-				     ok;
-			}
-			if (right_size != 0) {
-				ok = MapExistingPlaceholderFixed(right_addr, right_size,
-				                                 old.backing_offset + (right_addr - old.vaddr),
-				                                 old.mode) &&
-				     ok;
-			}
-			if (ok) {
-				if (placeholder_preserved != nullptr) {
-					*placeholder_preserved = true;
-				}
-				return true;
-			}
-		} else
-#endif
-		{
-			if (!UnmapView(reinterpret_cast<void*>(old.vaddr), old.size)) {
-				std::lock_guard lock(m_mutex);
-				m_maps.emplace(old.vaddr, old);
-				return false;
-			}
+		// Partial unmaps must split an existing placeholder-backed view. Never fall through to
+		// MapFixed — that path can VirtualFree an entire reserved container and corrupt neighbors.
+		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
+			std::lock_guard lock(m_mutex);
+			m_maps.emplace(old.vaddr, old);
+			return false;
+		}
+		bool ok = true;
+		if (left_size != 0 && left_size != old.size) {
+			ok = SplitPlaceholder(old.vaddr, left_size) && ok;
+		}
+		if (right_size != 0) {
+			ok = SplitPlaceholder(vaddr, size) && ok;
+		}
+		if (left_size != 0) {
+			ok = MapExistingPlaceholderFixed(old.vaddr, left_size, old.backing_offset, old.mode) &&
+			     ok;
+		}
+		if (right_size != 0) {
+			ok = MapExistingPlaceholderFixed(right_addr, right_size,
+			                                 old.backing_offset + (right_addr - old.vaddr),
+			                                 old.mode) &&
+			     ok;
+		}
+		if (!ok) {
+			MapExistingPlaceholderFixed(old.vaddr, old.size, old.backing_offset, old.mode);
+			return false;
+		}
+		// Partial unmaps always leave an OS placeholder in the hole (required to keep
+		// left/right remapable). Report it so callers AddFree + track Reserved; do not
+		// MEM_RELEASE the hole here — that breaks later ReserveFixed next to live views.
+		if (placeholder_preserved != nullptr) {
+			*placeholder_preserved = true;
+		}
+		return true;
+#else
+		if (!UnmapView(reinterpret_cast<void*>(old.vaddr), old.size)) {
+			std::lock_guard lock(m_mutex);
+			m_maps.emplace(old.vaddr, old);
+			return false;
 		}
 
 		bool ok = true;
@@ -435,6 +475,7 @@ public:
 		}
 
 		return ok;
+#endif
 	}
 
 	void UpdateProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
@@ -1122,7 +1163,13 @@ public:
 		{
 			std::lock_guard lock(m_mutex);
 			if (FindContaining(vaddr, size) != m_free.end()) {
-				return true;
+				MEMORY_BASIC_INFORMATION info {};
+				if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) != 0 &&
+				    info.State == MEM_RESERVE) {
+					return true;
+				}
+				// Stale free-list entry: OS no longer has a placeholder here.
+				DropOverlappingFreeUnlocked(vaddr, size);
 			}
 		}
 		if (!ReserveFixedPlaceholderRange(vaddr, size)) {
@@ -1153,6 +1200,16 @@ public:
 		return true;
 #else
 		return false;
+#endif
+	}
+
+	void DropOverlappingFree(uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		std::lock_guard lock(m_mutex);
+		DropOverlappingFreeUnlocked(vaddr, size);
+#else
+		(void)vaddr;
+		(void)size;
 #endif
 	}
 
@@ -1340,15 +1397,28 @@ private:
 		return true;
 	}
 
-	void AddFreeUnlocked(uint64_t vaddr, uint64_t size) {
+	void DropOverlappingFreeUnlocked(uint64_t vaddr, uint64_t size) {
 		if (vaddr == 0 || size == 0) {
 			return;
 		}
-		auto [it, inserted] = m_free.emplace(vaddr, size);
-		if (!inserted) {
-			it->second = size;
+		const auto range_end = vaddr + size;
+		auto       it        = m_free.upper_bound(vaddr);
+		if (it != m_free.begin()) {
+			auto prev = std::prev(it);
+			if (prev->first + prev->second > vaddr) {
+				it = prev;
+			}
 		}
+		while (it != m_free.end() && it->first < range_end) {
+			if (it->first + it->second <= vaddr) {
+				++it;
+				continue;
+			}
+			it = m_free.erase(it);
+		}
+	}
 
+	void CoalesceAroundUnlocked(std::map<uint64_t, uint64_t>::iterator it) {
 		auto base = it->first;
 		auto end  = it->first + it->second;
 
@@ -1375,6 +1445,39 @@ private:
 				m_free.emplace(base, end - base);
 			}
 		}
+	}
+
+	void AddFreeUnlocked(uint64_t vaddr, uint64_t size) {
+		if (vaddr == 0 || size == 0) {
+			return;
+		}
+		// Idempotent when the span is already tracked; merge overlapping/adjacent spans instead
+		// of silently overwriting map sizes (which desyncs m_free from OS placeholders).
+		if (FindContaining(vaddr, size) != m_free.end()) {
+			return;
+		}
+
+		auto range_start = vaddr;
+		auto range_end   = vaddr + size;
+		auto it          = m_free.upper_bound(vaddr);
+		if (it != m_free.begin()) {
+			auto prev = std::prev(it);
+			if (prev->first + prev->second > vaddr) {
+				range_start = prev->first;
+				range_end   = std::max(range_end, prev->first + prev->second);
+				it          = prev;
+			}
+		}
+		while (it != m_free.end() && it->first < range_end) {
+			range_end = std::max(range_end, it->first + it->second);
+			it        = m_free.erase(it);
+		}
+
+		auto [inserted_it, inserted] = m_free.emplace(range_start, range_end - range_start);
+		if (!inserted) {
+			inserted_it->second = std::max(inserted_it->second, range_end - range_start);
+		}
+		CoalesceAroundUnlocked(inserted_it);
 	}
 
 	uint64_t                     m_granularity = 0x10000;

@@ -730,6 +730,311 @@ void TestDirectMapUnmapReusesHostAddress() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestDirectMapFixedNoOverwriteRemapAfterMunmap() {
+	const char* test = "DirectMapFixedNoOverwriteRemapAfterMunmap";
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            SceKernelPageSize, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* reserve = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, SceKernelPageSize, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+
+	void* mapped = reserve;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &mapped, SceKernelPageSize, SceKernelProtCpuRw,
+	            SceKernelMapFixed | SceKernelMapNoOverwrite, phys_addr, 0, "dmem_no_overwrite"),
+	        "KernelMapNamedDirectMemory(first)");
+	Check(test, mapped == reserve, "fixed direct mapping moved on first map");
+	*reinterpret_cast<uint64_t*>(mapped) = 0x4b59545952454d50ull; // "KYTYREMP"
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap");
+
+	void* remapped = reinterpret_cast<void*>(base);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &remapped, SceKernelPageSize, SceKernelProtCpuRw,
+	            SceKernelMapFixed | SceKernelMapNoOverwrite, phys_addr, 0, "dmem_no_overwrite"),
+	        "KernelMapNamedDirectMemory(remap after munmap)");
+	Check(test, remapped == reinterpret_cast<void*>(base),
+	      "fixed direct remap moved after munmap");
+	Check(test, *reinterpret_cast<const uint64_t*>(remapped) == 0x4b59545952454d50ull,
+	      "direct remap after munmap did not preserve backing contents");
+
+	// Munmap of committed_from_reserved Direct restores Reserved; clear that too.
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap(direct cleanup)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap(reserve cleanup)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, SceKernelPageSize),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestDirectStagingStyleRemapAliasStress() {
+	const char*        test       = "DirectStagingStyleRemapAliasStress";
+	constexpr uint64_t chunk_size = SceKernelPageSize * 64; // 1 MiB
+	constexpr uint64_t chunk_count = 10;
+	constexpr uint64_t total_size  = chunk_size * chunk_count;
+	constexpr int      cycles      = 8;
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            total_size, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* staging_reserve = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&staging_reserve, total_size, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange(staging)");
+	const auto staging_base = reinterpret_cast<uint64_t>(staging_reserve);
+
+	void* alias_reserve = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&alias_reserve, total_size, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange(alias)");
+	const auto alias_base = reinterpret_cast<uint64_t>(alias_reserve);
+
+	for (int cycle = 0; cycle < cycles; ++cycle) {
+		for (uint64_t i = 0; i < chunk_count; ++i) {
+			void* mapped = reinterpret_cast<void*>(staging_base + i * chunk_size);
+			CheckOk(test,
+			        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+			            &mapped, chunk_size, SceKernelProtCpuRw,
+			            SceKernelMapFixed | SceKernelMapNoOverwrite, phys_addr + i * chunk_size, 0,
+			            "staging_chunk"),
+			        "KernelMapNamedDirectMemory(staging)");
+			Check(test, mapped == reinterpret_cast<void*>(staging_base + i * chunk_size),
+			      "staging fixed map moved");
+			*reinterpret_cast<uint64_t*>(mapped) = 0x4b59545953544147ull + i; // "KYTYSTAG"+i
+		}
+
+		for (uint64_t i = 0; i < chunk_count; ++i) {
+			void* mapped = reinterpret_cast<void*>(alias_base + i * chunk_size);
+			CheckOk(test,
+			        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+			            &mapped, chunk_size, SceKernelProtCpuRw,
+			            SceKernelMapFixed | SceKernelMapNoOverwrite, phys_addr + i * chunk_size, 0,
+			            "alias_chunk"),
+			        "KernelMapNamedDirectMemory(alias)");
+			Check(test, mapped == reinterpret_cast<void*>(alias_base + i * chunk_size),
+			      "alias fixed map moved");
+			Check(test,
+			      *reinterpret_cast<const uint64_t*>(mapped) == 0x4b59545953544147ull + i,
+			      "alias did not see staging backing contents");
+			*reinterpret_cast<uint64_t*>(mapped) = 0x4b595459414c4941ull + i; // "KYTYALIA"+i
+		}
+
+		for (uint64_t i = 0; i < chunk_count; ++i) {
+			Check(test,
+			      *reinterpret_cast<const uint64_t*>(staging_base + i * chunk_size) ==
+			          0x4b595459414c4941ull + i,
+			      "staging did not observe alias write");
+		}
+
+		CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(staging_base, total_size),
+		        "KernelMunmap(staging)");
+		CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(alias_base, total_size),
+		        "KernelMunmap(alias)");
+
+		for (uint64_t i = 0; i < chunk_count; ++i) {
+			void* remapped = reinterpret_cast<void*>(staging_base + i * chunk_size);
+			CheckOk(test,
+			        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+			            &remapped, chunk_size, SceKernelProtCpuRw,
+			            SceKernelMapFixed | SceKernelMapNoOverwrite, phys_addr + i * chunk_size, 0,
+			            "staging_remap"),
+			        "KernelMapNamedDirectMemory(staging remap)");
+			Check(test, remapped == reinterpret_cast<void*>(staging_base + i * chunk_size),
+			      "staging remap moved");
+			Check(test,
+			      *reinterpret_cast<const uint64_t*>(remapped) == 0x4b595459414c4941ull + i,
+			      "staging remap lost backing contents");
+		}
+
+		CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(staging_base, total_size),
+		        "KernelMunmap(staging after remap)");
+	}
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(staging_base, total_size),
+	        "KernelMunmap(staging reserve cleanup)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(alias_base, total_size),
+	        "KernelMunmap(alias reserve cleanup)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, total_size),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestDirectMidPlaceholderMapPreservesNeighbors() {
+	const char*        test        = "DirectMidPlaceholderMapPreservesNeighbors";
+	constexpr uint64_t chunk_size  = SceKernelPageSize * 64; // 1 MiB
+	constexpr uint64_t chunk_count = 10;
+	constexpr uint64_t total_size  = chunk_size * chunk_count;
+	constexpr uint64_t mid_index   = 4;
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            total_size, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* reserve = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, total_size, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+
+	void* left = reinterpret_cast<void*>(base);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &left, chunk_size, SceKernelProtCpuRw,
+	            SceKernelMapFixed | SceKernelMapNoOverwrite, phys_addr, 0, "edge_left"),
+	        "KernelMapNamedDirectMemory(left edge)");
+	Check(test, left == reinterpret_cast<void*>(base), "left edge map moved");
+	*reinterpret_cast<uint64_t*>(left) = 0x4b5954594c454654ull; // "KYTYLEFT"
+
+	void* right = reinterpret_cast<void*>(base + (chunk_count - 1) * chunk_size);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &right, chunk_size, SceKernelProtCpuRw,
+	            SceKernelMapFixed | SceKernelMapNoOverwrite,
+	            phys_addr + (chunk_count - 1) * chunk_size, 0, "edge_right"),
+	        "KernelMapNamedDirectMemory(right edge)");
+	Check(test, right == reinterpret_cast<void*>(base + (chunk_count - 1) * chunk_size),
+	      "right edge map moved");
+	*reinterpret_cast<uint64_t*>(right) = 0x4b59545952494748ull; // "KYTYRIGH"
+
+	void* mid = reinterpret_cast<void*>(base + mid_index * chunk_size);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &mid, chunk_size, SceKernelProtCpuRw,
+	            SceKernelMapFixed | SceKernelMapNoOverwrite, phys_addr + mid_index * chunk_size, 0,
+	            "mid_chunk"),
+	        "KernelMapNamedDirectMemory(mid placeholder)");
+	Check(test, mid == reinterpret_cast<void*>(base + mid_index * chunk_size),
+	      "mid map moved");
+	*reinterpret_cast<uint64_t*>(mid) = 0x4b5954594d494444ull; // "KYTYMIDD"
+
+	Check(test, *reinterpret_cast<const uint64_t*>(left) == 0x4b5954594c454654ull,
+	      "left edge destroyed by mid MapFixed-on-reserve");
+	Check(test, *reinterpret_cast<const uint64_t*>(right) == 0x4b59545952494748ull,
+	      "right edge destroyed by mid MapFixed-on-reserve");
+
+	void* alias_reserve = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&alias_reserve, chunk_size, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange(alias)");
+	void* alias = alias_reserve;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &alias, chunk_size, SceKernelProtCpuRw,
+	            SceKernelMapFixed | SceKernelMapNoOverwrite, phys_addr + mid_index * chunk_size, 0,
+	            "mid_alias"),
+	        "KernelMapNamedDirectMemory(mid alias)");
+	Check(test, *reinterpret_cast<const uint64_t*>(alias) == 0x4b5954594d494444ull,
+	      "mid alias lost backing contents");
+	*reinterpret_cast<uint64_t*>(alias) = 0x4b595459414c4941ull; // "KYTYALIA"
+	Check(test, *reinterpret_cast<const uint64_t*>(mid) == 0x4b595459414c4941ull,
+	      "mid did not observe alias write");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + mid_index * chunk_size, chunk_size),
+	        "KernelMunmap(mid)");
+	void* remapped = reinterpret_cast<void*>(base + mid_index * chunk_size);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &remapped, chunk_size, SceKernelProtCpuRw,
+	            SceKernelMapFixed | SceKernelMapNoOverwrite, phys_addr + mid_index * chunk_size, 0,
+	            "mid_remap"),
+	        "KernelMapNamedDirectMemory(mid remap)");
+	Check(test, remapped == reinterpret_cast<void*>(base + mid_index * chunk_size),
+	      "mid remap moved");
+	Check(test, *reinterpret_cast<const uint64_t*>(remapped) == 0x4b595459414c4941ull,
+	      "mid remap lost backing contents");
+	Check(test, *reinterpret_cast<const uint64_t*>(left) == 0x4b5954594c454654ull,
+	      "left edge destroyed by mid remap");
+	Check(test, *reinterpret_cast<const uint64_t*>(right) == 0x4b59545952494748ull,
+	      "right edge destroyed by mid remap");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, total_size),
+	        "KernelMunmap(staging cleanup)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(alias_reserve),
+	                                              chunk_size),
+	        "KernelMunmap(alias cleanup)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, total_size),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestFlexibleMidPlaceholderMapPreservesNeighbors() {
+	const char*        test        = "FlexibleMidPlaceholderMapPreservesNeighbors";
+	constexpr uint64_t chunk_size  = SceKernelPageSize * 64; // 1 MiB
+	constexpr uint64_t chunk_count = 10;
+	constexpr uint64_t total_size  = chunk_size * chunk_count;
+	constexpr uint64_t mid_index   = 4;
+
+	void* reserve = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, total_size, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+
+	void* left = reinterpret_cast<void*>(base);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &left, chunk_size, SceKernelProtCpuRw, SceKernelMapFixed, "flex_edge_left"),
+	        "KernelMapNamedFlexibleMemory(left edge)");
+	Check(test, left == reinterpret_cast<void*>(base), "left edge map moved");
+	*reinterpret_cast<uint64_t*>(left) = 0x4b5954594c454654ull; // "KYTYLEFT"
+
+	void* right = reinterpret_cast<void*>(base + (chunk_count - 1) * chunk_size);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &right, chunk_size, SceKernelProtCpuRw, SceKernelMapFixed, "flex_edge_right"),
+	        "KernelMapNamedFlexibleMemory(right edge)");
+	Check(test, right == reinterpret_cast<void*>(base + (chunk_count - 1) * chunk_size),
+	      "right edge map moved");
+	*reinterpret_cast<uint64_t*>(right) = 0x4b59545952494748ull; // "KYTYRIGH"
+
+	void* mid = reinterpret_cast<void*>(base + mid_index * chunk_size);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &mid, chunk_size, SceKernelProtCpuRw, SceKernelMapFixed, "flex_mid_chunk"),
+	        "KernelMapNamedFlexibleMemory(mid placeholder)");
+	Check(test, mid == reinterpret_cast<void*>(base + mid_index * chunk_size), "mid map moved");
+	*reinterpret_cast<uint64_t*>(mid) = 0x4b5954594d494444ull; // "KYTYMIDD"
+
+	Check(test, *reinterpret_cast<const uint64_t*>(left) == 0x4b5954594c454654ull,
+	      "left edge destroyed by mid flexible MAP_FIXED on reserve");
+	Check(test, *reinterpret_cast<const uint64_t*>(right) == 0x4b59545952494748ull,
+	      "right edge destroyed by mid flexible MAP_FIXED on reserve");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, total_size),
+	        "KernelMunmap(flexible mid cleanup)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFixedReserveReplacesPartialDirectMapping() {
 	const char*        test         = "FixedReserveReplacesPartialDirectMapping";
 	constexpr uint64_t page_count   = 13;
@@ -1581,6 +1886,10 @@ int main() {
 	RunTest(TestDefaultDirectMapUsesSystemAddressRange);
 	RunTest(TestLargeDirectMapAliasesAcrossChunks);
 	RunTest(TestDirectMapUnmapReusesHostAddress);
+	RunTest(TestDirectMapFixedNoOverwriteRemapAfterMunmap);
+	RunTest(TestDirectStagingStyleRemapAliasStress);
+	RunTest(TestDirectMidPlaceholderMapPreservesNeighbors);
+	RunTest(TestFlexibleMidPlaceholderMapPreservesNeighbors);
 	RunTest(TestFixedReserveReplacesPartialDirectMapping);
 	RunTest(TestFixedReserveRollbackConsumesRestoredPlaceholder);
 	RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);

@@ -1,9 +1,11 @@
 #include "graphics/host_gpu/pageManager.h"
 
+#include "common/fatalLog.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -33,20 +35,33 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 thread_local bool g_in_fault_resolution = false;
 
 [[noreturn]] void FailFast(const char* reason = nullptr) noexcept {
-	std::fputs("PageManager fail-fast: ", stderr);
-	std::fputs(reason != nullptr ? reason : "invalid page state", stderr);
-	std::fputc('\n', stderr);
+	char message[2048];
+	int  written =
+	    std::snprintf(message, sizeof(message), "PageManager fail-fast: %s",
+	                  reason != nullptr ? reason : "invalid page state");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (written < 0) {
+		written = 0;
+	}
 	void* frames[16] {};
 	const auto frame_count = CaptureStackBackTrace(0, static_cast<DWORD>(std::size(frames)), frames,
 	                                               nullptr);
 	const auto image_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-	for (uint16_t i = 0; i < frame_count; i++) {
+	for (uint16_t i = 0; i < frame_count && written < static_cast<int>(sizeof(message)) - 1; i++) {
 		const auto address = reinterpret_cast<uintptr_t>(frames[i]);
-		std::fprintf(stderr, "  frame[%u]=0x%016" PRIxPTR " image_rva=0x%016" PRIxPTR "\n", i,
-		             address, address >= image_base ? address - image_base : 0);
+		const int  appended = std::snprintf(
+		    message + written, sizeof(message) - static_cast<size_t>(written),
+		    "\n  frame[%u]=0x%016" PRIxPTR " image_rva=0x%016" PRIxPTR, i, address,
+		    address >= image_base ? address - image_base : 0);
+		if (appended < 0) {
+			break;
+		}
+		written += appended;
 	}
+#else
+	(void)written;
 #endif
+	Common::LogFatalToFile(message);
 	std::fflush(stderr);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(EXCEPTION_NONCONTINUABLE_EXCEPTION));
@@ -55,12 +70,14 @@ thread_local bool g_in_fault_resolution = false;
 }
 
 [[noreturn]] void Fatal(const char* format, ...) {
-	std::fputs("PageManager fatal: ", stderr);
+	char body[1536];
 	va_list args;
 	va_start(args, format);
-	std::vfprintf(stderr, format, args);
+	std::vsnprintf(body, sizeof(body), format, args);
 	va_end(args);
-	std::fputc('\n', stderr);
+	char message[1600];
+	std::snprintf(message, sizeof(message), "PageManager fatal: %s", body);
+	Common::LogFatalToFile(message);
 	std::fflush(stderr);
 	std::_Exit(322);
 }
@@ -203,17 +220,58 @@ struct PageManager::Impl {
 		}
 	}
 
+	// Collapse execute / writecopy variants so remapped views (often XRW) match tracker state.
+	static uint32_t NormalizeAccessProtection(uint32_t protection) noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		switch (protection) {
+			case PAGE_EXECUTE_READWRITE:
+			case PAGE_WRITECOPY:
+			case PAGE_EXECUTE_WRITECOPY: return PAGE_READWRITE;
+			case PAGE_READWRITE: return PAGE_READWRITE;
+			case PAGE_EXECUTE_READ:
+			case PAGE_EXECUTE: return PAGE_READONLY;
+			case PAGE_READONLY: return PAGE_READONLY;
+			case PAGE_NOACCESS: return PAGE_NOACCESS;
+			default: return protection;
+		}
+#else
+		return protection;
+#endif
+	}
+
+	static bool ProtectionAccessEquivalent(uint32_t a, uint32_t b) noexcept {
+		return NormalizeAccessProtection(a) == NormalizeAccessProtection(b);
+	}
+
+	static bool HostProtectionMatches(uint64_t vaddr, uint32_t protection) noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(static_cast<uintptr_t>(vaddr)), &info,
+		                 sizeof(info)) == 0 ||
+		    info.State != MEM_COMMIT) {
+			return false;
+		}
+		return info.Protect == protection ||
+		       ProtectionAccessEquivalent(static_cast<uint32_t>(info.Protect), protection);
+#else
+		(void)vaddr;
+		(void)protection;
+		return false;
+#endif
+	}
+
 	static uint32_t QueryProtection(uint64_t vaddr) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		MEMORY_BASIC_INFORMATION info {};
 		if (VirtualQuery(reinterpret_cast<const void*>(static_cast<uintptr_t>(vaddr)), &info,
 		                 sizeof(info)) == 0 ||
-		    info.State != MEM_COMMIT || info.Protect != PAGE_READWRITE) {
+		    info.State != MEM_COMMIT ||
+		    NormalizeAccessProtection(static_cast<uint32_t>(info.Protect)) != PAGE_READWRITE) {
 			Fatal("basic path requires PAGE_READWRITE at 0x%016" PRIx64 " (state=0x%08" PRIx32
 			      ", protection=0x%08" PRIx32 ")",
 			      vaddr, static_cast<uint32_t>(info.State), static_cast<uint32_t>(info.Protect));
 		}
-		return info.Protect;
+		return PAGE_READWRITE;
 #else
 		(void)vaddr;
 		Fatal("page query is unsupported on this platform");
@@ -228,10 +286,11 @@ struct PageManager::Impl {
 		    info.State != MEM_COMMIT) {
 			return false;
 		}
+		const auto normalized = NormalizeAccessProtection(static_cast<uint32_t>(info.Protect));
 		switch (access) {
 			case PageFaultAccess::Read:
-				return info.Protect == PAGE_READONLY || info.Protect == PAGE_READWRITE;
-			case PageFaultAccess::Write: return info.Protect == PAGE_READWRITE;
+				return normalized == PAGE_READONLY || normalized == PAGE_READWRITE;
+			case PageFaultAccess::Write: return normalized == PAGE_READWRITE;
 			default: return false;
 		}
 #else
@@ -245,8 +304,12 @@ struct PageManager::Impl {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		DWORD old_protection = 0;
 		if (VirtualProtect(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), PAGE_SIZE,
-		                   protection, &old_protection) == 0 ||
-		    old_protection != expected_old) {
+		                   protection, &old_protection) == 0) {
+			// Remap may already have left the page at the requested (or access-equivalent)
+			// protection; treat that as a successful no-op instead of FailFast.
+			if (HostProtectionMatches(vaddr, protection)) {
+				return;
+			}
 			if (fault_path) {
 				FailFast("VirtualProtect fault transition did not match expected protection");
 			}
@@ -254,6 +317,25 @@ struct PageManager::Impl {
 			      ", expected=0x%08" PRIx32 ", new=0x%08" PRIx32,
 			      vaddr, static_cast<uint32_t>(old_protection), expected_old, protection);
 		}
+		if (old_protection == expected_old ||
+		    ProtectionAccessEquivalent(static_cast<uint32_t>(old_protection), expected_old)) {
+			return;
+		}
+		// Remaps / placeholder replaces recreate views as RW/XRW while watchers still expect RO.
+		if (old_protection == protection ||
+		    ProtectionAccessEquivalent(static_cast<uint32_t>(old_protection), protection)) {
+			return;
+		}
+		// Transition applied despite stale expected_old (tracker desync after Direct remap).
+		if (HostProtectionMatches(vaddr, protection)) {
+			return;
+		}
+		if (fault_path) {
+			FailFast("VirtualProtect fault transition did not match expected protection");
+		}
+		Fatal("invalid protection transition at 0x%016" PRIx64 ", old=0x%08" PRIx32
+		      ", expected=0x%08" PRIx32 ", new=0x%08" PRIx32,
+		      vaddr, static_cast<uint32_t>(old_protection), expected_old, protection);
 #else
 		(void)vaddr;
 		(void)protection;

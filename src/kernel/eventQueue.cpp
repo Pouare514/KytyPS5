@@ -6,13 +6,19 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/renderer/sync.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cinttypes>
+#include <cstdio>
 #include <fmt/format.h>
 #include <list>
+#include <string>
 
 namespace Libs::LibKernel::EventQueue {
 
@@ -22,6 +28,41 @@ constexpr uint16_t EV_ADD     = 0x01;
 constexpr uint16_t EV_ONESHOT = 0x10;
 constexpr uint16_t EV_CLEAR   = 0x20;
 constexpr uint16_t EV_ERROR   = 0x4000;
+constexpr int      AGC_USER_INTERRUPT_EVENT = 0x1800;
+
+std::atomic<uint32_t> g_agc_user_triggers {0};
+std::atomic<uint32_t> g_agc_user_delivers {0};
+std::atomic<bool>     g_agc_user_sticky_logged {false};
+
+static void NoteAgcUserTrigger() {
+	g_agc_user_triggers.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void NoteAgcUserDeliveries(const KernelEvent* ev, int count) {
+	if (ev == nullptr || count <= 0) {
+		return;
+	}
+	bool saw_agc_user = false;
+	for (int i = 0; i < count; ++i) {
+		if (ev[i].filter == KERNEL_EVFILT_USER &&
+		    ev[i].ident == static_cast<uintptr_t>(AGC_USER_INTERRUPT_EVENT)) {
+			saw_agc_user = true;
+			break;
+		}
+	}
+	if (!saw_agc_user) {
+		return;
+	}
+	const auto delivers = g_agc_user_delivers.fetch_add(1, std::memory_order_relaxed) + 1;
+	const auto triggers = g_agc_user_triggers.load(std::memory_order_relaxed);
+	// Level-triggered sticky: many more delivers than triggers (Phase 26 livelock).
+	if (delivers > triggers + 1 && !g_agc_user_sticky_logged.exchange(true, std::memory_order_acq_rel)) {
+		LOGF("SubmitTrace: UserEventSticky id=0x1800 delivers=%" PRIu32 " triggers=%" PRIu32 "\n",
+		     delivers, triggers);
+		fprintf(stderr, "SubmitTrace: UserEventSticky id=0x1800 delivers=%" PRIu32 " triggers=%" PRIu32 "\n",
+		        delivers, triggers);
+	}
+}
 
 static uint64_t MonotonicTimeNs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -362,6 +403,24 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
 	     Common::Thread::GetThreadIdUnique());
 
+	if (Libs::LibKernel::PthreadCurrentIsSubmissionRelated() ||
+	    Libs::LibKernel::PthreadCurrentIsMainRelated()) {
+		static std::atomic<uint32_t> eq_logs {0};
+		if (eq_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+			char name[32] = {};
+			auto* self    = Libs::LibKernel::PthreadSelfOrNull();
+			if (self != nullptr) {
+				Libs::LibKernel::PthreadGetname(self, name);
+			}
+			const uint64_t ra = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+			LOGF("SubmitTrace: EqueueWait name=%s tid=%d eq=%s num=%d timo=%s ra=0x%016" PRIx64 "\n",
+			     name, Libs::LibKernel::PthreadGetUniqueId(self), eq->GetName().c_str(), num,
+			     timo == nullptr ? "inf" : "set", ra);
+			fprintf(stderr, "SubmitTrace: EqueueWait name=%s tid=%d eq=%s\n", name,
+			        Libs::LibKernel::PthreadGetUniqueId(self), eq->GetName().c_str());
+		}
+	}
+
 	if (timo == nullptr) {
 		*out = eq->WaitForEvents(ev, num, 0);
 	}
@@ -376,6 +435,9 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 
 	if (*out == 0) {
 		LOGF("\tEqueue wait timedout: %s\n", eq->GetName().c_str());
+		if (eq->GetName().find("NdJob Sync") != std::string::npos) {
+			Libs::Graphics::Sync::OnNdJobSyncTimeout(eq);
+		}
 		return KERNEL_ERROR_ETIMEDOUT;
 	}
 
@@ -385,6 +447,23 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     *out, static_cast<uint64_t>(ev[0].ident), ev[0].filter, ev[0].flags, ev[0].fflags,
 	     static_cast<uint64_t>(ev[0].data), reinterpret_cast<uint64_t>(ev[0].udata));
 
+	if (eq->GetName().find("NdJob") != std::string::npos) {
+		static std::atomic<uint32_t> batch_logs {0};
+		if (batch_logs.fetch_add(1, std::memory_order_relaxed) < 24) {
+			for (int i = 0; i < *out; ++i) {
+				LOGF("SubmitTrace: NdJobBatch[%d/%d] ident=0x%016" PRIx64 " filter=%d data=0x%016"
+				     PRIx64 "\n",
+				     i, *out, static_cast<uint64_t>(ev[i].ident), ev[i].filter,
+				     static_cast<uint64_t>(ev[i].data));
+				fprintf(stderr,
+				        "SubmitTrace: NdJobBatch[%d/%d] ident=0x%016" PRIx64 " filter=%d\n", i,
+				        *out, static_cast<uint64_t>(ev[i].ident), ev[i].filter);
+			}
+		}
+	}
+
+	NoteAgcUserDeliveries(ev, *out);
+
 	return OK;
 }
 
@@ -392,6 +471,11 @@ int KYTY_SYSV_ABI KernelAddUserEvent(KernelEqueue eq, int id) {
 	PRINT_NAME();
 
 	LOGF("\t user event add: eq = 0x%016" PRIx64 ", id = %d\n", reinterpret_cast<uint64_t>(eq), id);
+	if (id == 0x1800 || Libs::LibKernel::PthreadCurrentIsSubmissionRelated()) {
+		LOGF("SubmitTrace: UserEventAdd id=%d eq=0x%016" PRIx64 "\n", id,
+		     reinterpret_cast<uint64_t>(eq));
+		fprintf(stderr, "SubmitTrace: UserEventAdd id=%d\n", id);
+	}
 
 	if (eq == nullptr) {
 		return KERNEL_ERROR_EBADF;
@@ -417,6 +501,11 @@ int KYTY_SYSV_ABI KernelAddUserEventEdge(KernelEqueue eq, int id) {
 
 	LOGF("\t user event edge add: eq = 0x%016" PRIx64 ", id = %d\n", reinterpret_cast<uint64_t>(eq),
 	     id);
+	if (id == AGC_USER_INTERRUPT_EVENT) {
+		LOGF("SubmitTrace: UserEventAddEdge id=0x1800 eq=0x%016" PRIx64 "\n",
+		     reinterpret_cast<uint64_t>(eq));
+		fprintf(stderr, "SubmitTrace: UserEventAddEdge id=0x1800\n");
+	}
 
 	if (eq == nullptr) {
 		return KERNEL_ERROR_EBADF;
@@ -442,6 +531,12 @@ int KYTY_SYSV_ABI KernelTriggerUserEvent(KernelEqueue eq, int id, void* udata) {
 
 	LOGF("\t user event trigger: eq = 0x%016" PRIx64 ", id = %d, udata = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(eq), id, reinterpret_cast<uint64_t>(udata));
+	if (id == 0x1800) {
+		NoteAgcUserTrigger();
+		LOGF("SubmitTrace: UserEventTrigger id=0x1800 eq=0x%016" PRIx64 "\n",
+		     reinterpret_cast<uint64_t>(eq));
+		fprintf(stderr, "SubmitTrace: UserEventTrigger id=0x1800\n");
+	}
 
 	return KernelTriggerEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_USER, udata);
 }
@@ -456,6 +551,14 @@ int KYTY_SYSV_ABI KernelTriggerUserEventForAll(int id, void* udata) {
 		    eq->TriggerEvent(static_cast<uintptr_t>(id), KERNEL_EVFILT_USER, udata)) {
 			triggered++;
 		}
+	}
+
+	if (id == 0x1800) {
+		if (triggered > 0) {
+			NoteAgcUserTrigger();
+		}
+		LOGF("SubmitTrace: UserEventTriggerForAll id=0x1800 triggered=%d\n", triggered);
+		fprintf(stderr, "SubmitTrace: UserEventTriggerForAll id=0x1800 triggered=%d\n", triggered);
 	}
 
 	return (triggered > 0 ? OK : KERNEL_ERROR_ENOENT);

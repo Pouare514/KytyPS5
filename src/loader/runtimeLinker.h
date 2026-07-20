@@ -165,6 +165,7 @@ public:
 	bool  IsApplicationHeapApiSet() const;
 	void* ApplicationHeapMalloc(uint64_t size);
 	void* ApplicationHeapMemalign(uint64_t alignment, uint64_t size);
+	application_heap_free_func_t ApplicationHeapFreeFunc() const;
 
 	void Resolve(const std::string& name, SymbolType type, Program* program, SymbolRecord* out_info,
 	             bool* bind_self);

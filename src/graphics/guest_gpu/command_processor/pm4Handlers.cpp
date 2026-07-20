@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/objects/label.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
@@ -2545,6 +2546,11 @@ KYTY_CP_OP_PARSER(CpOpFlip) {
 	f.flip_mode = static_cast<int>(buffer[2]);
 	f.flip_arg  = static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u));
 
+	if (boot_trace_log()) {
+		LOGF("FlipTrace: PM4 CpOpFlip handle=%d index=%d mode=%d arg=%" PRId64 "\n", f.handle,
+		     f.index, f.flip_mode, f.flip_arg);
+	}
+
 	cp->SetFlip(f);
 	cp->Flip();
 	return 5;
@@ -2868,6 +2874,9 @@ KYTY_CP_OP_PARSER(CpOpMarker) {
 		case 0x4: cp->SetUserDataMarker(HW::UserSgprType::Vsharp); break;
 		case 0xd: cp->SetUserDataMarker(HW::UserSgprType::Region); break;
 		case 0x777: {
+			if (boot_trace_log()) {
+				LOGF("FlipTrace: PM4 MarkerFlip 0x777\n");
+			}
 			cp->Flip();
 			break;
 		}
@@ -2875,6 +2884,10 @@ KYTY_CP_OP_PARSER(CpOpMarker) {
 			auto* addr =
 			    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
 			uint32_t value = buffer[3];
+			if (boot_trace_log()) {
+				LOGF("FlipTrace: PM4 MarkerFlip 0x778 addr=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
+				     reinterpret_cast<uint64_t>(addr), value);
+			}
 			cp->Flip(addr, value);
 			break;
 		}
@@ -2884,6 +2897,10 @@ KYTY_CP_OP_PARSER(CpOpMarker) {
 			uint32_t value          = buffer[3];
 			uint32_t eop_event_type = buffer[4];
 			uint32_t cache_action   = buffer[5];
+			if (boot_trace_log()) {
+				LOGF("FlipTrace: PM4 MarkerFlip 0x781 addr=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
+				     reinterpret_cast<uint64_t>(addr), value);
+			}
 			cp->FlipWithInterrupt(eop_event_type, cache_action, addr, value);
 			break;
 		}

@@ -1,11 +1,16 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/fatalLog.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/window.h"
+#include "kernel/eventQueue.h"
 #include "kernel/pthread.h"
+#include "libs/agc.h"
 #include "libs/errno.h"
 #include "libs/guestPrintf.h"
 #include "libs/libs.h"
@@ -14,17 +19,20 @@
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fmt/format.h>
 #include <list>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -74,7 +82,55 @@ const char** GetArgv() {
 
 static KYTY_SYSV_ABI void exit(int code) {
 	PRINT_NAME();
-
+	void* ra0 = __builtin_return_address(0);
+	fprintf(stderr, "GuestExit: libC::exit code=%d ra=%p\n", code, ra0);
+	LOGF("GuestExit: libC::exit code=%d ra=%p\n", code, ra0);
+	char msg[128];
+	std::snprintf(msg, sizeof(msg), "GuestExit: libC::exit code=%d ra=%p", code, ra0);
+	Common::LogFatalToFile(msg);
+	std::fflush(stderr);
+	// Suppress exit under IgnoreQuit. KYTY_PHASE32_PARK_EXIT=1 = park.
+	// KYTY_PHASE33_DIVERT=1 = Phase 33 divert. Default Phase 34 = soft-idle wakes.
+	if (Libs::Graphics::WindowShouldIgnoreQuit()) {
+		const char* park = std::getenv("KYTY_PHASE32_PARK_EXIT");
+		if (park != nullptr && park[0] == '1') {
+			LOGF("GuestExit: suppressing exit(%d) (phase32 arm) — park thread\n", code);
+			fprintf(stderr, "GuestExit: suppressing exit(%d) (phase32 arm) — park thread\n",
+			        code);
+			std::fflush(stderr);
+			for (;;) {
+				std::this_thread::sleep_for(std::chrono::seconds(1));
+				(void)Libs::LibKernel::PthreadWakeSubmissionCondWaitersAfterFlip();
+			}
+		}
+		const char* divert = std::getenv("KYTY_PHASE33_DIVERT");
+		if (divert != nullptr && divert[0] == '1') {
+			LOGF("GuestExit: suppressing exit(%d) (phase33 divert — no CRT return)\n", code);
+			fprintf(stderr, "GuestExit: suppressing exit(%d) (phase33 divert)\n", code);
+			std::fflush(stderr);
+			while (Libs::Graphics::WindowShouldIgnoreQuit()) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(16));
+				(void)Libs::LibKernel::PthreadWakeSubmissionCondWaitersAfterFlip();
+			}
+			LOGF("GuestExit: phase33 divert holding after ignore-quit expiry\n");
+			fprintf(stderr, "GuestExit: phase33 divert holding\n");
+			for (;;) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+				(void)Libs::LibKernel::PthreadWakeSubmissionCondWaitersAfterFlip();
+			}
+		}
+		LOGF("GuestExit: suppressing exit(%d) — phase34 soft-idle\n", code);
+		fprintf(stderr, "GuestExit: suppressing exit(%d) — phase34 soft-idle\n", code);
+		std::fflush(stderr);
+		for (int tick = 0;; ++tick) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(16));
+			(void)Libs::LibKernel::PthreadWakeSubmissionCondWaitersAfterFlip();
+			if ((tick % 30) == 0) {
+				(void)Libs::LibKernel::EventQueue::KernelTriggerUserEventForAll(0x1800, nullptr);
+				Libs::Graphics::WindowArmIgnoreQuit(60);
+			}
+		}
+	}
 	::exit(code);
 }
 
@@ -303,6 +359,83 @@ static KYTY_SYSV_ABI int libc_printf(VA_ARGS) {
 
 	PRINT_NAME();
 
+	const auto* format = reinterpret_cast<const char*>(rdi);
+	if (format != nullptr &&
+	    (std::strstr(format, "Code and Data section is too large") != nullptr ||
+	     std::strstr(format, "RAM Cache is being disabled") != nullptr)) {
+		double d0 = 0.0;
+		double d1 = 0.0;
+		std::memcpy(&d0, &xmm0, sizeof(d0));
+		std::memcpy(&d1, &xmm1, sizeof(d1));
+		uint64_t d0_bits = 0;
+		uint64_t d1_bits = 0;
+		std::memcpy(&d0_bits, &d0, sizeof(d0_bits));
+		std::memcpy(&d1_bits, &d1, sizeof(d1_bits));
+		LOGF("NdMemoryPrintf libc_printf regs: rdi=0x%016" PRIx64 " rsi=0x%016" PRIx64
+		     " rdx=0x%016" PRIx64 " rcx=0x%016" PRIx64 " r8=0x%016" PRIx64 " r9=0x%016" PRIx64
+		     " xmm0=%.6g/0x%016" PRIx64 " xmm1=%.6g/0x%016" PRIx64 "\n",
+		     rdi, rsi, rdx, rcx, r8, r9, d0, d0_bits, d1, d1_bits);
+		// TLOU InitializeMemory guest globals (eboot PPSA03396 @ base 0x900000000).
+		constexpr uint64_t kNdTablePtrGlobal = 0x0000000904b5a520ull;
+		constexpr uint64_t kNdCountGlobal    = 0x0000000904b9a8e0ull;
+		constexpr uint64_t kNdEntry6Global   = 0x0000000904b1a3e8ull;
+		constexpr uint64_t kNdMeasuredGlobal = 0x0000000904b1a3f0ull;
+		const auto* table_ptr_cell = reinterpret_cast<const uint64_t*>(kNdTablePtrGlobal);
+		const auto* count_cell     = reinterpret_cast<const uint32_t*>(kNdCountGlobal);
+		const auto* entry6_cell    = reinterpret_cast<const uint64_t*>(kNdEntry6Global);
+		const auto* measured_cell  = reinterpret_cast<const uint64_t*>(kNdMeasuredGlobal);
+		const uint64_t table_ptr   = *table_ptr_cell;
+		const uint32_t count       = *count_cell;
+		const uint64_t entry6      = *entry6_cell;
+		const uint64_t measured    = *measured_cell;
+		LOGF("NdMemoryPrintf ND globals: table_ptr=0x%016" PRIx64 " count=%u entry6=0x%016" PRIx64
+		     " measured=0x%016" PRIx64 " (%.3f MiB raw/2^20)\n",
+		     table_ptr, count, entry6, measured,
+		     static_cast<double>(measured) / (1024.0 * 1024.0));
+		{
+			constexpr uint64_t kNdObjectGlobal = 0x0000000904ada0e0ull;
+			constexpr uint64_t kNdFnPtrGlobal  = 0x000000090493c478ull;
+			const uint64_t     object          = *reinterpret_cast<const uint64_t*>(kNdObjectGlobal);
+			const uint64_t     fn_cell         = *reinterpret_cast<const uint64_t*>(kNdFnPtrGlobal);
+			const uint64_t     fn              =
+			    fn_cell != 0 ? *reinterpret_cast<const uint64_t*>(fn_cell) : 0;
+			const uint64_t second =
+			    (measured + entry6 + 0x98e60000ull); // approx; refined below if avail known
+			LOGF("NdMemoryPrintf ND call: object=0x%016" PRIx64 " fn_cell=0x%016" PRIx64
+			     " fn=0x%016" PRIx64 "\n",
+			     object, fn_cell, fn);
+			if (object != 0) {
+				const auto* o = reinterpret_cast<const uint64_t*>(object);
+				LOGF("NdMemoryPrintf ND object[0..7]: %016" PRIx64 " %016" PRIx64 " %016" PRIx64
+				     " %016" PRIx64 " %016" PRIx64 " %016" PRIx64 " %016" PRIx64 " %016" PRIx64 "\n",
+				     o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]);
+			}
+			(void)second;
+		}
+		if (table_ptr != 0) {
+			// Entries start at table+0x20; walk until id==0 (guest terminator), max 16.
+			const auto* obj = reinterpret_cast<const uint64_t*>(table_ptr + 0x20);
+			uint64_t    total = 0;
+			for (uint32_t i = 0; i < 16; i++) {
+				const auto* e  = obj + static_cast<size_t>(i) * 4;
+				const auto  id = static_cast<uint32_t>(e[0] & 0xffffffffu);
+				if (id == 0) {
+					LOGF("NdMemoryPrintf desc end at [%u]\n", i);
+					break;
+				}
+				const auto size = e[1];
+				total += size;
+				const char* name = reinterpret_cast<const char*>(e[3]);
+				LOGF("NdMemoryPrintf desc[%u]: id=%u hdr=0x%016" PRIx64 " size=0x%016" PRIx64
+				     " field2=0x%016" PRIx64 " name=%s\n",
+				     i, id, e[0], size, e[2], name != nullptr ? name : "<null>");
+			}
+			LOGF("NdMemoryPrintf desc_total_size=0x%016" PRIx64 " (%.3f MiB) limit_rsi=0x%016" PRIx64
+			     "\n",
+			     total, static_cast<double>(total) / (1024.0 * 1024.0), rsi);
+		}
+	}
+
 	return GetGuestPrintfCtxFunc()(&ctx);
 }
 
@@ -422,6 +555,92 @@ static KYTY_SYSV_ABI size_t libc_strftime(char* str, size_t count, const char* f
 	return std::strftime(str, count, format, timeptr);
 }
 
+// Phase 33 survival: divert MainThread forever (opt-in via KYTY_PHASE33_DIVERT=1).
+static void Phase33DivertPumpForever() {
+	for (int tick = 0;; ++tick) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		(void)Libs::LibKernel::PthreadWakeSubmissionCondWaitersAfterFlip();
+		if ((tick % 20) == 0) {
+			(void)Libs::LibKernel::EventQueue::KernelTriggerUserEventForAll(0x1800, nullptr);
+		}
+	}
+}
+
+// Phase 34/44: MainThread soft-idle — continue handoff until guest RegisterBuffers2 ABI.
+static void Phase34MainThreadSoftIdle() {
+	LOGF("GuestExit: catchReturnFromMain — phase44 soft-idle (handoff until Reg2)\n");
+	fprintf(stderr, "GuestExit: catchReturnFromMain — phase44 soft-idle\n");
+	std::fflush(stderr);
+	Common::LogFatalToFile("catchReturnFromMain phase44 soft-idle");
+	for (int tick = 0;; ++tick) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(33));
+		if (!Libs::VideoOut::Phase44GuestRegisterBuffers2Seen()) {
+			Libs::VideoOut::Phase41MenuHandoffAttempt();
+			Libs::VideoOut::Phase38NudgeBootWorkers();
+		}
+		(void)Libs::LibKernel::PthreadWakeSubmissionCondWaitersAfterFlip();
+		if ((tick % 30) == 0) {
+			(void)Libs::LibKernel::EventQueue::KernelTriggerUserEventForAll(0x1800, nullptr);
+			Libs::Graphics::WindowArmIgnoreQuit(60);
+			if (!Libs::VideoOut::Phase44GuestRegisterBuffers2Seen() && (tick % 300) == 0) {
+				LOGF("GuestExit: phase44 soft-idle still waiting for guest RegisterBuffers2 "
+				     "(%ds)\n",
+				     tick / 30);
+				fprintf(stderr, "GuestExit: phase44 still waiting Reg2 (%ds)\n", tick / 30);
+			}
+		}
+	}
+}
+
+// Phase 43: anti-CRT divert — handoff until sustained menu frames (presented delta ≥30).
+static void Phase38DeferredSoftIdle() {
+	LOGF("GuestExit: phase43 anti-CRT divert — until menu_frames_ok (no timeout park)\n");
+	fprintf(stderr, "GuestExit: phase43 anti-CRT divert — until menu_frames_ok\n");
+	std::fflush(stderr);
+	Common::LogFatalToFile("phase43 anti-CRT divert");
+	for (int i = 0;; ++i) {
+		if (Libs::VideoOut::Phase38GuestBootProgressSeen()) {
+			LOGF("GuestExit: phase43 menu_frames_ok at %dms — soft-idle park\n", i * 100);
+			fprintf(stderr, "GuestExit: phase43 menu_frames_ok — soft-idle park\n");
+			break;
+		}
+		if (i == 20) {
+			Libs::LibKernel::PthreadDumpAllGuestThreads("phase43 anti-CRT +2s");
+		}
+		if (i > 0 && (i % 300) == 0) {
+			LOGF("GuestExit: phase43 still waiting for menu_frames_ok (%ds) — NOT soft-idle\n",
+			     i / 10);
+			fprintf(stderr, "GuestExit: phase43 still waiting %ds — NOT soft-idle\n", i / 10);
+			Common::LogFatalToFile("phase43 still waiting for menu_frames_ok");
+		}
+		Libs::VideoOut::Phase41MenuHandoffAttempt();
+		Libs::VideoOut::Phase38NudgeBootWorkers();
+		Libs::Graphics::WindowArmIgnoreQuit(60);
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	}
+	Phase34MainThreadSoftIdle();
+}
+
+// Kick a non-empty Submit + SubmitFlip(0) from MainThread (opt-in KYTY_PHASE33_KICK=1).
+static void Phase33KickGuestSubmitAndFlip() {
+	static std::atomic<bool> once {false};
+	if (once.exchange(true, std::memory_order_acq_rel)) {
+		return;
+	}
+	// Two type-2 padding words — graphicsRun requires dw>=2 for type-3 packets.
+	static uint32_t dcb_storage[8] = {0x80000000u, 0x80000000u, 0, 0, 0, 0, 0, 0};
+	const uint32_t  dcb_size       = 2;
+	LOGF("SubmitTrace: phase33 KickSubmit (catchReturn) dcb=%p size=0x%x\n",
+	     static_cast<void*>(dcb_storage), dcb_size);
+	fprintf(stderr, "SubmitTrace: phase33 KickSubmit (catchReturn) size=0x%x\n", dcb_size);
+	(void)Libs::Graphics::Gen5Driver::GraphicsDriverSubmitCommandBuffer(0, dcb_storage, dcb_size);
+	const int flip_result =
+	    Libs::VideoOut::VideoOutSubmitFlip(1, 0, /*VIDEO_OUT_FLIP_MODE_VSYNC*/ 1, 0);
+	LOGF("FlipTrace: phase33 KickFlip0 result=%d (no PENDING0 bridge)\n", flip_result);
+	fprintf(stderr, "FlipTrace: phase33 KickFlip0 result=%d\n", flip_result);
+	(void)Libs::LibKernel::PthreadWakeSubmissionCondWaitersAfterFlip();
+}
+
 static KYTY_SYSV_ABI void catchReturnFromMain(int status) {
 	PRINT_NAME();
 
@@ -447,6 +666,26 @@ static KYTY_SYSV_ABI void catchReturnFromMain(int status) {
 	}
 
 	::printf("return from main = %d\n", status);
+
+	// Phase 34: CRT calls exit() then ud2 after this returns — never return under PENDING0.
+	const char* pending0 = std::getenv("KYTY_PHASE32_PENDING0");
+	if ((pending0 != nullptr && pending0[0] == '1') ||
+	    Libs::Graphics::WindowShouldIgnoreQuit()) {
+		const char* kick   = std::getenv("KYTY_PHASE33_KICK");
+		const char* divert = std::getenv("KYTY_PHASE33_DIVERT");
+		if (kick != nullptr && kick[0] == '1') {
+			Phase33KickGuestSubmitAndFlip();
+		}
+		if (divert != nullptr && divert[0] == '1') {
+			LOGF("GuestExit: catchReturnFromMain status=%d — phase33 divert\n", status);
+			fprintf(stderr, "GuestExit: catchReturnFromMain status=%d — phase33 divert\n",
+			        status);
+			std::fflush(stderr);
+			Common::LogFatalToFile("catchReturnFromMain phase33 divert");
+			Phase33DivertPumpForever();
+		}
+		Phase38DeferredSoftIdle();
+	}
 }
 
 enum class ThrdResult : int {

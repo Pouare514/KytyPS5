@@ -43,12 +43,32 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("MCJ8SkzsQxY", VideoOut::VideoOutLatencyMeasureSetStartPoint);
 	LIB_FUNC("DYhhWbJSeRg", VideoOut::VideoOutColorSettingsSetGamma);
 	LIB_FUNC("pv9CI5VC+R0", VideoOut::VideoOutAdjustColor);
+	LIB_FUNC("OcQybQejHEY", VideoOut::VideoOutGetBufferLabelAddress);
+	LIB_FUNC("kGVLc3htQE8", VideoOut::VideoOutGetDeviceCapabilityInfo);
+	LIB_FUNC("6kPnj51T62Y", VideoOut::VideoOutGetResolutionStatus);
+	// TLOU unresolved VideoOut NIDs — soft stubs until exact symbols are identified.
+	LIB_FUNC("T4ucGB8CsnM", VideoOut::VideoOutUnknownNidStub0);
+	LIB_FUNC("5tRaBjtdTzY", VideoOut::VideoOutUnknownNidStub1);
 }
 
 } // namespace LibGen5
 
+namespace LibVideoOutVrrStatus {
+
+LIB_VERSION("VideoOutVrrStatus", 1, "VideoOut", 1, 1);
+
+LIB_DEFINE(InitVideoOutVrrStatus_1) {
+	PRINT_NAME_ENABLE(true);
+
+	LIB_FUNC("kP2L8t3j-aM", VideoOut::VideoOutAddVrrStatusFlagsPrivilege);
+	LIB_FUNC("LibwuIonIBw", VideoOut::VideoOutGetVrrStatus);
+}
+
+} // namespace LibVideoOutVrrStatus
+
 LIB_DEFINE(InitVideoOut_1) {
 	LibGen5::InitVideoOut_1(s);
+	LibVideoOutVrrStatus::InitVideoOutVrrStatus_1(s);
 }
 
 } // namespace Libs

@@ -221,6 +221,8 @@ LIB_DEFINE(InitNet_1_Ssl) {
 	LIB_FUNC("0K1yQ6Lv-Yc", Ssl::SslTerm);
 	LIB_FUNC("TDfQqO-gMbY", Ssl::SslGetCaCerts);
 	LIB_FUNC("qIvLs0gYxi0", Ssl::SslFreeCaCerts);
+	LIB_FUNC("Ab7+DH+gYyM", Ssl::SslLoadCert);
+	LIB_FUNC("-PoIzr3PEk0", Ssl::SslGetMemoryPoolStats);
 }
 
 } // namespace LibSsl
@@ -271,8 +273,40 @@ static char* CopyUriPart(char*& dst, const UriPart& part) {
 	return out;
 }
 
+static char* CopyUriPartOrEmpty(char*& dst, char*& empty, const UriPart& part) {
+	if (part.begin != nullptr) {
+		return CopyUriPart(dst, part);
+	}
+
+	if (empty == nullptr) {
+		empty  = dst;
+		*dst++ = '\0';
+	}
+	return empty;
+}
+
+static bool UriSchemeEquals(const UriPart& scheme, const char* expected) {
+	if (scheme.begin == nullptr) {
+		return false;
+	}
+
+	const auto expected_len = std::strlen(expected);
+	if (scheme.len != expected_len) {
+		return false;
+	}
+
+	for (size_t i = 0; i < scheme.len; i++) {
+		if (std::tolower(static_cast<unsigned char>(scheme.begin[i])) !=
+		    static_cast<unsigned char>(expected[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, size_t prepare) {
-	constexpr size_t needed = 3;
+	// One shared empty string for all absent pointer fields (matches firmware / shadPS4).
+	constexpr size_t needed = 1;
 
 	if (require != nullptr) {
 		*require = needed;
@@ -288,13 +322,15 @@ static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, si
 			return HTTP_ERROR_OUT_OF_MEMORY;
 		}
 
-		auto* dst        = static_cast<char*>(pool);
-		out->scheme      = dst++;
-		out->hostname    = dst++;
-		out->path        = dst;
-		out->scheme[0]   = '\0';
-		out->hostname[0] = '\0';
-		out->path[0]     = '\0';
+		auto* empty      = static_cast<char*>(pool);
+		empty[0]         = '\0';
+		out->scheme      = empty;
+		out->username    = empty;
+		out->password    = empty;
+		out->hostname    = empty;
+		out->path        = empty;
+		out->query       = empty;
+		out->fragment    = empty;
 	}
 
 	return 0;
@@ -449,11 +485,25 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 		fragment = {fragment_begin, static_cast<size_t>(cursor - fragment_begin)};
 	}
 
-	size_t needed = 0;
+	if (port == 0) {
+		if (UriSchemeEquals(scheme, "https")) {
+			port = 443;
+		} else if (UriSchemeEquals(scheme, "http")) {
+			port = 80;
+		}
+	}
+
+	size_t needed     = 0;
+	bool   need_empty = false;
 	for (const auto& part: {scheme, username, password, hostname, path, query, fragment}) {
 		if (part.begin != nullptr) {
 			needed += part.len + 1;
+		} else {
+			need_empty = true;
 		}
+	}
+	if (need_empty) {
+		needed += 1;
 	}
 
 	if (require != nullptr) {
@@ -471,14 +521,15 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 			return HTTP_ERROR_OUT_OF_MEMORY;
 		}
 
-		auto* dst     = static_cast<char*>(pool);
-		out->scheme   = CopyUriPart(dst, scheme);
-		out->username = CopyUriPart(dst, username);
-		out->password = CopyUriPart(dst, password);
-		out->hostname = CopyUriPart(dst, hostname);
-		out->path     = CopyUriPart(dst, path);
-		out->query    = CopyUriPart(dst, query);
-		out->fragment = CopyUriPart(dst, fragment);
+		auto* dst   = static_cast<char*>(pool);
+		char* empty = nullptr;
+		out->scheme   = CopyUriPartOrEmpty(dst, empty, scheme);
+		out->username = CopyUriPartOrEmpty(dst, empty, username);
+		out->password = CopyUriPartOrEmpty(dst, empty, password);
+		out->hostname = CopyUriPartOrEmpty(dst, empty, hostname);
+		out->path     = CopyUriPartOrEmpty(dst, empty, path);
+		out->query    = CopyUriPartOrEmpty(dst, empty, query);
+		out->fragment = CopyUriPartOrEmpty(dst, empty, fragment);
 	}
 
 	return 0;
