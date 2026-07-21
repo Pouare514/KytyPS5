@@ -254,6 +254,7 @@ enum : uint32_t {
 	GlslLog2           = 30,
 	GlslSqrt           = 31,
 	GlslInverseSqrt    = 32,
+	GlslPow            = 26,
 	GlslFMin           = 37,
 	GlslFMax           = 40,
 	GlslFClamp         = 43,

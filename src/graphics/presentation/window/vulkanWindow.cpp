@@ -645,6 +645,10 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, vk::Sur
 	device_features.tessellationShader                   = VK_TRUE;
 	device_features.sampleRateShading    = supported_features2.features.sampleRateShading;
 	graphics.sample_rate_shading_enabled = device_features.sampleRateShading == VK_TRUE;
+	device_features.wideLines            = supported_features2.features.wideLines;
+	graphics.wide_lines_enabled          = device_features.wideLines == VK_TRUE;
+	device_features.fillModeNonSolid      = supported_features2.features.fillModeNonSolid;
+	graphics.fill_mode_non_solid_enabled  = device_features.fillModeNonSolid == VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics =
 	    supported_features2.features.vertexPipelineStoresAndAtomics;
 

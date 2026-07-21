@@ -255,16 +255,14 @@ bool TextureCheckFormat(vk::ImageCreateInfo& image_info) {
 		};
 
 		if (image_info.format == vk::Format::eR8G8B8A8Srgb) {
-			// TODO() convert SRGB -> LINEAR in shader
 			return apply_fallback(
 			    vk::Format::eR8G8B8A8Unorm,
-			    "replace vk::Format::eR8G8B8A8Srgb => vk::Format::eR8G8B8A8Unorm");
+			    "replace vk::Format::eR8G8B8A8Srgb => vk::Format::eR8G8B8A8Unorm (shader decode)");
 		}
 		if (image_info.format == vk::Format::eB8G8R8A8Srgb) {
-			// TODO() convert SRGB -> LINEAR in shader
 			return apply_fallback(
 			    vk::Format::eB8G8R8A8Unorm,
-			    "replace vk::Format::eB8G8R8A8Srgb => vk::Format::eB8G8R8A8Unorm");
+			    "replace vk::Format::eB8G8R8A8Srgb => vk::Format::eB8G8R8A8Unorm (shader decode)");
 		}
 		return false;
 	}
@@ -286,20 +284,25 @@ bool TextureCheckStorageSwizzle(vk::ImageCreateInfo& image_info, vk::ComponentMa
 			return true;
 		}
 
-		if (components.r == vk::ComponentSwizzle::eB && components.g == vk::ComponentSwizzle::eG &&
-		    components.b == vk::ComponentSwizzle::eR && components.a == vk::ComponentSwizzle::eA &&
-		    image_info.format == vk::Format::eR8G8B8A8Srgb) {
-			LOGF("replace vk::Format::eR8G8B8A8Srgb => vk::Format::eB8G8R8A8Srgb\n");
+		const bool bgra =
+		    components.r == vk::ComponentSwizzle::eB && components.g == vk::ComponentSwizzle::eG &&
+		    components.b == vk::ComponentSwizzle::eR && components.a == vk::ComponentSwizzle::eA;
+		if (bgra && (image_info.format == vk::Format::eR8G8B8A8Srgb ||
+		             image_info.format == vk::Format::eR8G8B8A8Unorm)) {
+			const auto replacement = image_info.format == vk::Format::eR8G8B8A8Srgb
+			                             ? vk::Format::eB8G8R8A8Srgb
+			                             : vk::Format::eB8G8R8A8Unorm;
+			LOGF("replace %s => %s for storage BGRA swizzle\n",
+			     image_info.format == vk::Format::eR8G8B8A8Srgb ? "R8G8B8A8Srgb" : "R8G8B8A8Unorm",
+			     replacement == vk::Format::eB8G8R8A8Srgb ? "B8G8R8A8Srgb" : "B8G8R8A8Unorm");
 
 			components.r      = vk::ComponentSwizzle::eR;
 			components.g      = vk::ComponentSwizzle::eG;
 			components.b      = vk::ComponentSwizzle::eB;
 			components.a      = vk::ComponentSwizzle::eA;
-			image_info.format = vk::Format::eB8G8R8A8Srgb;
+			image_info.format = replacement;
 			return true;
 		}
-
-		// TODO() swizzle channels in shader
 
 		return false;
 	}
@@ -492,10 +495,27 @@ vk::ComponentMapping TextureCreateImage(VulkanImage& vk_obj,
 	const auto requested_usage     = params.format_usage;
 	const auto required_usage      = params.required_format_usage;
 	const bool has_optional_usage  = static_cast<uint32_t>(requested_usage & ~required_usage) != 0;
+
+	// Sampled RGBA8 sRGB: keep Unorm backing and decode in the shader so storage-capable
+	// usage that rejects sRGB stays coherent with SpecializeResources.needs_srgb_decode.
+	bool needs_srgb_decode = false;
+	if (TextureHasFormatUsage(params.format_usage, TextureFormatUsage::Sampled) &&
+	    (image_info.format == vk::Format::eR8G8B8A8Srgb ||
+	     image_info.format == vk::Format::eB8G8R8A8Srgb)) {
+		needs_srgb_decode = true;
+		image_info.format = image_info.format == vk::Format::eR8G8B8A8Srgb
+		                        ? vk::Format::eR8G8B8A8Unorm
+		                        : vk::Format::eB8G8R8A8Unorm;
+		static std::atomic_uint log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("\t %s using Unorm backing for RGBA8 sRGB with shader decode\n", params.owner);
+		}
+	}
+
 	if (!TextureCheckFormatExact(image_info) && has_optional_usage) {
 		auto required_info   = image_info;
 		required_info.usage  = TextureGetUsage(required_usage);
-		required_info.format = view_checked_format;
+		required_info.format = needs_srgb_decode ? image_info.format : view_checked_format;
 		if (TextureCheckFormatExact(required_info)) {
 			static std::atomic_uint log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -509,23 +529,31 @@ vk::ComponentMapping TextureCreateImage(VulkanImage& vk_obj,
 		}
 	}
 
+	const auto format_before_check = image_info.format;
 	if (!TextureCheckFormat(image_info)) {
 		if (has_optional_usage) {
-			image_info.format = view_checked_format;
+			image_info.format = needs_srgb_decode ? format_before_check : view_checked_format;
 			image_info.usage  = TextureGetUsage(required_usage);
 		}
 		if (!has_optional_usage || !TextureCheckFormat(image_info)) {
 			EXIT("format is not supported");
 		}
 	}
+	if ((format_before_check == vk::Format::eR8G8B8A8Srgb ||
+	     format_before_check == vk::Format::eB8G8R8A8Srgb) &&
+	    (image_info.format == vk::Format::eR8G8B8A8Unorm ||
+	     image_info.format == vk::Format::eB8G8R8A8Unorm)) {
+		needs_srgb_decode = true;
+	}
 
-	vk_obj.extent.width  = image_info.extent.width;
-	vk_obj.extent.height = image_info.extent.height;
-	vk_obj.layers        = image_info.arrayLayers;
-	vk_obj.mip_levels    = image_info.mipLevels;
-	vk_obj.format        = image_info.format;
-	vk_obj.image         = nullptr;
-	vk_obj.layout        = image_info.initialLayout;
+	vk_obj.extent.width       = image_info.extent.width;
+	vk_obj.extent.height      = image_info.extent.height;
+	vk_obj.layers             = image_info.arrayLayers;
+	vk_obj.mip_levels         = image_info.mipLevels;
+	vk_obj.format             = image_info.format;
+	vk_obj.needs_srgb_decode  = needs_srgb_decode;
+	vk_obj.image              = nullptr;
+	vk_obj.layout             = image_info.initialLayout;
 
 	vk_obj.memory.property = vk::MemoryPropertyFlagBits::eDeviceLocal;
 

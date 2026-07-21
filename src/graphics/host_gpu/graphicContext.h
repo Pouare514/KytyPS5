@@ -130,6 +130,7 @@ struct VulkanImage {
 	uint32_t               layers               = 1;
 	uint32_t               mip_levels           = 1;
 	uint32_t               samples              = 1;
+	bool                   needs_srgb_decode    = false;
 	vk::Image              image                = nullptr;
 	vk::ImageView          image_view[VIEW_MAX] = {};
 	vk::ImageLayout        layout               = vk::ImageLayout::eUndefined;

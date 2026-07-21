@@ -737,7 +737,7 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline& pipeline, vk::Rende
 	rasterizer.flags                   = {};
 	rasterizer.depthClampEnable        = VK_FALSE;
 	rasterizer.rasterizerDiscardEnable = VK_FALSE;
-	rasterizer.polygonMode             = vk::PolygonMode::eFill;
+	rasterizer.polygonMode             = static_params.polygon_mode;
 	rasterizer.cullMode                = cull_mode;
 	rasterizer.frontFace               = front_face;
 	rasterizer.depthBiasEnable =

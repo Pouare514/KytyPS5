@@ -385,7 +385,7 @@ static void SetDynamicParams(const RenderCommandBuffer& buffer, vk::CommandBuffe
 	vk_buffer.setScissor(0, 1, &scissor);
 
 	float line_width = dynamic_params.line_width;
-	if (line_width != 1.0f) {
+	if (line_width != 1.0f && !GetRenderContext().GetGraphics().wide_lines_enabled) {
 		static bool logged = false;
 		if (!logged) {
 			LOGF("Render: temporary: clamping Vulkan line width %f to 1.0 because wideLines is "
@@ -466,9 +466,15 @@ static bool ShouldSkipGeShader(const RenderCommandBuffer& buffer) {
 	                                 sh_regs.m_vgtGsMaxVertOut == 0x00000000 &&
 	                                 is_known_gs_out_prim_type(sh_regs.m_vgtGsOutPrimType);
 
+	// Known PS5 NGG vertex passthrough already validated above; do not also reject it via
+	// GE group-size / subgroup register heuristics that can disagree with that path.
+	if (ps5_ngg_vertex_path) {
+		return false;
+	}
+
 	const bool unsupported_stage_mask = (stages != 0 && stages != 0x02002000);
-	const bool unsupported_gs_stage = (vertex_info.es_regs.data_addr != 0 &&
-	                                   vertex_info.gs_regs.data_addr != 0 && !ps5_ngg_vertex_path);
+	const bool unsupported_gs_stage =
+	    (vertex_info.es_regs.data_addr != 0 && vertex_info.gs_regs.data_addr != 0);
 	const bool ge_group_size =
 	    ge_cntl.primitive_group_size > 0x0040 || ge_cntl.vertex_group_size > 0x0040;
 	const bool ge_shader_regs =

@@ -337,13 +337,18 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 		    image.kind == ResourceKind::StorageImageUint) {
 			image.storage_swizzle = DescriptorImageSwizzle(descriptor);
 		}
-		if (Prospero::IsUintTextureFormat((descriptor.dwords[1] >> 20u) & 0x1ffu)) {
+		const auto guest_format = (descriptor.dwords[1] >> 20u) & 0x1ffu;
+		if (Prospero::IsUintTextureFormat(guest_format)) {
 			switch (image.kind) {
 				case ResourceKind::Image: image.kind = ResourceKind::ImageUint; break;
 				case ResourceKind::StorageImage: image.kind = ResourceKind::StorageImageUint; break;
 				default: break;
 			}
 		}
+		// RGBA8 sRGB sampled textures use Unorm Vulkan backing + shader decode.
+		image.needs_srgb_decode =
+		    image.kind == ResourceKind::Image &&
+		    guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8Srgb);
 	}
 	struct ImagePatch {
 		std::reference_wrapper<Instruction> inst;

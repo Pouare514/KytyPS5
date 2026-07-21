@@ -322,6 +322,86 @@ void EmitImageSampleResult(EmitterState& state, const IR::Instruction& inst, uin
 	}
 }
 
+uint32_t EmitSrgbDecodeChannelF32(EmitterState& state, uint32_t encoded) {
+	// linear = c <= 0.04045 ? c/12.92 : pow((c+0.055)/1.055, 2.4)
+	const auto threshold = ConstantF32Value(state, 0.04045f);
+	const auto inv_12_92 = ConstantF32Value(state, 1.0f / 12.92f);
+	const auto offset    = ConstantF32Value(state, 0.055f);
+	const auto inv_1_055 = ConstantF32Value(state, 1.0f / 1.055f);
+	const auto gamma     = ConstantF32Value(state, 2.4f);
+
+	const auto use_linear = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpFOrdLessThanEqual, state.bool_type, use_linear, encoded, threshold});
+
+	const auto low = state.builder.AllocateId();
+	state.builder.AddFunction({OpFMul, state.float_type, low, encoded, inv_12_92});
+
+	const auto biased = state.builder.AllocateId();
+	state.builder.AddFunction({OpFAdd, state.float_type, biased, encoded, offset});
+	const auto scaled = state.builder.AllocateId();
+	state.builder.AddFunction({OpFMul, state.float_type, scaled, biased, inv_1_055});
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpExtInst, state.float_type, high, state.glsl_std450, GlslPow, scaled, gamma});
+
+	const auto linear = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, state.float_type, linear, use_linear, low, high});
+	return linear;
+}
+
+uint32_t EmitSrgbDecodeSampleF32(EmitterState& state, uint32_t sample) {
+	uint32_t channels[4] = {};
+	for (uint32_t i = 0; i < 4; i++) {
+		const auto encoded = state.builder.AllocateId();
+		state.builder.AddFunction({OpCompositeExtract, state.float_type, encoded, sample, i});
+		channels[i] = (i < 3) ? EmitSrgbDecodeChannelF32(state, encoded) : encoded;
+	}
+	const auto decoded = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeConstruct, state.vec4_float_type, decoded, channels[0],
+	                           channels[1], channels[2], channels[3]});
+	return decoded;
+}
+
+bool ImageSampleNeedsSrgbDecode(const EmitterState& state, const IR::Instruction& inst) {
+	if (inst.memory.kind != IR::ResourceKind::Image) {
+		return false;
+	}
+	EXIT_IF(inst.memory.resource >= state.program.info.images.size());
+	return state.program.info.images[inst.memory.resource].needs_srgb_decode;
+}
+
+void EmitImageSample(EmitterState& state, const IR::Instruction& inst) {
+	const auto view          = SampledImageViewKind(state, inst.memory, inst.pc);
+	const auto sampled_image = MakeSampledImage(state, inst.memory, inst.pc, view);
+
+	const auto layout       = MakeImageSampleLayout(inst, view);
+	const auto base_coord   = EmitImageCoordF32(state, inst, layout, view);
+	const auto sample       = state.builder.AllocateId();
+	const auto dref         = HasImageSampleFlag(inst, Decoder::ImageSampleFlagCompare);
+	const bool integer      = inst.memory.kind == IR::ResourceKind::ImageUint;
+	const auto result_type  = dref      ? state.float_type
+	                          : integer ? state.vec4_uint_type
+	                                    : state.vec4_float_type;
+	const auto explicit_lod = ImageSampleNeedsExplicitLod(state, inst);
+	const auto opcode       = ImageSampleOpcode(state, inst);
+	const auto coord =
+	    EmitImageOffsetCoordF32(state, inst, layout, sampled_image, base_coord, view);
+
+	std::vector<uint32_t> words = {opcode, result_type, sample, sampled_image, coord};
+	if (dref) {
+		words.push_back(EmitImageDrefF32(state, inst, layout));
+	}
+	AddImageSampleOperands(state, inst, layout, explicit_lod, words);
+	state.builder.AddFunction(words);
+
+	auto sample_result = sample;
+	if (!dref && !integer && ImageSampleNeedsSrgbDecode(state, inst)) {
+		sample_result = EmitSrgbDecodeSampleF32(state, sample);
+	}
+	EmitImageSampleResult(state, inst, sample_result, dref, integer);
+}
+
 bool ImageSampleNeedsExplicitLod(const EmitterState& state, const IR::Instruction& inst) {
 	// RDNA2 plain IMAGE_SAMPLE is derivative-based in pixel shaders. Do not translate it
 	// to Lod(0): only _L/_LZ/_D variants supply explicit LOD/gradient information.
@@ -369,32 +449,6 @@ uint32_t ImageSampleOpcode(const EmitterState& state, const IR::Instruction& ins
 		return dref ? OpImageSampleDrefExplicitLod : OpImageSampleExplicitLod;
 	}
 	return dref ? OpImageSampleDrefImplicitLod : OpImageSampleImplicitLod;
-}
-
-void EmitImageSample(EmitterState& state, const IR::Instruction& inst) {
-	const auto view          = SampledImageViewKind(state, inst.memory, inst.pc);
-	const auto sampled_image = MakeSampledImage(state, inst.memory, inst.pc, view);
-
-	const auto layout       = MakeImageSampleLayout(inst, view);
-	const auto base_coord   = EmitImageCoordF32(state, inst, layout, view);
-	const auto sample       = state.builder.AllocateId();
-	const auto dref         = HasImageSampleFlag(inst, Decoder::ImageSampleFlagCompare);
-	const bool integer      = inst.memory.kind == IR::ResourceKind::ImageUint;
-	const auto result_type  = dref      ? state.float_type
-	                          : integer ? state.vec4_uint_type
-	                                    : state.vec4_float_type;
-	const auto explicit_lod = ImageSampleNeedsExplicitLod(state, inst);
-	const auto opcode       = ImageSampleOpcode(state, inst);
-	const auto coord =
-	    EmitImageOffsetCoordF32(state, inst, layout, sampled_image, base_coord, view);
-
-	std::vector<uint32_t> words = {opcode, result_type, sample, sampled_image, coord};
-	if (dref) {
-		words.push_back(EmitImageDrefF32(state, inst, layout));
-	}
-	AddImageSampleOperands(state, inst, layout, explicit_lod, words);
-	state.builder.AddFunction(words);
-	EmitImageSampleResult(state, inst, sample, dref, integer);
 }
 
 uint32_t ImageGatherComponent(uint32_t dmask) {

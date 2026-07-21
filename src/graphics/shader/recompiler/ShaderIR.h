@@ -629,6 +629,8 @@ struct ImageResource {
 	bool                    written         = false;
 	bool                    atomic          = false;
 	bool                    depth_compare   = false;
+	// Guest sRGB sampled as Unorm: apply sRGB→linear in the emitter after sampling.
+	bool needs_srgb_decode = false;
 
 	bool operator==(const ImageResource& other) const = default;
 };

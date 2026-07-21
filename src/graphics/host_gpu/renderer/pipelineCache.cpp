@@ -34,6 +34,26 @@ void NormalizeStaticParamsForDynamicState(PipelineStaticParameters& static_param
 	static_params.scissor_ltrb[3] = 1;
 }
 
+[[nodiscard]] vk::PolygonMode ResolveVulkanPolygonMode(const HW::ModeControl& mc) {
+	// poly_mode == 0 disables dual/primitive override; triangles stay filled.
+	if (mc.poly_mode == 0) {
+		return vk::PolygonMode::eFill;
+	}
+
+	// Vulkan exposes a single polygon mode; front/back must match when dual mode is on.
+	EXIT_NOT_IMPLEMENTED(mc.polymode_front_ptype != mc.polymode_back_ptype);
+
+	switch (mc.polymode_front_ptype) {
+		case 0: return vk::PolygonMode::ePoint;
+		case 1: return vk::PolygonMode::eLine;
+		case 2: return vk::PolygonMode::eFill;
+		default:
+			EXIT("unsupported PA_SU_SC_MODE_CNTL.POLYMODE_*_PTYPE = %" PRIu8 "\n",
+			     mc.polymode_front_ptype);
+			return vk::PolygonMode::eFill;
+	}
+}
+
 } // namespace
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
@@ -117,9 +137,15 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	for (uint32_t i = 0; i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
 		static_params.color_mask[i] = color_mask[i];
 	}
-	static_params.cull_back  = mc.cull_back;
-	static_params.cull_front = mc.cull_front;
-	static_params.face       = mc.face;
+	static_params.cull_back     = mc.cull_back;
+	static_params.cull_front    = mc.cull_front;
+	static_params.face          = mc.face;
+	static_params.polygon_mode  = ResolveVulkanPolygonMode(mc);
+	if (static_params.polygon_mode != vk::PolygonMode::eFill &&
+	    !m_graphics.fill_mode_non_solid_enabled) {
+		EXIT("Pipeline: polygon mode %d requires fillModeNonSolid, but the host disabled it\n",
+		     static_cast<int>(static_params.polygon_mode));
+	}
 
 	for (uint32_t i = 0; i < color_count; i++) {
 		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
