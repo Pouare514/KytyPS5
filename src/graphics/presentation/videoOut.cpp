@@ -1452,14 +1452,14 @@ void Phase51TryBypassFlipL0(const char* why) {
 	}
 	int         result = VIDEO_OUT_ERROR_INVALID_HANDLE;
 	const char* path   = "none";
-	if (Graphics::g_render_ctx != nullptr) {
+	if (Graphics::HasRenderContext()) {
 		// One-shot proof: heap CB intentionally retained until process exit (Prepare
 		// records into it; Complete may run later on GPU timeline).
 		auto*    host_cb    = new Graphics::CommandBuffer(0);
 		uint64_t request_id = 0;
-		result = Presentation::DisplayBufferSubmitFlipFromGpu(host_cb, handle, 0,
+		result = Presentation::DisplayBufferSubmitFlipFromGpu(*host_cb, handle, 0,
 		                                                     /*VIDEO_OUT_FLIP_MODE_VSYNC*/ 1, 0,
-		                                                     &request_id);
+		                                                     request_id);
 		path = "gpu_submit";
 		if (result != OK) {
 			result = VideoOutSubmitFlip(handle, 0, /*VIDEO_OUT_FLIP_MODE_VSYNC*/ 1, 0);
@@ -7251,6 +7251,8 @@ static void AfterPending0HostTick() {
 	}
 }
 
+static void AfterGpuQueueEmptyHostTick(); // defined after FlipStats
+
 [[maybe_unused]] static const char* ResolveJmprelaSymbol(Loader::Program* prog, uint32_t reloc_idx) {
 	if (prog == nullptr || prog->dynamic_info == nullptr ||
 	    prog->dynamic_info->jmprela_table == nullptr || prog->dynamic_info->symbol_table == nullptr ||
@@ -7550,6 +7552,53 @@ static void LogPeriodic() {
 	        submit_gpu.load(std::memory_order_relaxed));
 }
 } // namespace FlipStats
+
+static void AfterGpuQueueEmptyHostTick() {
+	AfterPending0HostTick();
+	static std::atomic<uint64_t> last_submit_gpu {0};
+	static std::atomic<uint32_t> empty_streak {0};
+	const uint64_t               sg = FlipStats::submit_gpu.load(std::memory_order_relaxed);
+	const uint64_t               prev = last_submit_gpu.load(std::memory_order_relaxed);
+	if (sg != prev) {
+		last_submit_gpu.store(sg, std::memory_order_relaxed);
+		empty_streak.store(0, std::memory_order_relaxed);
+		return;
+	}
+	if (sg == 0) {
+		return;
+	}
+	const uint32_t n = empty_streak.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((n % 64u) != 0u || n > 4096u) {
+		return;
+	}
+	const auto woken = LibKernel::PthreadWakeSubmissionCondWaitersUnlimited();
+	const int  ue =
+	    LibKernel::EventQueue::KernelTriggerUserEventForAll(0x1800, nullptr);
+	LOGF("SubmitTrace: queue_empty stall wake n=%u submit_gpu=%" PRIu64 " woken=%zu ue=%d\n", n, sg,
+	     woken, ue);
+	fprintf(stderr,
+	        "SubmitTrace: queue_empty stall wake n=%u submit_gpu=%" PRIu64 " woken=%zu ue=%d\n", n,
+	        sg, woken, ue);
+	// Once after CFG soft-continue: dump who is waiting (producer freeze diagnosis).
+	if (Common::CfgSoftContinueSeen()) {
+		static std::atomic<bool> dumped {false};
+		bool                     expect = false;
+		if (dumped.compare_exchange_strong(expect, true, std::memory_order_relaxed)) {
+			fprintf(stderr,
+			        "SubmitTrace: cfg_stall_snapshot submit_gpu=%" PRIu64 " empty_streak=%u\n", sg,
+			        n);
+			LibKernel::PthreadDumpAllGuestThreads("cfg_stall_after_softcontinue");
+			const int      uid = Common::CfgSoftContinueFaultUniqueId();
+			const uint32_t htid = Common::CfgSoftContinueFaultHostTid();
+			// Prefer host_tid of the CFG fault thread (Main). Do NOT default uid→8
+			// (TaskGraph) when unique_id was unavailable in the VEH.
+			LibKernel::PthreadSnapshotGuestThread(uid, htid, "cfg_stall_after_softcontinue");
+			if (htid != 0) {
+				LibKernel::PthreadSnapshotGuestThread(-1, htid, "cfg_stall_fault_host");
+			}
+		}
+	}
+}
 
 class FlipQueue {
 public:
@@ -8112,12 +8161,12 @@ static int ReserveFlipRequest(int handle, int index, int flip_mode, int64_t flip
 	if (ok_n < 32 || (source == FlipRequestSource::GpuEop && ok_n < 64)) {
 		LOGF("FlipTrace: phase49 submit OK handle=%d index=%d mode=%d arg=%" PRId64
 		     " id=%" PRIu64 " buffer=%p vk=%p flip_rate=%d pending=%d src=%s\n",
-		     handle, index, flip_mode, flip_arg, *request_id, guest_buf, static_cast<void*>(vk),
+		     handle, index, flip_mode, flip_arg, request_id, guest_buf, static_cast<void*>(vk),
 		     video_out->flip_rate, video_out->flip_status.flipPendingNum,
 		     source == FlipRequestSource::GpuEop ? "gpu" : "cpu");
 		if (ok_n < 8 || source == FlipRequestSource::GpuEop) {
 			fprintf(stderr, "FlipTrace: phase49 submit OK index=%d src=%s id=%" PRIu64 "\n",
-			        index, source == FlipRequestSource::GpuEop ? "gpu" : "cpu", *request_id);
+			        index, source == FlipRequestSource::GpuEop ? "gpu" : "cpu", request_id);
 		}
 	}
 	return OK;
@@ -8649,7 +8698,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 			m_mutex.Unlock();
 			FlipStats::LogRateLimited("queue_empty", FlipStats::queue_empty, 256);
 			FlipStats::LogPeriodic();
-			AfterPending0HostTick();
+			AfterGpuQueueEmptyHostTick();
 			if (cpu_q != 0) {
 				static std::atomic<uint32_t> stuck_logs {0};
 				if (stuck_logs.fetch_add(1, std::memory_order_relaxed) < 32) {

@@ -832,10 +832,10 @@ static void ShaderGetStaticInputInfoPS(
 	        : 0;
 	// Vulkan push-constant ranges must not overlap across stages that are updated
 	// independently; place PS after the VS range (16-byte padded), matching descriptor_set.
-	ps_info->push_constant_offset =
-	    vs_info->stage.program != nullptr
+	ps_info.push_constant_offset =
+	    vs_info.stage.program != nullptr
 	        ? ShaderRecompiler::IR::PushConstantVulkanRangeSize(
-	              vs_info->stage.program->bindings.push_constant_size)
+	              vs_info.stage.program->bindings.push_constant_size)
 	        : 0;
 
 	for (int i = 0; i < 8; i++) {

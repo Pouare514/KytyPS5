@@ -37,6 +37,14 @@ using namespace Emulator;
 
 extern "C" void KytyCfgSafeCallTarget() {}
 
+// Park only the current thread (CFG walker runaway). Do not TerminateProcess — GPU
+// producer threads must keep running.
+extern "C" void KytyParkThreadForever() {
+	for (;;) {
+		Sleep(1000);
+	}
+}
+
 static bool KytyHostCodeIsExecutable(uint64_t addr) {
 	if (addr < 0x10000ull) {
 		return false;
@@ -56,17 +64,12 @@ static bool KytyCfgCallerWillInvokeRcx(uint64_t return_addr) {
 		return false;
 	}
 	const auto* p = reinterpret_cast<const uint8_t*>(return_addr);
-	// call rcx (FF D1) / jmp rcx (FF E1) — CFG check-then-invoke sites.
-	if (p[0] == 0xff && (p[1] == 0xd1 || p[1] == 0xe1)) {
-		return true;
-	}
-	return false;
+	return p[0] == 0xff && (p[1] == 0xd1 || p[1] == 0xe1);
 }
 
 // target in RCX, CFG caller's resume address in RDX (passed by naked stubs).
 extern "C" uint64_t KytyCfgSanitizeTarget(uint64_t target, uint64_t caller_ret) {
-	// Stack walkers validate RAs via CFG without calling them — never clobber RCX for those.
-	// Only retarget when the caller is about to call/jmp rcx into non-executable memory.
+	// Walkers validate RAs without calling them — leave RCX intact (Exp B / DS Main freeze).
 	if (caller_ret != 0 && !KytyCfgCallerWillInvokeRcx(caller_ret)) {
 		return target;
 	}
@@ -471,10 +474,22 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 int main(int argc, char* argv[]) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	DisableHostControlFlowGuard();
 	if (Common::RunExitWatcherIfRequested(argc, argv)) {
 		return 0;
 	}
+#endif
+
+	// Launcher probes version by spawning with no args and reading stdout. Keep this
+	// path free of crash hooks / subsystem teardown (those can AV on exit and lose
+	// the buffered usage text → "Can't find emulator").
+	if (argc < 2) {
+		PrintUsage();
+		std::fflush(stdout);
+		return 0;
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	DisableHostControlFlowGuard();
 	Common::InstallCrashDiagnostics();
 	Common::DisableKnownVulkanLayers();
 #endif
@@ -498,20 +513,16 @@ int main(int argc, char* argv[]) {
 	RunOptions options;
 	bool       show_help = false;
 
-	if (argc < 2) {
-		PrintUsage();
-		slist.DestroyAll(false);
-		return 0;
-	}
-
 	if (!ParseArgs(argc, argv, options, show_help)) {
 		PrintUsage();
+		std::fflush(stdout);
 		slist.DestroyAll(false);
 		return 1;
 	}
 
 	if (show_help) {
 		PrintUsage();
+		std::fflush(stdout);
 		slist.DestroyAll(false);
 		return 0;
 	}

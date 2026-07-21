@@ -71,6 +71,10 @@ RenderContext& GetRenderContext() noexcept {
 	return *g_render_ctx;
 }
 
+bool HasRenderContext() noexcept {
+	return g_render_ctx != nullptr;
+}
+
 FenceResourceRetainer::~FenceResourceRetainer() {
 	if (!m_resources.empty()) {
 		EXIT("fence resource retainer destroyed before release\n");

@@ -97,6 +97,12 @@ Pthread               PthreadSwapSelfForSignal(Pthread thread);
 [[nodiscard]] bool    PthreadMainThreadAlive();
 void                  PthreadDumpSubmissionThreads(const char* reason);
 void                  PthreadDumpAllGuestThreads(const char* reason);
+// Format current guest pthread as "name=… tid=… cond=…" (or "name=- tid=-" if none).
+void                  PthreadFormatCurrentGuest(char* out, size_t out_size);
+// Suspend + GetThreadContext dump (RIP/module/RVA) for post-CFG producer diagnosis.
+// Prefer unique_id; if <0, match host_tid_hint. Logs "cfg_post_rip …" to stderr/fatal.
+void                  PthreadSnapshotGuestThread(int unique_id, uint32_t host_tid_hint,
+                                                 const char* reason);
 size_t                PthreadWakeSubmissionCondWaiters();
 size_t                PthreadWakeSubmissionCondWaitersAfterFlip();
 // Phase 41: no wake budget — used by post-Unregister boot nudge / anti-CRT handoff.

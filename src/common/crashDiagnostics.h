@@ -28,6 +28,13 @@ void FlushHleRingToFatal(const char* reason);
 void NoteHaltReason(const char* kind, const char* detail = nullptr);
 const char* GetLastHaltReason();
 
+// Set when CFG-bitmap soft-continue runs; used by GPU queue_empty stall dump.
+// host_tid / unique_id identify the faulting guest thread for post-CFG RIP snapshot.
+void NoteCfgSoftContinue(uint32_t host_tid = 0, int unique_id = -1);
+[[nodiscard]] bool CfgSoftContinueSeen();
+[[nodiscard]] uint32_t CfgSoftContinueFaultHostTid();
+[[nodiscard]] int      CfgSoftContinueFaultUniqueId();
+
 } // namespace Common
 
 #endif /* KYTY_COMMON_CRASH_DIAGNOSTICS_H_ */

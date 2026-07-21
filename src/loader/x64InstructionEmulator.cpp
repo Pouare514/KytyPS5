@@ -3,6 +3,7 @@
 #include "common/common.h"
 #include "common/crashDiagnostics.h"
 #include "common/fatalLog.h"
+#include "kernel/pthread.h"
 
 #include <atomic>
 #include <cinttypes>
@@ -20,6 +21,7 @@ namespace Loader::X64InstructionEmulator {
 
 extern "C" void KytyCfgSafeCallTarget();
 extern "C" void KytyCfgAllowAll();
+extern "C" void KytyParkThreadForever();
 
 static M128A* GetContextXmm(PCONTEXT context, uint8_t index) {
 	if (context == nullptr || index >= 16) {
@@ -595,6 +597,29 @@ static bool IsHostExecutableCode(uint64_t addr) {
 	       prot == PAGE_EXECUTE_WRITECOPY;
 }
 
+// #region agent log
+static void AgentDbgLog(const char* hypothesis_id, const char* location, const char* message,
+                        const char* data_json) {
+	FILE* f = nullptr;
+#if defined(_MSC_VER)
+	if (fopen_s(&f, "c:\\codes\\KytyPS5-main\\debug-bacc56.log", "a") != 0) {
+		f = nullptr;
+	}
+#else
+	f = fopen("c:\\codes\\KytyPS5-main\\debug-bacc56.log", "a");
+#endif
+	if (f == nullptr) {
+		return;
+	}
+	const uint64_t ts = GetTickCount64();
+	std::fprintf(f,
+	             "{\"sessionId\":\"bacc56\",\"hypothesisId\":\"%s\",\"location\":\"%s\","
+	             "\"message\":\"%s\",\"data\":%s,\"timestamp\":%" PRIu64 "}\n",
+	             hypothesis_id, location, message, data_json != nullptr ? data_json : "{}", ts);
+	std::fclose(f);
+}
+// #endregion
+
 bool TrySoftContinueCfgBitmap(void* native_context, uint64_t fault_vaddr) {
 	auto* context = static_cast<PCONTEXT>(native_context);
 	if (context == nullptr) {
@@ -640,67 +665,327 @@ bool TrySoftContinueCfgBitmap(void* native_context, uint64_t fault_vaddr) {
 		return false;
 	}
 
-	// First hit: redirect LdrpValidateUserCallTarget → KytyCfgAllowAll (abs jmp).
-	{
-		static std::atomic<bool> patched {false};
-		bool                     expect = false;
-		if (patched.compare_exchange_strong(expect, true, std::memory_order_relaxed)) {
-			DWORD64           image_base = 0;
-			PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(context->Rip, &image_base, nullptr);
-			if (rf != nullptr && image_base != 0) {
-				auto*            start = reinterpret_cast<uint8_t*>(image_base + rf->BeginAddress);
-				constexpr size_t kLen  = 14;
-				uint8_t          buf[kLen] = {0xff, 0x25, 0x00, 0x00, 0x00, 0x00};
-				const uint64_t   dest      = reinterpret_cast<uint64_t>(&KytyCfgAllowAll);
-				std::memcpy(buf + 6, &dest, sizeof(dest));
-				DWORD old = 0;
-				if (VirtualProtect(start, kLen, PAGE_EXECUTE_READWRITE, &old) != 0) {
-					std::memcpy(start, buf, kLen);
-					FlushInstructionCache(GetCurrentProcess(), start, kLen);
-					VirtualProtect(start, kLen, old, &old);
-					char line[192];
-					std::snprintf(line, sizeof(line),
-					              "MemoryTrace: CFG ntdll check patched to KytyCfgAllowAll at %p "
-					              "(was mid-fn rip=0x%016" PRIx64 ")",
-					              static_cast<void*>(start),
-					              static_cast<uint64_t>(context->Rip));
-					Common::LogFatalToFile(line);
-					std::fprintf(stderr, "%s\n", line);
-				}
+	// CFG soft-continue notes (DS/MCL black-screen, 2026-07):
+	// - DS fault=spi_main_thread tid=8; cfg_post_rip: Main stuck in ntdll (rva≈0x163cb4),
+	//   ret_bytes often E9 (walk continues). CondWait not involved (cond=-).
+	// - Mid-fn C3 / walker-fn nop / unwind-into-guest: process dies. Keep AllowAll reenter.
+	// - Exp B: walker RCX intact; Exp C: Sleep-park non-producer walkers (MCL Rendering Pool).
+	// - Unblock submit>120 still open — need safe abort of ntdll guest-stack walk.
+
+	const auto* ret_bytes = reinterpret_cast<const uint8_t*>(stacked_ret);
+	const bool  will_invoke =
+	    ret_bytes[0] == 0xff && (ret_bytes[1] == 0xd1 || ret_bytes[1] == 0xe1);
+	const uint64_t rcx_before = call_target;
+
+	auto log_fault_thread_once = [&]() {
+		static std::atomic<bool> logged_thread {false};
+		bool                     expect_log = false;
+		if (!logged_thread.compare_exchange_strong(expect_log, true, std::memory_order_relaxed)) {
+			return;
+		}
+		char guest[128];
+		Libs::LibKernel::PthreadFormatCurrentGuest(guest, sizeof(guest));
+		void* frames[8] = {};
+		const USHORT nf =
+		    CaptureStackBackTrace(0, static_cast<DWORD>(sizeof(frames) / sizeof(frames[0])),
+		                          frames, nullptr);
+		char line[512];
+		std::snprintf(line, sizeof(line),
+		              "MemoryTrace: CFG-bitmap fault-thread host_tid=%lu %s "
+		              "rip=0x%016" PRIx64 " rsp=0x%016" PRIx64 " rcx_before=0x%016" PRIx64
+		              " rcx_after=0x%016" PRIx64 " ret=0x%016" PRIx64 " invoke=%d "
+		              "bt0=%p bt1=%p bt2=%p bt3=%p bt4=%p bt5=%p",
+		              static_cast<unsigned long>(GetCurrentThreadId()), guest,
+		              static_cast<uint64_t>(context->Rip),
+		              static_cast<uint64_t>(context->Rsp), rcx_before,
+		              static_cast<uint64_t>(context->Rcx), stacked_ret, will_invoke ? 1 : 0,
+		              nf > 0 ? frames[0] : nullptr, nf > 1 ? frames[1] : nullptr,
+		              nf > 2 ? frames[2] : nullptr, nf > 3 ? frames[3] : nullptr,
+		              nf > 4 ? frames[4] : nullptr, nf > 5 ? frames[5] : nullptr);
+		Common::LogFatalToFile(line);
+		std::fprintf(stderr, "%s\n", line);
+		int unique_id = -1;
+		if (auto* self = Libs::LibKernel::PthreadSelfOrNull()) {
+			unique_id = Libs::LibKernel::PthreadGetUniqueId(self);
+		}
+		Common::NoteCfgSoftContinue(static_cast<uint32_t>(GetCurrentThreadId()), unique_id);
+	};
+
+	// Exp B: only retarget when the CFG caller will call/jmp rcx.
+	if (will_invoke && !IsHostExecutableCode(call_target)) {
+		context->Rcx = reinterpret_cast<uint64_t>(&KytyCfgSafeCallTarget);
+		static std::atomic<uint32_t> retarget_n {0};
+		const uint32_t n = retarget_n.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n <= 32 || (n % 64) == 0) {
+			char line[320];
+			std::snprintf(line, sizeof(line),
+			              "MemoryTrace: CFG-bitmap retarget-safe n=%u invoke=1 "
+			              "target=0x%016" PRIx64 " ret=0x%016" PRIx64,
+			              n, call_target, stacked_ret);
+			Common::LogFatalToFile(line);
+			std::fprintf(stderr, "%s\n", line);
+		}
+	} else if (!will_invoke && !IsHostExecutableCode(call_target)) {
+		static std::atomic<uint32_t> walker_n {0};
+		const uint32_t n = walker_n.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n <= 32 || (n % 64) == 0) {
+			char line[320];
+			std::snprintf(line, sizeof(line),
+			              "MemoryTrace: CFG-bitmap walker-rcx-intact n=%u "
+			              "target=0x%016" PRIx64 " ret=0x%016" PRIx64,
+			              n, call_target, stacked_ret);
+			Common::LogFatalToFile(line);
+			std::fprintf(stderr, "%s\n", line);
+		}
+	}
+
+	log_fault_thread_once();
+
+	static std::atomic<uint32_t> cfg_n {0};
+	const uint32_t               n = cfg_n.fetch_add(1, std::memory_order_relaxed) + 1;
+
+	const bool producer_critical = Libs::LibKernel::PthreadCurrentIsMainRelated() ||
+	                               Libs::LibKernel::PthreadCurrentIsSubmissionRelated();
+
+	// Exp C: non-critical walker (e.g. MCL Rendering Pool) — park in-handler (Sleep loop).
+	// Redirecting RIP to KytyParkThreadForever still re-entered CFG thousands of times.
+	if (!will_invoke && !producer_critical) {
+		char guest[128];
+		Libs::LibKernel::PthreadFormatCurrentGuest(guest, sizeof(guest));
+		static std::atomic<uint32_t> park_n {0};
+		const uint32_t               pn = park_n.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (pn <= 32 || (pn % 64) == 0) {
+			char line[320];
+			std::snprintf(line, sizeof(line),
+			              "MemoryTrace: CFG-bitmap selective-park n=%u %s "
+			              "target=0x%016" PRIx64 " ret=0x%016" PRIx64,
+			              pn, guest, call_target, stacked_ret);
+			Common::LogFatalToFile(line);
+			std::fprintf(stderr, "%s\n", line);
+			std::fflush(stderr);
+		}
+		for (;;) {
+			Sleep(1000);
+		}
+	}
+
+	// Always redirect LdrpValidateUserCallTarget → AllowAll so later frames skip bitmap AV.
+	static std::atomic<uint64_t> patched_entry {0};
+	uint64_t                     entry_va = patched_entry.load(std::memory_order_acquire);
+	if (entry_va == 0) {
+		DWORD64           image_base = 0;
+		PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(context->Rip, &image_base, nullptr);
+		if (rf != nullptr && image_base != 0) {
+			auto*            start = reinterpret_cast<uint8_t*>(image_base + rf->BeginAddress);
+			constexpr size_t kLen  = 14;
+			uint8_t          buf[kLen] = {0xff, 0x25, 0x00, 0x00, 0x00, 0x00};
+			const uint64_t   dest      = reinterpret_cast<uint64_t>(&KytyCfgAllowAll);
+			std::memcpy(buf + 6, &dest, sizeof(dest));
+			DWORD old = 0;
+			if (VirtualProtect(start, kLen, PAGE_EXECUTE_READWRITE, &old) != 0) {
+				std::memcpy(start, buf, kLen);
+				FlushInstructionCache(GetCurrentProcess(), start, kLen);
+				VirtualProtect(start, kLen, old, &old);
+				entry_va = reinterpret_cast<uint64_t>(start);
+				patched_entry.store(entry_va, std::memory_order_release);
+				char line[192];
+				std::snprintf(line, sizeof(line),
+				              "MemoryTrace: CFG ntdll check patched to KytyCfgAllowAll at %p "
+				              "(was mid-fn rip=0x%016" PRIx64 ")",
+				              static_cast<void*>(start),
+				              static_cast<uint64_t>(context->Rip));
+				Common::LogFatalToFile(line);
+				std::fprintf(stderr, "%s\n", line);
 			}
 		}
 	}
 
-	{
-		const auto* p = reinterpret_cast<const uint8_t*>(stacked_ret);
-		const bool  will_invoke = p[0] == 0xff && (p[1] == 0xd1 || p[1] == 0xe1);
-		if (will_invoke && !IsHostExecutableCode(call_target)) {
-			context->Rcx = reinterpret_cast<uint64_t>(&KytyCfgSafeCallTarget);
-		} else if (!will_invoke && !IsHostExecutableCode(call_target)) {
-			// Stack walker validating a guest-stack / non-X "return address". Allowing
-			// the check lets the walk dive into guest frames → 0xC0000005. Soft-halt.
+	// Producer walker: AllowAll alone → E9 walk-continue forever (submit freeze).
+	// E9→C3 mid-WalkerFunc REJECTED (AV Execute[0], rbp=CFG target, halt 321).
+	// Next: RtlVirtualUnwind exactly 2 frames (Validate + WalkerFunc) with host-only
+	// landing; if unsafe, park this thread (no 321) rather than spin/crash.
+	const bool producer_walker = !will_invoke && producer_critical;
+	if (producer_walker) {
+		static std::atomic<uint32_t> producer_walker_n {0};
+		const uint32_t               pwn =
+		    producer_walker_n.fetch_add(1, std::memory_order_relaxed) + 1;
+
+		uint8_t ret_code[8] = {};
+		std::memcpy(ret_code, reinterpret_cast<const void*>(stacked_ret), sizeof(ret_code));
+
+		// #region agent log
+		{
+			char dj[320];
+			std::snprintf(dj, sizeof(dj),
+			              "{\"pwn\":%u,\"rip\":\"0x%016" PRIx64 "\",\"rsp\":\"0x%016" PRIx64
+			              "\",\"target\":\"0x%016" PRIx64 "\",\"ret\":\"0x%016" PRIx64
+			              "\",\"ret0\":%u,\"entry_va\":\"0x%016" PRIx64 "\"}",
+			              pwn, static_cast<uint64_t>(context->Rip),
+			              static_cast<uint64_t>(context->Rsp), call_target, stacked_ret,
+			              static_cast<unsigned>(ret_code[0]), entry_va);
+			AgentDbgLog("C", "x64InstructionEmulator.cpp:producer-enter",
+			            "producer walker soft-continue", dj);
+		}
+		// #endregion
+
+		HMODULE ntdll_mod = GetModuleHandleA("ntdll.dll");
+		CONTEXT unwind    = *context;
+		bool    ok_frames = true;
+		for (int step = 0; step < 2; ++step) {
+			DWORD64           image_base = 0;
+			PRUNTIME_FUNCTION rf =
+			    RtlLookupFunctionEntry(unwind.Rip, &image_base, nullptr);
+			if (rf == nullptr || image_base == 0) {
+				ok_frames = false;
+				// #region agent log
+				{
+					char dj[192];
+					std::snprintf(dj, sizeof(dj),
+					              "{\"step\":%d,\"why\":\"no-rf\",\"rip\":\"0x%016" PRIx64 "\"}",
+					              step, static_cast<uint64_t>(unwind.Rip));
+					AgentDbgLog("G", "x64InstructionEmulator.cpp:unwind2", "unwind2 fail",
+					            dj);
+				}
+				// #endregion
+				break;
+			}
+			PVOID   handler_data = nullptr;
+			DWORD64 establisher  = 0;
+			RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, unwind.Rip, rf, &unwind,
+			                 &handler_data, &establisher, nullptr);
+			HMODULE owner = nullptr;
+			const bool has_mod =
+			    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			                       reinterpret_cast<LPCSTR>(unwind.Rip), &owner) != 0 &&
+			    owner != nullptr;
+			const bool guest_band =
+			    unwind.Rip >= 0x0000000900000000ull && unwind.Rip < 0x0000000a00000000ull;
+			const bool is_exec = IsHostExecutableCode(unwind.Rip);
+			const bool in_ntdll = ntdll_mod != nullptr && owner == ntdll_mod;
+			// #region agent log
+			{
+				char dj[384];
+				std::snprintf(dj, sizeof(dj),
+				              "{\"step\":%d,\"rip\":\"0x%016" PRIx64 "\",\"rsp\":\"0x%016" PRIx64
+				              "\",\"has_mod\":%d,\"ntdll\":%d,\"guest\":%d,\"exec\":%d,"
+				              "\"rsp_eq_target\":%d}",
+				              step, static_cast<uint64_t>(unwind.Rip),
+				              static_cast<uint64_t>(unwind.Rsp), has_mod ? 1 : 0,
+				              in_ntdll ? 1 : 0, guest_band ? 1 : 0, is_exec ? 1 : 0,
+				              unwind.Rsp == call_target ? 1 : 0);
+				AgentDbgLog("G", "x64InstructionEmulator.cpp:unwind2", "unwind2 frame", dj);
+			}
+			// #endregion
+			if (!has_mod || guest_band || !is_exec || unwind.Rip < 0x10000ull) {
+				ok_frames = false;
+				break;
+			}
+		}
+
+		if (ok_frames) {
+			HMODULE owner = nullptr;
+			const bool has_mod =
+			    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			                       reinterpret_cast<LPCSTR>(unwind.Rip), &owner) != 0 &&
+			    owner != nullptr;
+			const bool guest_band =
+			    unwind.Rip >= 0x0000000900000000ull && unwind.Rip < 0x0000000a00000000ull;
+			if (has_mod && !guest_band && IsHostExecutableCode(unwind.Rip) &&
+			    unwind.Rsp != call_target) {
+				context->Rip = unwind.Rip;
+				context->Rsp = unwind.Rsp;
+				context->Rbp = unwind.Rbp;
+				context->Rax = unwind.Rax;
+				context->Rbx = unwind.Rbx;
+				context->Rcx = unwind.Rcx;
+				context->Rdx = unwind.Rdx;
+				context->Rsi = unwind.Rsi;
+				context->Rdi = unwind.Rdi;
+				context->R8  = unwind.R8;
+				context->R9  = unwind.R9;
+				context->R10 = unwind.R10;
+				context->R11 = unwind.R11;
+				context->R12 = unwind.R12;
+				context->R13 = unwind.R13;
+				context->R14 = unwind.R14;
+				context->R15 = unwind.R15;
+				// #region agent log
+				{
+					char dj[320];
+					std::snprintf(dj, sizeof(dj),
+					              "{\"mode\":\"unwind-2frame\",\"pwn\":%u,\"out_rip\":\"0x%016"
+					              PRIx64 "\",\"out_rsp\":\"0x%016" PRIx64
+					              "\",\"runId\":\"post-fix\"}",
+					              pwn, static_cast<uint64_t>(context->Rip),
+					              static_cast<uint64_t>(context->Rsp));
+					AgentDbgLog("G", "x64InstructionEmulator.cpp:accept-unwind2",
+					            "producer unwind 2-frame landing", dj);
+				}
+				// #endregion
+				char line[512];
+				std::snprintf(line, sizeof(line),
+				              "MemoryTrace: CFG-bitmap soft-continue n=%u mode=unwind-2frame "
+				              "pwn=%u fault=0x%016" PRIx64 " target=0x%016" PRIx64
+				              " ret=0x%016" PRIx64 " out_rip=0x%016" PRIx64
+				              " out_rsp=0x%016" PRIx64,
+				              n, pwn, fault_vaddr, call_target, stacked_ret,
+				              static_cast<uint64_t>(context->Rip),
+				              static_cast<uint64_t>(context->Rsp));
+				Common::LogFatalToFile(line);
+				std::fprintf(stderr, "%s\n", line);
+				std::fflush(stderr);
+				return true;
+			}
+		}
+
+		// Unsafe landing: park Main (process stays up; avoids Execute[0]/321).
+		// #region agent log
+		{
+			char dj[256];
+			std::snprintf(dj, sizeof(dj),
+			              "{\"mode\":\"park-producer\",\"pwn\":%u,\"ok_frames\":%d,"
+			              "\"runId\":\"post-fix\"}",
+			              pwn, ok_frames ? 1 : 0);
+			AgentDbgLog("G", "x64InstructionEmulator.cpp:park-producer",
+			            "producer park after unsafe unwind2", dj);
+		}
+		// #endregion
+		{
 			char line[320];
 			std::snprintf(line, sizeof(line),
-			              "MemoryTrace: CFG-bitmap walker soft-halt target=0x%016" PRIx64
-			              " ret=0x%016" PRIx64,
-			              call_target, stacked_ret);
+			              "MemoryTrace: CFG-bitmap soft-continue n=%u mode=park-producer "
+			              "pwn=%u fault=0x%016" PRIx64 " target=0x%016" PRIx64
+			              " ret=0x%016" PRIx64 " ret_bytes=%02x%02x%02x%02x%02x%02x%02x%02x",
+			              n, pwn, fault_vaddr, call_target, stacked_ret, ret_code[0], ret_code[1],
+			              ret_code[2], ret_code[3], ret_code[4], ret_code[5], ret_code[6],
+			              ret_code[7]);
 			Common::LogFatalToFile(line);
 			std::fprintf(stderr, "%s\n", line);
-			return false;
+			std::fflush(stderr);
+		}
+		for (;;) {
+			Sleep(1000);
 		}
 	}
 
-	context->Rip = stacked_ret;
-	context->Rsp += 8;
+	// Non-producer: prefer reenter AllowAll; else fake-ret.
+	const char* mode = "fake-ret";
+	if (entry_va != 0) {
+		context->Rip = entry_va;
+		mode         = "reenter-AllowAll";
+	} else {
+		context->Rip = stacked_ret;
+		context->Rsp += 8;
+	}
 
-	static std::atomic<uint32_t> cfg_n {0};
-	const uint32_t               n = cfg_n.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (n <= 32 || (n % 128) == 0) {
 		char line[384];
 		std::snprintf(line, sizeof(line),
-		              "MemoryTrace: CFG-bitmap soft-continue n=%u fault=0x%016" PRIx64
+		              "MemoryTrace: CFG-bitmap soft-continue n=%u mode=%s fault=0x%016" PRIx64
 		              " target=0x%016" PRIx64 " ret=0x%016" PRIx64 " exec=%d rcx_now=0x%016" PRIx64,
-		              n, fault_vaddr, call_target, stacked_ret,
+		              n, mode, fault_vaddr, call_target, stacked_ret,
 		              IsHostExecutableCode(call_target) ? 1 : 0,
 		              static_cast<uint64_t>(context->Rcx));
 		Common::LogFatalToFile(line);

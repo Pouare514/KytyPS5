@@ -64,6 +64,7 @@ private:
 };
 
 [[nodiscard]] RenderContext& GetRenderContext() noexcept;
+[[nodiscard]] bool           HasRenderContext() noexcept;
 
 } // namespace Libs::Graphics
 

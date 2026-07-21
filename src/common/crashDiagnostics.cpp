@@ -40,6 +40,9 @@ std::atomic<uint32_t>           g_guest_av_logs {0};
 Common::SoftIdleKeepAliveFn     g_soft_idle_keep_alive = nullptr;
 char                            g_halt_reason[256] {"(none)"};
 std::atomic<uint32_t>           g_halt_reason_seq {0};
+std::atomic<bool>               g_cfg_softcontinue_seen {false};
+std::atomic<uint32_t>           g_cfg_fault_host_tid {0};
+std::atomic<int>                g_cfg_fault_unique_id {-1};
 
 void CopyCapped(char* dst, size_t dst_size, const char* src) {
 	if (dst == nullptr || dst_size == 0) {
@@ -206,6 +209,28 @@ void NoteHaltReason(const char* kind, const char* detail) {
 
 const char* GetLastHaltReason() {
 	return g_halt_reason;
+}
+
+void NoteCfgSoftContinue(uint32_t host_tid, int unique_id) {
+	g_cfg_softcontinue_seen.store(true, std::memory_order_release);
+	if (host_tid != 0) {
+		g_cfg_fault_host_tid.store(host_tid, std::memory_order_release);
+	}
+	if (unique_id >= 0) {
+		g_cfg_fault_unique_id.store(unique_id, std::memory_order_release);
+	}
+}
+
+bool CfgSoftContinueSeen() {
+	return g_cfg_softcontinue_seen.load(std::memory_order_acquire);
+}
+
+uint32_t CfgSoftContinueFaultHostTid() {
+	return g_cfg_fault_host_tid.load(std::memory_order_acquire);
+}
+
+int CfgSoftContinueFaultUniqueId() {
+	return g_cfg_fault_unique_id.load(std::memory_order_acquire);
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -403,20 +428,12 @@ static void TerminateBreadcrumb() {
 	std::abort();
 }
 
-using ExitProcessFn         = void(WINAPI*)(UINT);
-using TerminateProcessFn    = BOOL(WINAPI*)(HANDLE, UINT);
-using NtTerminateProcessFn  = LONG(NTAPI*)(HANDLE, LONG);
-using RtlExitUserProcessFn  = void(NTAPI*)(ULONG);
+using ExitProcessFn      = void(WINAPI*)(UINT);
+using TerminateProcessFn = BOOL(WINAPI*)(HANDLE, UINT);
 
-static ExitProcessFn        g_real_exit_process         = nullptr;
-static TerminateProcessFn   g_real_terminate_process    = nullptr;
-static NtTerminateProcessFn g_real_nt_terminate_process = nullptr;
-static RtlExitUserProcessFn g_real_rtl_exit_user_process = nullptr;
+static ExitProcessFn      g_real_exit_process      = nullptr;
+static TerminateProcessFn g_real_terminate_process = nullptr;
 static std::atomic<uint32_t> g_exit_hook_logs {0};
-
-// Executable trampoline: stolen prologue + jmp back into ntdll.
-alignas(16) static uint8_t g_nt_term_tramp[64] {};
-alignas(16) static uint8_t g_rtl_exit_tramp[64] {};
 
 static bool WriteAbsJmp(void* from, const void* to) {
 	auto* p = static_cast<uint8_t*>(from);
@@ -430,33 +447,40 @@ static bool WriteAbsJmp(void* from, const void* to) {
 	return true;
 }
 
+// tramp_steal = complete instructions copied into the trampoline (must not include
+// rip-relative call/jcc that would break when relocated).
+// patch_len   = bytes overwritten at target (>= 12 for abs jmp); may be > tramp_steal.
 static bool InstallInlineHook(void* target, void* hook, void* trampoline, size_t tramp_size,
-                              void** original_out, size_t stolen = 16) {
-	// Abs jmp is 12 bytes; stolen must be a complete-instruction boundary >= 12.
+                              void** original_out, size_t tramp_steal = 16,
+                              size_t patch_len = 0) {
+	if (patch_len == 0) {
+		patch_len = tramp_steal;
+	}
 	if (target == nullptr || hook == nullptr || trampoline == nullptr || tramp_size < 48 ||
-	    stolen < 12 || stolen > 32) {
+	    tramp_steal < 1 || tramp_steal > 32 || patch_len < 12 || patch_len > 32 ||
+	    tramp_steal + 12 > tramp_size) {
 		return false;
 	}
 	DWORD old_prot = 0;
-	if (VirtualProtect(target, stolen, PAGE_EXECUTE_READWRITE, &old_prot) == 0) {
+	if (VirtualProtect(target, patch_len, PAGE_EXECUTE_READWRITE, &old_prot) == 0) {
 		return false;
 	}
-	std::memcpy(trampoline, target, stolen);
-	WriteAbsJmp(static_cast<uint8_t*>(trampoline) + stolen,
-	            static_cast<uint8_t*>(target) + stolen);
+	std::memcpy(trampoline, target, tramp_steal);
+	// Resume after the overwritten region — never mid-patch (tramp_steal < patch_len).
+	WriteAbsJmp(static_cast<uint8_t*>(trampoline) + tramp_steal,
+	            static_cast<uint8_t*>(target) + patch_len);
 	DWORD tramp_prot = 0;
 	VirtualProtect(trampoline, tramp_size, PAGE_EXECUTE_READWRITE, &tramp_prot);
 	FlushInstructionCache(GetCurrentProcess(), trampoline, tramp_size);
 
 	WriteAbsJmp(target, hook);
-	// NOP-pad remaining stolen bytes past the 12-byte abs jmp.
 	auto* t = static_cast<uint8_t*>(target);
-	for (size_t i = 12; i < stolen; ++i) {
+	for (size_t i = 12; i < patch_len; ++i) {
 		t[i] = 0x90;
 	}
-	FlushInstructionCache(GetCurrentProcess(), target, stolen);
+	FlushInstructionCache(GetCurrentProcess(), target, patch_len);
 	DWORD ignored = 0;
-	VirtualProtect(target, stolen, old_prot, &ignored);
+	VirtualProtect(target, patch_len, old_prot, &ignored);
 	if (original_out != nullptr) {
 		*original_out = trampoline;
 	}
@@ -548,6 +572,9 @@ static void WINAPI HookedExitProcess(UINT code) {
 	if (g_real_exit_process != nullptr) {
 		g_real_exit_process(code);
 	}
+	for (;;) {
+		Sleep(1000);
+	}
 }
 
 static BOOL WINAPI HookedTerminateProcess(HANDLE process, UINT code) {
@@ -565,33 +592,6 @@ static BOOL WINAPI HookedTerminateProcess(HANDLE process, UINT code) {
 		return g_real_terminate_process(process, code);
 	}
 	return FALSE;
-}
-
-static LONG NTAPI HookedNtTerminateProcess(HANDLE process, LONG status) {
-	HANDLE self = GetCurrentProcess();
-	const bool self_target =
-	    process == nullptr || process == self ||
-	    process == reinterpret_cast<HANDLE>(static_cast<intptr_t>(-1));
-	if (self_target) {
-		LogExitHookFrames("NtTerminateProcess", static_cast<UINT>(status));
-		if (ShouldSoftIdleExitCode(static_cast<UINT>(status))) {
-			SoftIdleForever("NtTerminateProcess", static_cast<UINT>(status));
-		}
-	}
-	if (g_real_nt_terminate_process != nullptr) {
-		return g_real_nt_terminate_process(process, status);
-	}
-	return static_cast<LONG>(0xC0000001L);
-}
-
-static void NTAPI HookedRtlExitUserProcess(ULONG status) {
-	LogExitHookFrames("RtlExitUserProcess", status);
-	if (ShouldSoftIdleExitCode(status)) {
-		SoftIdleForever("RtlExitUserProcess", status);
-	}
-	if (g_real_rtl_exit_user_process != nullptr) {
-		g_real_rtl_exit_user_process(status);
-	}
 }
 
 alignas(16) static uint8_t g_gs_fail_tramps[8][64] {};
@@ -1019,10 +1019,6 @@ static void InstallExitHooks() {
 	                      "api-ms-win-core-processthreads-l1-1-2.dll"};
 	int exit_hits = 0;
 	int term_hits = 0;
-	int nt_hits   = 0;
-	int rtl_hits  = 0;
-	void* nt_orig  = nullptr;
-	void* rtl_orig = nullptr;
 	for (size_t mi = 0; mi < count; ++mi) {
 		if (modules[mi] == nullptr) {
 			continue;
@@ -1030,8 +1026,6 @@ static void InstallExitHooks() {
 		for (const char* dll: dlls) {
 			void* scratch_exit = exit_orig;
 			void* scratch_term = term_orig;
-			void* scratch_nt   = nt_orig;
-			void* scratch_rtl  = rtl_orig;
 			if (PatchIatInModule(modules[mi], dll, "ExitProcess",
 			                     reinterpret_cast<void*>(&HookedExitProcess), &scratch_exit)) {
 				exit_orig = scratch_exit;
@@ -1042,16 +1036,6 @@ static void InstallExitHooks() {
 				term_orig = scratch_term;
 				++term_hits;
 			}
-			if (PatchIatInModule(modules[mi], dll, "NtTerminateProcess",
-			                     reinterpret_cast<void*>(&HookedNtTerminateProcess), &scratch_nt)) {
-				nt_orig = scratch_nt;
-				++nt_hits;
-			}
-			if (PatchIatInModule(modules[mi], dll, "RtlExitUserProcess",
-			                     reinterpret_cast<void*>(&HookedRtlExitUserProcess), &scratch_rtl)) {
-				rtl_orig = scratch_rtl;
-				++rtl_hits;
-			}
 		}
 	}
 	g_real_exit_process =
@@ -1060,46 +1044,12 @@ static void InstallExitHooks() {
 	                               ? reinterpret_cast<TerminateProcessFn>(term_orig)
 	                               : TerminateProcess;
 
-	// Always inline-hook ntdll entry points — IAT hits alone miss GetProcAddress / direct calls,
-	// and previous runs died with zero HOOK lines after UserEvent/CondWait.
-	{
-		void* nt_target = reinterpret_cast<void*>(
-		    GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtTerminateProcess"));
-		void* nt_orig_fn = nullptr;
-		if (InstallInlineHook(nt_target, reinterpret_cast<void*>(&HookedNtTerminateProcess),
-		                      g_nt_term_tramp, sizeof(g_nt_term_tramp), &nt_orig_fn)) {
-			g_real_nt_terminate_process = reinterpret_cast<NtTerminateProcessFn>(nt_orig_fn);
-			++nt_hits;
-			EmergencyLogRaw("CrashTrace: NtTerminateProcess INLINE hooked");
-		} else if (nt_orig != nullptr) {
-			g_real_nt_terminate_process = reinterpret_cast<NtTerminateProcessFn>(nt_orig);
-			EmergencyLogRaw("CrashTrace: NtTerminateProcess inline FAILED (using IAT orig)");
-		} else {
-			g_real_nt_terminate_process = reinterpret_cast<NtTerminateProcessFn>(nt_target);
-			EmergencyLogRaw("CrashTrace: NtTerminateProcess inline FAILED");
-		}
-	}
-	{
-		void* rtl_target = reinterpret_cast<void*>(
-		    GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlExitUserProcess"));
-		void* rtl_orig_fn = nullptr;
-		if (InstallInlineHook(rtl_target, reinterpret_cast<void*>(&HookedRtlExitUserProcess),
-		                      g_rtl_exit_tramp, sizeof(g_rtl_exit_tramp), &rtl_orig_fn)) {
-			g_real_rtl_exit_user_process = reinterpret_cast<RtlExitUserProcessFn>(rtl_orig_fn);
-			++rtl_hits;
-			EmergencyLogRaw("CrashTrace: RtlExitUserProcess INLINE hooked");
-		} else if (rtl_orig != nullptr) {
-			g_real_rtl_exit_user_process = reinterpret_cast<RtlExitUserProcessFn>(rtl_orig);
-			EmergencyLogRaw("CrashTrace: RtlExitUserProcess inline FAILED (using IAT orig)");
-		} else {
-			g_real_rtl_exit_user_process = reinterpret_cast<RtlExitUserProcessFn>(rtl_target);
-			EmergencyLogRaw("CrashTrace: RtlExitUserProcess inline FAILED");
-		}
-	}
+	// Do not hook ntdll RtlExitUserProcess / NtTerminateProcess — fragile trampolines and
+	// re-entrancy. Soft-idle 321 is covered by ExitProcess + TerminateProcess IAT hooks.
+	EmergencyLogRaw("CrashTrace: NtTerminateProcess/RtlExitUserProcess unhooked (passthrough)");
 	char message[256];
 	std::snprintf(message, sizeof(message),
-	              "CrashTrace: Exit=%d Term=%d NtTerm=%d RtlExit=%d modules=%zu", exit_hits,
-	              term_hits, nt_hits, rtl_hits, count);
+	              "CrashTrace: Exit=%d Term=%d modules=%zu", exit_hits, term_hits, count);
 	EmergencyLogRaw(message);
 }
 

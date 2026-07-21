@@ -392,6 +392,9 @@ uint32_t EmitMemoryDwordIndex(EmitterState& state, const IR::Instruction& inst,
 	}
 	return index;
 }
+
+DescriptorResourceBinding
+StorageBufferBindingForMemory(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc) {
 	(void)use_pc;
 	const auto binding =
 	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);

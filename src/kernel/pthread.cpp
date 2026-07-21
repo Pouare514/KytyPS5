@@ -965,6 +965,7 @@ public:
 	void   FreeDetachedThreads();
 	void   DumpSubmissionThreads(const char* reason);
 	void   DumpAllGuestThreads(const char* reason);
+	void   SnapshotGuestThread(int unique_id, uint32_t host_tid_hint, const char* reason);
 	size_t WakeSubmissionCondWaiters();
 	size_t SuspendAllGuests();
 	size_t ResumeAllGuests();
@@ -1852,14 +1853,219 @@ void PthreadPool::DumpAllGuestThreads(const char* reason) {
 	fprintf(stderr, "GuestExit: phase40 threadSnap done count=%u\n", n);
 }
 
+void PthreadPool::SnapshotGuestThread(int unique_id, uint32_t host_tid_hint, const char* reason) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const char* why = reason != nullptr ? reason : "cfg_post_rip";
+	PthreadPrivate* target = nullptr;
+	{
+		Common::LockGuard lock(m_mutex);
+		for (auto* p: m_threads) {
+			if (p == nullptr || p->free.load(std::memory_order_acquire) ||
+			    p->host_thread_id == 0) {
+				continue;
+			}
+			if (unique_id >= 0 && p->unique_id == unique_id) {
+				target = p;
+				break;
+			}
+			if (unique_id < 0 && host_tid_hint != 0 &&
+			    p->host_thread_id == static_cast<uint64_t>(host_tid_hint)) {
+				target = p;
+				break;
+			}
+		}
+		// Fallback: prefer MainThread by name, then any "main", never prefer tid=8 alone
+		// (TaskGraphThreadNP 0 is tid=8 on GTA/UE and was a false snapshot target).
+		if (target == nullptr) {
+			for (auto* p: m_threads) {
+				if (p == nullptr || p->free.load(std::memory_order_acquire) ||
+				    p->host_thread_id == 0) {
+					continue;
+				}
+				if (p->name == "MainThread") {
+					target = p;
+					break;
+				}
+			}
+		}
+		if (target == nullptr) {
+			for (auto* p: m_threads) {
+				if (p == nullptr || p->free.load(std::memory_order_acquire) ||
+				    p->host_thread_id == 0) {
+					continue;
+				}
+				if (p->name.find("Main") != std::string::npos ||
+				    p->name.find("main") != std::string::npos) {
+					target = p;
+					break;
+				}
+			}
+		}
+		if (target == nullptr) {
+			char line[192];
+			std::snprintf(line, sizeof(line),
+			              "SubmitTrace: cfg_post_rip miss reason=%s unique_id=%d host_tid=%u", why,
+			              unique_id, host_tid_hint);
+			Common::LogFatalToFile(line);
+			fprintf(stderr, "%s\n", line);
+			return;
+		}
+	}
+
+	const DWORD host_tid = static_cast<DWORD>(target->host_thread_id);
+	if (host_tid == GetCurrentThreadId()) {
+		char line[256];
+		std::snprintf(line, sizeof(line),
+		              "SubmitTrace: cfg_post_rip skip_self reason=%s name=%s tid=%d host_tid=%lu",
+		              why, target->name.c_str(), target->unique_id,
+		              static_cast<unsigned long>(host_tid));
+		Common::LogFatalToFile(line);
+		fprintf(stderr, "%s\n", line);
+		return;
+	}
+
+	HANDLE handle =
+	    OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
+	               host_tid);
+	if (handle == nullptr) {
+		char line[256];
+		std::snprintf(line, sizeof(line),
+		              "SubmitTrace: cfg_post_rip open_fail reason=%s name=%s tid=%d host_tid=%lu "
+		              "err=%lu",
+		              why, target->name.c_str(), target->unique_id,
+		              static_cast<unsigned long>(host_tid),
+		              static_cast<unsigned long>(GetLastError()));
+		Common::LogFatalToFile(line);
+		fprintf(stderr, "%s\n", line);
+		return;
+	}
+
+	if (SuspendThread(handle) == static_cast<DWORD>(-1)) {
+		char line[256];
+		std::snprintf(line, sizeof(line),
+		              "SubmitTrace: cfg_post_rip suspend_fail reason=%s name=%s tid=%d err=%lu",
+		              why, target->name.c_str(), target->unique_id,
+		              static_cast<unsigned long>(GetLastError()));
+		Common::LogFatalToFile(line);
+		fprintf(stderr, "%s\n", line);
+		CloseHandle(handle);
+		return;
+	}
+
+	CONTEXT ctx {};
+	ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+	const BOOL got = GetThreadContext(handle, &ctx);
+	uint64_t   stack_q[4] = {};
+	if (got != FALSE) {
+		MEMORY_BASIC_INFORMATION mbi {};
+		if (VirtualQuery(reinterpret_cast<const void*>(ctx.Rsp), &mbi, sizeof(mbi)) != 0 &&
+		    mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_NOACCESS) == 0) {
+			const auto* sp = reinterpret_cast<const uint64_t*>(ctx.Rsp);
+			for (int i = 0; i < 4; ++i) {
+				stack_q[i] = sp[i];
+			}
+		}
+	}
+
+	char module_name[MAX_PATH] = {};
+	uint64_t rva = 0;
+	const char* mod_base_name = "(none)";
+	if (got != FALSE) {
+		HMODULE owner = nullptr;
+		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+		                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                       reinterpret_cast<LPCSTR>(ctx.Rip), &owner) != 0 &&
+		    owner != nullptr) {
+			GetModuleFileNameA(owner, module_name, MAX_PATH);
+			rva = static_cast<uint64_t>(ctx.Rip) - reinterpret_cast<uint64_t>(owner);
+			mod_base_name = module_name;
+			const char* slash = std::strrchr(module_name, '\\');
+			if (slash != nullptr && slash[1] != '\0') {
+				mod_base_name = slash + 1;
+			}
+		} else {
+			mod_base_name = "(guest_or_anon)";
+		}
+	}
+
+	const char* cond_name =
+	    target->waiting_cond != nullptr ? target->waiting_cond->name.c_str() : "-";
+	char line[768];
+	if (got != FALSE) {
+		std::snprintf(line, sizeof(line),
+		              "SubmitTrace: cfg_post_rip reason=%s name=%s tid=%d host_tid=%lu "
+		              "almost_done=%d cond=%s rip=0x%016" PRIx64 " rsp=0x%016" PRIx64
+		              " rcx=0x%016" PRIx64 " rax=0x%016" PRIx64 " mod=%s rva=0x%016" PRIx64
+		              " stack0=0x%016" PRIx64 " stack1=0x%016" PRIx64 " stack2=0x%016" PRIx64
+		              " stack3=0x%016" PRIx64,
+		              why, target->name.c_str(), target->unique_id,
+		              static_cast<unsigned long>(host_tid), target->almost_done.load() ? 1 : 0,
+		              cond_name, static_cast<uint64_t>(ctx.Rip), static_cast<uint64_t>(ctx.Rsp),
+		              static_cast<uint64_t>(ctx.Rcx), static_cast<uint64_t>(ctx.Rax), mod_base_name,
+		              rva, stack_q[0], stack_q[1], stack_q[2], stack_q[3]);
+		// #region agent log
+		{
+			FILE* f = nullptr;
+#if defined(_MSC_VER)
+			if (fopen_s(&f, "c:\\codes\\KytyPS5-main\\debug-bacc56.log", "a") == 0 && f != nullptr)
+#else
+			if ((f = fopen("c:\\codes\\KytyPS5-main\\debug-bacc56.log", "a")) != nullptr)
+#endif
+			{
+				std::fprintf(f,
+				             "{\"sessionId\":\"bacc56\",\"hypothesisId\":\"E\",\"location\":"
+				             "\"pthread.cpp:cfg_post_rip\",\"message\":\"post-CFG Main RIP\","
+				             "\"data\":{\"reason\":\"%s\",\"name\":\"%s\",\"rip\":\"0x%016" PRIx64
+				             "\",\"rsp\":\"0x%016" PRIx64 "\",\"mod\":\"%s\",\"rva\":\"0x%016" PRIx64
+				             "\"},\"timestamp\":%llu}\n",
+				             why, target->name.c_str(), static_cast<uint64_t>(ctx.Rip),
+				             static_cast<uint64_t>(ctx.Rsp), mod_base_name, rva,
+				             static_cast<unsigned long long>(GetTickCount64()));
+				std::fclose(f);
+			}
+		}
+		// #endregion
+	} else {
+		std::snprintf(line, sizeof(line),
+		              "SubmitTrace: cfg_post_rip ctx_fail reason=%s name=%s tid=%d host_tid=%lu "
+		              "err=%lu cond=%s almost_done=%d",
+		              why, target->name.c_str(), target->unique_id,
+		              static_cast<unsigned long>(host_tid),
+		              static_cast<unsigned long>(GetLastError()), cond_name,
+		              target->almost_done.load() ? 1 : 0);
+	}
+	Common::LogFatalToFile(line);
+	fprintf(stderr, "%s\n", line);
+	std::fflush(stderr);
+
+	ResumeThread(handle);
+	CloseHandle(handle);
+#else
+	(void)unique_id;
+	(void)host_tid_hint;
+	(void)reason;
+#endif
+}
+
+void PthreadSnapshotGuestThread(int unique_id, uint32_t host_tid_hint, const char* reason) {
+	if (g_pthread_context == nullptr || g_pthread_context->GetPthreadPool() == nullptr) {
+		return;
+	}
+	g_pthread_context->GetPthreadPool()->SnapshotGuestThread(unique_id, host_tid_hint, reason);
+}
+
 // Phase 26: Mixed/Compute sit on an anonymous job-queue cond that is never signaled pre-submit.
 // Wake those waiters once when synthetic EOP / AGC user interrupt runs.
+// Also wake Main-related (incl. unique_id==8 / "VMem" on MCL) — otherwise queue_empty stall
+// kicks only Mixed/Compute (woken=0) while Main stays CondWait and submit_gpu freezes ~60–70.
 size_t PthreadPool::WakeSubmissionCondWaiters() {
 	Common::LockGuard lock(m_mutex);
 	size_t            woken = 0;
 	for (auto* p: m_threads) {
-		if (p == nullptr || p->free || !IsSubmissionRelatedName(p->name) ||
-		    p->waiting_cond == nullptr) {
+		if (p == nullptr || p->free || p->waiting_cond == nullptr) {
+			continue;
+		}
+		if (!IsSubmissionRelatedName(p->name) && !IsMainRelatedThread(p)) {
 			continue;
 		}
 		auto* cond = p->waiting_cond;
@@ -1871,9 +2077,12 @@ size_t PthreadPool::WakeSubmissionCondWaiters() {
 		if (notify) {
 			cond->cv.notify_all();
 			++woken;
-			LOGF("SubmitTrace: WakeSubmissionCond name=%s tid=%d cond_ptr=0x%016" PRIx64 "\n",
-			     p->name.c_str(), p->unique_id, reinterpret_cast<uint64_t>(cond));
-			fprintf(stderr, "SubmitTrace: WakeSubmissionCond name=%s\n", p->name.c_str());
+			LOGF("SubmitTrace: WakeSubmissionCond name=%s tid=%d role=%s cond_ptr=0x%016" PRIx64
+			     "\n",
+			     p->name.c_str(), p->unique_id, Phase54RoleOf(p),
+			     reinterpret_cast<uint64_t>(cond));
+			fprintf(stderr, "SubmitTrace: WakeSubmissionCond name=%s tid=%d role=%s\n",
+			        p->name.c_str(), p->unique_id, Phase54RoleOf(p));
 			Libs::VideoOut::Phase50NoteWake(p->name.c_str(), 1);
 		}
 	}
@@ -1943,6 +2152,19 @@ void PthreadDumpAllGuestThreads(const char* reason) {
 		return;
 	}
 	g_pthread_context->GetPthreadPool()->DumpAllGuestThreads(reason);
+}
+
+void PthreadFormatCurrentGuest(char* out, size_t out_size) {
+	if (out == nullptr || out_size == 0) {
+		return;
+	}
+	auto* self = g_pthread_self;
+	if (self == nullptr) {
+		std::snprintf(out, out_size, "name=- tid=- cond=-");
+		return;
+	}
+	std::snprintf(out, out_size, "name=%s tid=%d cond=%s", self->name.c_str(), self->unique_id,
+	              self->waiting_cond != nullptr ? self->waiting_cond->name.c_str() : "-");
 }
 
 size_t PthreadWakeSubmissionCondWaiters() {

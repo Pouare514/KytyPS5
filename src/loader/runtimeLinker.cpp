@@ -690,7 +690,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 								if (Loader::X64InstructionEmulator::TrySoftContinueCfgBitmap(
 								        info->native_context, fault_va)) {
 									std::snprintf(line, sizeof(line),
-									              "MemoryTrace: AV CFG-bitmap soft-continue "
+									              "MemoryTrace: AV CFG-bitmap handled "
 									              "rip=0x%016" PRIx64 " addr=0x%016" PRIx64
 									              " alloc=0x%016" PRIx64 " rcx=0x%016" PRIx64,
 									              info->exception_address, fault_va,
@@ -700,8 +700,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 									std::fprintf(stderr, "%s\n", line);
 									return true;
 								}
+								// Soft-continue failed: park THIS thread only. Never
+								// TerminateProcess(321) — that soft-idles the whole process and
+								// kills further GPU submits.
 								std::snprintf(line, sizeof(line),
-								              "MemoryTrace: AV CFG-bitmap soft-halt "
+								              "MemoryTrace: AV CFG-bitmap park-thread "
 								              "rip=0x%016" PRIx64 " addr=0x%016" PRIx64
 								              " alloc=0x%016" PRIx64 " rcx=0x%016" PRIx64,
 								              info->exception_address, fault_va,
@@ -709,7 +712,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 								              info->rcx);
 								Common::LogFatalToFile(line);
 								std::fprintf(stderr, "%s\n", line);
-								// Fall through to soft-halt 321.
+								Common::NoteHaltReason("cfg_bitmap_park_thread", line);
+								for (;;) {
+									Sleep(1000);
+								}
 							}
 							std::snprintf(line, sizeof(line),
 							              "MemoryTrace: AV system-dll non-host-stack "

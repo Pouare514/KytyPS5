@@ -410,7 +410,11 @@ static void SetDynamicParams(const RenderCommandBuffer& buffer, vk::CommandBuffe
 	for (uint32_t i = 0; i < dynamic_params.color_write_count; i++) {
 		enable[i] = (dynamic_params.color_write_enable[i] ? VK_TRUE : VK_FALSE);
 	}
-	VulkanCmdSetColorWriteEnableEXT(vk_buffer, dynamic_params.color_write_count, enable);
+	// Depth-only / no color attachments: dynamic ColorWriteEnable is not in the pipeline
+	// and VUID requires attachmentCount > 0.
+	if (dynamic_params.color_write_count > 0) {
+		VulkanCmdSetColorWriteEnableEXT(vk_buffer, dynamic_params.color_write_count, enable);
+	}
 }
 
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
