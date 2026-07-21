@@ -280,6 +280,9 @@ uint32_t* KYTY_SYSV_ABI GraphicsDcbSetFlip(CommandBuffer* buf, uint32_t video_ou
                                            int32_t display_buffer_index, uint32_t flip_mode,
                                            int64_t flip_arg);
 
+// PPSA21564: after Draw encodes geometry and CondWaits, finish DCB with SetFlip+Submit.
+void TrySoftHleOrganicGuestFlipAfterDrawWait();
+
 } // namespace Gen5
 
 namespace Gen5Driver {

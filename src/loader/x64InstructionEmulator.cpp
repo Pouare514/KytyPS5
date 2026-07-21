@@ -780,8 +780,7 @@ bool TrySoftContinueCfgBitmap(void* native_context, uint64_t fault_vaddr) {
 	static std::atomic<uint32_t> cfg_n {0};
 	const uint32_t               n = cfg_n.fetch_add(1, std::memory_order_relaxed) + 1;
 
-	const bool producer_critical = Libs::LibKernel::PthreadCurrentIsMainRelated() ||
-	                               Libs::LibKernel::PthreadCurrentIsSubmissionRelated();
+	const bool producer_critical = Libs::LibKernel::PthreadCurrentIsProducerPipeline();
 
 	// Exp C: non-critical walker (e.g. MCL Rendering Pool) — park in-handler (Sleep loop).
 	// Redirecting RIP to KytyParkThreadForever still re-entered CFG thousands of times.
@@ -840,8 +839,23 @@ bool TrySoftContinueCfgBitmap(void* native_context, uint64_t fault_vaddr) {
 	// E9→C3 mid-WalkerFunc REJECTED (AV Execute[0], rbp=CFG target, halt 321).
 	// Next: RtlVirtualUnwind exactly 2 frames (Validate + WalkerFunc) with host-only
 	// landing; if unsafe, park this thread (no 321) rather than spin/crash.
+	// PPSA21564 Draw*/Havok: skip unwind-2frame (corrupts guest mid-DCB build) → AllowAll.
 	const bool producer_walker = !will_invoke && producer_critical;
-	if (producer_walker) {
+	const bool main_producer   = producer_walker && Libs::LibKernel::PthreadCurrentIsMainRelated();
+	if (producer_walker && !main_producer) {
+		static std::atomic<uint32_t> pipe_n {0};
+		const uint32_t               pn = pipe_n.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (pn <= 16 || (pn % 64u) == 0u) {
+			char line[280];
+			std::snprintf(line, sizeof(line),
+			              "MemoryTrace: CFG-bitmap soft-continue n=%u mode=pipeline-AllowAll "
+			              "pn=%u (skip unwind mid-DCB)",
+			              n, pn);
+			Common::LogFatalToFile(line);
+			std::fprintf(stderr, "%s\n", line);
+		}
+		// Fall through to AllowAll / fake-ret below.
+	} else if (main_producer) {
 		static std::atomic<uint32_t> producer_walker_n {0};
 		const uint32_t               pwn =
 		    producer_walker_n.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -976,33 +990,46 @@ bool TrySoftContinueCfgBitmap(void* native_context, uint64_t fault_vaddr) {
 			}
 		}
 
-		// Unsafe landing: park Main (process stays up; avoids Execute[0]/321).
-		// #region agent log
-		{
-			char dj[256];
-			std::snprintf(dj, sizeof(dj),
-			              "{\"mode\":\"park-producer\",\"pwn\":%u,\"ok_frames\":%d,"
-			              "\"runId\":\"post-fix\"}",
-			              pwn, ok_frames ? 1 : 0);
-			AgentDbgLog("G", "x64InstructionEmulator.cpp:park-producer",
-			            "producer park after unsafe unwind2", dj);
+		// Unsafe landing: park Main only (process stays up; avoids Execute[0]/321).
+		// PPSA21564 Draw*/Havok/Gfx must NOT park — fall through to AllowAll reenter so
+		// the render pipeline can still reach GraphicsDcbSetFlip / SubmitFlip.
+		if (Libs::LibKernel::PthreadCurrentIsMainRelated()) {
+			// #region agent log
+			{
+				char dj[256];
+				std::snprintf(dj, sizeof(dj),
+				              "{\"mode\":\"park-producer\",\"pwn\":%u,\"ok_frames\":%d,"
+				              "\"runId\":\"post-fix\"}",
+				              pwn, ok_frames ? 1 : 0);
+				AgentDbgLog("G", "x64InstructionEmulator.cpp:park-producer",
+				            "producer park after unsafe unwind2", dj);
+			}
+			// #endregion
+			{
+				char line[320];
+				std::snprintf(line, sizeof(line),
+				              "MemoryTrace: CFG-bitmap soft-continue n=%u mode=park-producer "
+				              "pwn=%u fault=0x%016" PRIx64 " target=0x%016" PRIx64
+				              " ret=0x%016" PRIx64 " ret_bytes=%02x%02x%02x%02x%02x%02x%02x%02x",
+				              n, pwn, fault_vaddr, call_target, stacked_ret, ret_code[0], ret_code[1],
+				              ret_code[2], ret_code[3], ret_code[4], ret_code[5], ret_code[6],
+				              ret_code[7]);
+				Common::LogFatalToFile(line);
+				std::fprintf(stderr, "%s\n", line);
+				std::fflush(stderr);
+			}
+			for (;;) {
+				Sleep(1000);
+			}
 		}
-		// #endregion
 		{
-			char line[320];
+			char line[280];
 			std::snprintf(line, sizeof(line),
-			              "MemoryTrace: CFG-bitmap soft-continue n=%u mode=park-producer "
-			              "pwn=%u fault=0x%016" PRIx64 " target=0x%016" PRIx64
-			              " ret=0x%016" PRIx64 " ret_bytes=%02x%02x%02x%02x%02x%02x%02x%02x",
-			              n, pwn, fault_vaddr, call_target, stacked_ret, ret_code[0], ret_code[1],
-			              ret_code[2], ret_code[3], ret_code[4], ret_code[5], ret_code[6],
-			              ret_code[7]);
+			              "MemoryTrace: CFG-bitmap soft-continue n=%u mode=pipeline-AllowAll "
+			              "pwn=%u (Draw/Havok skip park-producer)",
+			              n, pwn);
 			Common::LogFatalToFile(line);
 			std::fprintf(stderr, "%s\n", line);
-			std::fflush(stderr);
-		}
-		for (;;) {
-			Sleep(1000);
 		}
 	}
 

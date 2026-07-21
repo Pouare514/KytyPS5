@@ -61,9 +61,6 @@ void Phase50NoteWake(const char* name, size_t woken);
 void Phase50NoteNdJobBatch(int index, int total, uint64_t ident, int filter, uint64_t data);
 void Phase50NoteSubmitGpu(int handle, int index, uint64_t request_id, uint64_t submit_gpu_total);
 bool Phase50ObjNonZeroSeen();
-// PPSA21564: Main loops KernelWaitSema(hkSemaphore) after Reg2 without ever calling
-// VideoOutSubmitFlip. Soft-HLE from that wait path (producer thread) — not host flip inject.
-void TrySoftHleGuestSubmitFromMainSemaWait();
 uint64_t FlipStatsSubmitCpu();
 uint64_t FlipStatsSubmitGpu();
 uint64_t FlipStatsPresented();

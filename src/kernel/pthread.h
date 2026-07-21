@@ -93,6 +93,8 @@ Pthread               PthreadSelfOrNull();
 Pthread               PthreadSwapSelfForSignal(Pthread thread);
 [[nodiscard]] bool    PthreadCurrentIsSubmissionRelated();
 [[nodiscard]] bool    PthreadCurrentIsMainRelated();
+// Draw*/Havok/Gfx/Render (+ Mixed/Compute) — must not CFG selective-park (PPSA21564).
+[[nodiscard]] bool    PthreadCurrentIsProducerPipeline();
 // Phase 65: MainThread / unique_id==8 still present (not almost_done/free).
 [[nodiscard]] bool    PthreadMainThreadAlive();
 void                  PthreadDumpSubmissionThreads(const char* reason);

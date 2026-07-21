@@ -55,6 +55,7 @@ public:
 	// Like Signal but never returns InvalCount when already at max — still wakes waiters.
 	// Used by host soft-HLE when Draw/Havok semas sit at max with no forward progress.
 	Result ForceSignal(int signal_count);
+	Result SignalIfWaiting(int signal_count);
 	Result Wait(int need_count, uint32_t* ptr_micros);
 
 	Result Poll(int need_count) {
@@ -174,7 +175,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
 	return Result::Ok;
 }
 
-KernelSemaPrivate::Result KernelSemaPrivate::ForceSignal(int signal_count) {
+	KernelSemaPrivate::Result KernelSemaPrivate::ForceSignal(int signal_count) {
 	Common::LockGuard lock(m_mutex);
 
 	if (m_status == Status::Deleted) {
@@ -182,6 +183,35 @@ KernelSemaPrivate::Result KernelSemaPrivate::ForceSignal(int signal_count) {
 	}
 	if (signal_count < 1) {
 		return Result::InvalCount;
+	}
+
+	if (m_count < m_max_count) {
+		const int room = m_max_count - m_count;
+		m_count += (signal_count < room) ? signal_count : room;
+	}
+	WakeWaiters();
+	m_cond_var.SignalAll();
+	return Result::Ok;
+}
+
+// Host wake helper: only raise count when a thread is actually waiting. Raising
+// RenderContextDrawSema / max=1 hkSemaphore while idle leaves count at ceiling and
+// the next guest Signal hits InvalCount → engine ASSERT Semaphore.cpp:86 (DrawThread).
+KernelSemaPrivate::Result KernelSemaPrivate::SignalIfWaiting(int signal_count) {
+	Common::LockGuard lock(m_mutex);
+
+	if (m_status == Status::Deleted) {
+		return Result::Deleted;
+	}
+	if (signal_count < 1) {
+		return Result::InvalCount;
+	}
+
+	const bool any_waiter = std::any_of(
+	    m_waiting_threads.begin(), m_waiting_threads.end(),
+	    [](const WaitingThread* w) { return w != nullptr && !w->ready; });
+	if (!any_waiter) {
+		return Result::Ok;
 	}
 
 	if (m_count < m_max_count) {
@@ -346,7 +376,6 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 		if (sem->GetName() == "hkSemaphore" && PthreadCurrentIsMainRelated()) {
 			g_main_hk_wait_ptr.store(reinterpret_cast<uintptr_t>(sem),
 			                         std::memory_order_release);
-			Libs::VideoOut::TrySoftHleGuestSubmitFromMainSemaWait();
 		}
 		static std::atomic<uint32_t> logs {0};
 		const auto                   n = logs.fetch_add(1, std::memory_order_relaxed);
@@ -376,7 +405,39 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 		}
 	}
 
-	auto result = sem->Wait(need, time);
+	// PPSA21564: after Reg2, Main infinite-waits hkSemaphore while Draw is starved.
+	// Cap wait with a short timeout (do NOT ForceSignal — that fills max=1 semas and
+	// triggers engine ASSERT Semaphore.cpp:86 on the next guest Signal). Soft-OK on
+	// timeout so Main can progress toward organic SetFlip/SubmitFlip.
+	KernelUseconds  soft_timo  = 100;
+	KernelUseconds* wait_time  = time;
+	bool            soft_yield = false;
+	if (sem->GetName() == "hkSemaphore" && PthreadCurrentIsMainRelated() &&
+	    Libs::VideoOut::FlipStatsRegisterBuffers() > 0 &&
+	    Libs::VideoOut::FlipStatsSubmitCpu() == 0 &&
+	    Libs::VideoOut::FlipStatsSubmitGpu() == 0 && time == nullptr) {
+		soft_yield = true;
+		wait_time  = &soft_timo;
+	}
+
+	auto result = sem->Wait(need, wait_time);
+
+	if (soft_yield && result != KernelSemaPrivate::Result::Ok) {
+		static std::atomic<uint32_t> yield_n {0};
+		const uint32_t               yn = yield_n.fetch_add(1, std::memory_order_relaxed) + 1;
+		result = KernelSemaPrivate::Result::Ok;
+		if (yn <= 32 || (yn % 64u) == 0u) {
+			char line[160];
+			std::snprintf(line, sizeof(line),
+			              "SubmitTrace: soft_hle MainHkWaitYield n=%u ptr=%p "
+			              "(jobs_never_enqueued gate)",
+			              yn, static_cast<void*>(sem));
+			Common::EmergencyLogRaw(line);
+			Common::LogFatalToFile(line);
+			fprintf(stderr, "%s\n", line);
+		}
+		(void)Libs::LibKernel::PthreadWakeSubmissionCondWaitersUnlimited();
+	}
 
 	int ret = OK;
 
@@ -466,6 +527,28 @@ int KYTY_SYSV_ABI KernelSignalSema(KernelSema sem, int count) {
 	}
 
 	auto result = sem->Signal(count);
+
+	// PPSA21564 / Asobi Conc::Semaphore: Signal past max returns EINVAL and the engine
+	// ASSERTs (Semaphore.cpp:86) — seen on DrawThread after host ForceSignal filled
+	// RenderContextDrawSema (max=1). Treat ceiling as idempotent success.
+	if (result == KernelSemaPrivate::Result::InvalCount) {
+		const auto& n = sem->GetName();
+		if (n == "RenderContextDrawSema" || n == "hkSemaphore") {
+			static std::atomic<uint32_t> ceil_n {0};
+			const uint32_t               cn = ceil_n.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (cn <= 16 || (cn % 64u) == 0u) {
+				char line[160];
+				std::snprintf(line, sizeof(line),
+				              "SubmitTrace: soft_hle SemaSignalCeiling n=%u sem=%s "
+				              "(idempotent at max)",
+				              cn, n.c_str());
+				Common::EmergencyLogRaw(line);
+				Common::LogFatalToFile(line);
+				fprintf(stderr, "%s\n", line);
+			}
+			result = KernelSemaPrivate::Result::Ok;
+		}
+	}
 
 	int ret = OK;
 
@@ -558,7 +641,8 @@ size_t SignalMainHkSemaphore(int count) {
 		return 0;
 	}
 	auto* sem = reinterpret_cast<KernelSema>(main_wait);
-	if (sem->ForceSignal(count) != KernelSemaPrivate::Result::Ok) {
+	// Only raise count while Main is waiting — never park idle max=1 instances at ceiling.
+	if (sem->SignalIfWaiting(count) != KernelSemaPrivate::Result::Ok) {
 		return 0;
 	}
 	g_main_hk_host_signal_hits.fetch_add(1, std::memory_order_relaxed);

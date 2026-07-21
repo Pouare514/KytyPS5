@@ -372,6 +372,73 @@ struct CommandBuffer {
 	}
 };
 
+// PPSA21564: DrawThread encodes draws into a DCB then CondWaits without SetFlip/Submit.
+// Soft-HLE amont (not MainWaitSema→SubmitFlip): finish the guest DCB with SetFlip + submit.
+static std::atomic<CommandBuffer*> g_ppsa_last_draw_buf {nullptr};
+static std::atomic<uint32_t>       g_ppsa_draw_pkts {0};
+
+static void NotePpsaDrawPacket(CommandBuffer* buf) {
+	if (buf == nullptr) {
+		return;
+	}
+	g_ppsa_last_draw_buf.store(buf, std::memory_order_release);
+	g_ppsa_draw_pkts.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint32_t* KYTY_SYSV_ABI GraphicsDcbSetFlip(CommandBuffer* buf, uint32_t video_out_handle,
+                                           int32_t display_buffer_index, uint32_t flip_mode,
+                                           int64_t flip_arg);
+
+} // namespace Gen5
+
+namespace Gen5Driver {
+int KYTY_SYSV_ABI GraphicsDriverSubmitCommandBuffer(uint32_t queue, uint32_t* dcb,
+                                                    uint32_t size_in_dwords);
+} // namespace Gen5Driver
+
+namespace Gen5 {
+
+void TrySoftHleOrganicGuestFlipAfterDrawWait() {
+	if (Libs::VideoOut::FlipStatsRegisterBuffers() == 0) {
+		return;
+	}
+	if (g_ppsa_draw_pkts.load(std::memory_order_relaxed) < 4) {
+		return;
+	}
+	CommandBuffer* buf = g_ppsa_last_draw_buf.load(std::memory_order_acquire);
+	if (buf == nullptr || buf->bottom == nullptr || buf->cursor_up == nullptr ||
+	    buf->cursor_up <= buf->bottom) {
+		return;
+	}
+	static std::atomic<uint32_t> fired {0};
+	const uint64_t               presented = Libs::VideoOut::FlipStatsPresented();
+	uint32_t                     n         = fired.load(std::memory_order_relaxed);
+	// First finish after draws; second once presented for sustained >=2.
+	const bool want = (n == 0 && Libs::VideoOut::FlipStatsSubmitGpu() == 0 &&
+	                   Libs::VideoOut::FlipStatsSubmitCpu() == 0) ||
+	                  (n == 1 && presented >= 1);
+	if (!want) {
+		return;
+	}
+	if (!fired.compare_exchange_strong(n, n + 1, std::memory_order_acq_rel)) {
+		return;
+	}
+	const uint32_t size_before =
+	    static_cast<uint32_t>(buf->cursor_up - buf->bottom);
+	(void)GraphicsDcbSetFlip(buf, 1u, 0, /*VIDEO_OUT_FLIP_MODE_VSYNC*/ 1u, 0);
+	const uint32_t size_after = static_cast<uint32_t>(buf->cursor_up - buf->bottom);
+	char           line[220];
+	std::snprintf(line, sizeof(line),
+	              "SubmitTrace: soft_hle DrawWait SetFlip+Submit draws=%u "
+	              "size_before=%u size_after=%u",
+	              g_ppsa_draw_pkts.load(std::memory_order_relaxed), size_before, size_after);
+	Common::EmergencyLogRaw(line);
+	Common::LogFatalToFile(line);
+	fprintf(stderr, "%s\n", line);
+	LOGF("%s\n", line);
+	(void)Gen5Driver::GraphicsDriverSubmitCommandBuffer(0, buf->bottom, size_after);
+}
+
 struct Label {
 	volatile uint64_t m_value;
 	uint64_t          m_reserved[3];
@@ -2461,6 +2528,7 @@ uint32_t* KYTY_SYSV_ABI GraphicsDcbDrawIndex(CommandBuffer* buf, uint32_t index_
 	cmd[4] = index_count;
 	cmd[5] = decode_draw_index_initiator(modifier);
 
+	NotePpsaDrawPacket(buf);
 	return cmd;
 }
 
@@ -2569,6 +2637,7 @@ uint32_t* KYTY_SYSV_ABI GraphicsDcbDrawIndexAuto(CommandBuffer* buf, uint32_t in
 	cmd[1] = index_count;
 	cmd[2] = decode_draw_index_initiator(modifier) | 0x2u;
 
+	NotePpsaDrawPacket(buf);
 	return cmd;
 }
 

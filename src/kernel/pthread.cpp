@@ -12,6 +12,7 @@
 #include "common/timer.h"
 #include "graphics/presentation/videoOut.h"
 #include "kernel/memory.h"
+#include "libs/agc.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/runtimeLinker.h"
@@ -743,6 +744,24 @@ static uint64_t Phase54NoteCondSignal(PthreadCondPrivate* cond, PthreadPrivate* 
 		Libs::VideoOut::Phase64NoteMainCondSignal(reinterpret_cast<uint64_t>(cond), false);
 	}
 	if (!log_it) {
+		// Still soft-wake Draw pipeline when Main broadcasts an empty cond post-Reg2.
+		if (from_main && !notify && Libs::VideoOut::FlipStatsRegisterBuffers() > 0 &&
+		    Libs::VideoOut::FlipStatsSubmitCpu() == 0 &&
+		    Libs::VideoOut::FlipStatsSubmitGpu() == 0) {
+			static std::atomic<uint32_t> empty_bc {0};
+			const uint32_t               en = empty_bc.fetch_add(1, std::memory_order_relaxed) + 1;
+			if ((en % 32u) == 0u && en <= 4096u) {
+				const auto woken =
+				    Libs::LibKernel::PthreadWakeSubmissionCondWaitersUnlimited();
+				if (en <= 64 || (en % 256u) == 0u) {
+					LOGF("SubmitTrace: Main empty cond_broadcast → Draw wake n=%u woken=%zu\n",
+					     en, woken);
+					fprintf(stderr,
+					        "SubmitTrace: Main empty cond_broadcast → Draw wake n=%u woken=%zu\n",
+					        en, woken);
+				}
+			}
+		}
 		return cycle;
 	}
 	static std::atomic<uint32_t> logs {0};
@@ -770,6 +789,11 @@ static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
 
 	thread->waiting_cond = cond;
 	cond->waiters.push_back(thread);
+
+	// PPSA21564: Draw* CondWaits after encoding draws without SetFlip/Submit.
+	if (IsProducerPipelineName(thread->name)) {
+		Libs::Graphics::Gen5::TrySoftHleOrganicGuestFlipAfterDrawWait();
+	}
 
 	const bool main_related = IsMainRelatedThread(thread);
 	if (IsSubmissionRelatedName(thread->name) || main_related) {
@@ -2115,6 +2139,17 @@ bool PthreadCurrentIsMainRelated() {
 	return self->unique_id == 8 || self->name == "MainThread" ||
 	       self->name.find("Main") != std::string::npos ||
 	       self->name.find("BootCards") != std::string::npos;
+}
+
+bool PthreadCurrentIsProducerPipeline() {
+	auto* self = g_pthread_self;
+	if (self == nullptr) {
+		return false;
+	}
+	if (IsMainRelatedThread(self)) {
+		return true;
+	}
+	return IsProducerPipelineName(self->name);
 }
 
 bool PthreadMainThreadAlive() {
