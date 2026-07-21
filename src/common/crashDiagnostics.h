@@ -3,6 +3,10 @@
 
 namespace Common {
 
+// If argv is `--kyty-exit-watch <parentPid> <outPath>`, wait for parent and write exit code.
+// Returns true when this process WAS the watcher (caller must return from main immediately).
+bool RunExitWatcherIfRequested(int argc, char** argv);
+
 // Installs runtime hooks that log /GS security failures and fatal failfast before process death.
 void InstallCrashDiagnostics();
 

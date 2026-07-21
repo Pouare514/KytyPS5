@@ -229,6 +229,9 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 int main(int argc, char* argv[]) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (Common::RunExitWatcherIfRequested(argc, argv)) {
+		return 0;
+	}
 	Common::InstallCrashDiagnostics();
 	Common::DisableKnownVulkanLayers();
 #endif

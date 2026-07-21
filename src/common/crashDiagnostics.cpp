@@ -5,12 +5,18 @@
 #include "common/threads.h"
 
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <thread>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
+#include <intrin.h>
+#include <psapi.h>
 #endif
 
 namespace Common {
@@ -44,6 +50,103 @@ void CopyCapped(char* dst, size_t dst_size, const char* src) {
 }
 
 } // namespace
+
+bool RunExitWatcherIfRequested(int argc, char** argv) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc < 4 || argv == nullptr || argv[1] == nullptr) {
+		return false;
+	}
+	if (std::strcmp(argv[1], "--kyty-exit-watch") != 0) {
+		return false;
+	}
+	const DWORD parent_pid = static_cast<DWORD>(std::strtoul(argv[2], nullptr, 10));
+	const char* out_path   = argv[3];
+	if (parent_pid == 0 || out_path == nullptr || out_path[0] == '\0') {
+		return true;
+	}
+	HANDLE parent = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parent_pid);
+	if (parent == nullptr) {
+		HANDLE file = CreateFileA(out_path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+		                          FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file != INVALID_HANDLE_VALUE) {
+			char line[128];
+			std::snprintf(line, sizeof(line),
+			              "watch_open_failed parent=%lu gle=%lu\r\n",
+			              static_cast<unsigned long>(parent_pid),
+			              static_cast<unsigned long>(GetLastError()));
+			DWORD written = 0;
+			WriteFile(file, line, static_cast<DWORD>(std::strlen(line)), &written, nullptr);
+			CloseHandle(file);
+		}
+		return true;
+	}
+	WaitForSingleObject(parent, INFINITE);
+	DWORD code = 0;
+	if (GetExitCodeProcess(parent, &code) == 0) {
+		code = 0xFFFFFFFFu;
+	}
+	CloseHandle(parent);
+	HANDLE file = CreateFileA(out_path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+	                          FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file != INVALID_HANDLE_VALUE) {
+		char line[256];
+		std::snprintf(line, sizeof(line),
+		              "parent_pid=%lu\r\nexit_code=0x%08lX\r\nexit_code_dec=%lu\r\n",
+		              static_cast<unsigned long>(parent_pid), static_cast<unsigned long>(code),
+		              static_cast<unsigned long>(code));
+		DWORD written = 0;
+		WriteFile(file, line, static_cast<DWORD>(std::strlen(line)), &written, nullptr);
+		FlushFileBuffers(file);
+		CloseHandle(file);
+	}
+	return true;
+#else
+	(void)argc;
+	(void)argv;
+	return false;
+#endif
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static void SpawnExitWatcher() {
+	char module_path[MAX_PATH] {};
+	if (GetModuleFileNameA(nullptr, module_path, MAX_PATH) == 0) {
+		return;
+	}
+	char out_path[MAX_PATH] {};
+	std::snprintf(out_path, sizeof(out_path), "%s", module_path);
+	char* slash = std::strrchr(out_path, '\\');
+	if (slash != nullptr) {
+		std::snprintf(slash + 1, sizeof(out_path) - static_cast<size_t>(slash + 1 - out_path),
+		              "_kyty_exit_code.txt");
+	} else {
+		std::snprintf(out_path, sizeof(out_path), "_kyty_exit_code.txt");
+	}
+	DeleteFileA(out_path);
+
+	char cmd[1024];
+	std::snprintf(cmd, sizeof(cmd), "\"%s\" --kyty-exit-watch %lu \"%s\"", module_path,
+	              static_cast<unsigned long>(GetCurrentProcessId()), out_path);
+
+	STARTUPINFOA si {};
+	si.cb = sizeof(si);
+	PROCESS_INFORMATION pi {};
+	if (CreateProcessA(module_path, cmd, nullptr, nullptr, FALSE,
+	                   CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi) != 0) {
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+		char message[320];
+		std::snprintf(message, sizeof(message), "CrashTrace: exit watcher spawned out=%s",
+		              out_path);
+		EmergencyLogRaw(message);
+	} else {
+		char message[160];
+		std::snprintf(message, sizeof(message), "CrashTrace: exit watcher spawn FAILED gle=%lu",
+		              static_cast<unsigned long>(GetLastError()));
+		EmergencyLogRaw(message);
+	}
+}
+#endif
 
 void EnableGuestAccessViolationLogging(bool enable) {
 	g_log_guest_av.store(enable, std::memory_order_release);
@@ -86,8 +189,10 @@ void FlushHleRingToFatal(const char* reason) {
 using SecerrHandlerFunc    = void(__cdecl*)(int, void*);
 using SetSecerrHandlerFunc = SecerrHandlerFunc(__cdecl*)(SecerrHandlerFunc);
 
-static void SecurityFailureHandler(int code, void* return_address) {
+[[maybe_unused]] static void SecurityFailureHandler(int code, void* return_address) {
+	// /GS and __fastfail(STACK_COOKIE) do NOT invoke VEH — this handler is the only breadcrumb.
 	char module_name[MAX_PATH] = {};
+	uint64_t rva = 0;
 	if (return_address != nullptr) {
 		HMODULE owner_module = nullptr;
 		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -95,15 +200,20 @@ static void SecurityFailureHandler(int code, void* return_address) {
 		                       static_cast<LPCSTR>(return_address), &owner_module) != 0 &&
 		    owner_module != nullptr) {
 			(void)GetModuleFileNameA(owner_module, module_name, MAX_PATH);
+			rva = reinterpret_cast<uint64_t>(return_address) -
+			      reinterpret_cast<uint64_t>(owner_module);
 		}
 	}
 
-	char message[512];
+	char message[640];
 	std::snprintf(message, sizeof(message),
-	              "Security failure: code=%d, retaddr=%p, module=%s", code, return_address,
+	              "SecurityFailure(/GS|fastfail): code=%d ret=%p rva=0x%016" PRIx64
+	              " tid=%lu module=%s",
+	              code, return_address, rva, static_cast<unsigned long>(GetCurrentThreadId()),
 	              module_name[0] != '\0' ? module_name : "(unknown)");
-	LogFatalToFile(message);
+	EmergencyLogRaw(message);
 	FlushHleRingToFatal("security_failure");
+	FlushFileBuffers(GetStdHandle(STD_ERROR_HANDLE));
 }
 
 static LONG CALLBACK FatalFailfastVectoredHandler(PEXCEPTION_POINTERS exception) {
@@ -111,15 +221,42 @@ static LONG CALLBACK FatalFailfastVectoredHandler(PEXCEPTION_POINTERS exception)
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 	const auto code = static_cast<uint32_t>(exception->ExceptionRecord->ExceptionCode);
-	// ACCESS_VIOLATION / any exception after pending0 — log then continue search.
+	auto*      ctx  = exception->ContextRecord;
+	const auto rip  = ctx != nullptr ? ctx->Rip : 0ull;
+	const auto rsp  = ctx != nullptr ? ctx->Rsp : 0ull;
+	const auto addr =
+	    exception->ExceptionRecord->NumberParameters > 1
+	        ? exception->ExceptionRecord->ExceptionInformation[1]
+	        : 0ull;
+
+	// Always breadcrumb hard faults (even when guest-AV logging is off) — silent deaths
+	// were leaving only UserShadowStack in _kyty_fatal.txt.
+	const bool interesting =
+	    code == 0xC0000005u || // ACCESS_VIOLATION
+	    code == 0xC000001Du || // ILLEGAL_INSTRUCTION
+	    code == 0xC0000096u || // PRIVILEGED_INSTRUCTION
+	    code == 0xC00000FDu || // STACK_OVERFLOW
+	    code == 0xC0000409u || // STACK_BUFFER_OVERRUN
+	    code == 0xC0000374u || // HEAP_CORRUPTION
+	    code == 0xC0000094u || // INTEGER_DIVIDE_BY_ZERO
+	    code == 0x80000003u || // BREAKPOINT (often from bad runtime patches)
+	    code == 0xC00002B4u || // FLOAT_MULTIPLE_FAULTS / related
+	    code == 0xC00002B5u;
+	if (interesting) {
+		static std::atomic<uint32_t> hard_logs {0};
+		if (hard_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+			char message[384];
+			std::snprintf(message, sizeof(message),
+			              "CrashVEH: code=0x%08" PRIx32 " rip=0x%016" PRIx64 " rsp=0x%016" PRIx64
+			              " addr=0x%016" PRIx64 " tid=%u",
+			              code, rip, rsp, static_cast<uint64_t>(addr),
+			              GetCurrentThreadId());
+			EmergencyLogRaw(message);
+		}
+	}
+
 	if (g_log_guest_av.load(std::memory_order_acquire) &&
 	    g_guest_av_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
-		auto* ctx = exception->ContextRecord;
-		const auto rip = ctx != nullptr ? ctx->Rip : 0ull;
-		const auto addr =
-		    exception->ExceptionRecord->NumberParameters > 1
-		        ? exception->ExceptionRecord->ExceptionInformation[1]
-		        : 0ull;
 		char message[384];
 		std::snprintf(message, sizeof(message),
 		              "GuestExc VEH: code=0x%08" PRIx32 " rip=0x%016" PRIx64
@@ -141,9 +278,7 @@ static LONG CALLBACK FatalFailfastVectoredHandler(PEXCEPTION_POINTERS exception)
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
-	auto* ctx = exception->ContextRecord;
 	char  module_name[MAX_PATH] = {};
-	const auto rip = ctx != nullptr ? ctx->Rip : 0ull;
 	HMODULE    owner_module = nullptr;
 	if (rip != 0 &&
 	    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -187,6 +322,681 @@ static LONG CALLBACK FatalFailfastVectoredHandler(PEXCEPTION_POINTERS exception)
 
 #endif
 
+static LONG WINAPI UnhandledFilter(EXCEPTION_POINTERS* info) {
+	if (info != nullptr && info->ExceptionRecord != nullptr) {
+		char message[256];
+		const auto* ctx = info->ContextRecord;
+		std::snprintf(message, sizeof(message),
+		              "UnhandledExceptionFilter: code=0x%08" PRIx32 " rip=0x%016" PRIx64
+		              " tid=%u",
+		              static_cast<uint32_t>(info->ExceptionRecord->ExceptionCode),
+		              ctx != nullptr ? ctx->Rip : 0ull, GetCurrentThreadId());
+		EmergencyLogRaw(message);
+		FlushHleRingToFatal("unhandled_filter");
+	} else {
+		EmergencyLogRaw("UnhandledExceptionFilter: (null info)");
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static BOOL WINAPI ConsoleCtrlFilter(DWORD ctrl) {
+	char message[96];
+	std::snprintf(message, sizeof(message), "ConsoleCtrl: type=%" PRIu32, ctrl);
+	EmergencyLogRaw(message);
+	return FALSE;
+}
+
+static void AtexitBreadcrumb() {
+	EmergencyLogRaw("atexit: process exiting");
+}
+
+static void TerminateBreadcrumb() {
+	EmergencyLogRaw("std::terminate called");
+	std::abort();
+}
+
+using ExitProcessFn         = void(WINAPI*)(UINT);
+using TerminateProcessFn    = BOOL(WINAPI*)(HANDLE, UINT);
+using NtTerminateProcessFn  = LONG(NTAPI*)(HANDLE, LONG);
+using RtlExitUserProcessFn  = void(NTAPI*)(ULONG);
+
+static ExitProcessFn        g_real_exit_process         = nullptr;
+static TerminateProcessFn   g_real_terminate_process    = nullptr;
+static NtTerminateProcessFn g_real_nt_terminate_process = nullptr;
+static RtlExitUserProcessFn g_real_rtl_exit_user_process = nullptr;
+static std::atomic<uint32_t> g_exit_hook_logs {0};
+
+// Executable trampoline: stolen prologue + jmp back into ntdll.
+alignas(16) static uint8_t g_nt_term_tramp[64] {};
+alignas(16) static uint8_t g_rtl_exit_tramp[64] {};
+
+static bool WriteAbsJmp(void* from, const void* to) {
+	auto* p = static_cast<uint8_t*>(from);
+	// mov rax, imm64 ; jmp rax
+	p[0] = 0x48;
+	p[1] = 0xB8;
+	const auto imm = reinterpret_cast<uint64_t>(to);
+	std::memcpy(p + 2, &imm, sizeof(imm));
+	p[10] = 0xFF;
+	p[11] = 0xE0;
+	return true;
+}
+
+static bool InstallInlineHook(void* target, void* hook, void* trampoline, size_t tramp_size,
+                              void** original_out, size_t stolen = 16) {
+	// Abs jmp is 12 bytes; stolen must be a complete-instruction boundary >= 12.
+	if (target == nullptr || hook == nullptr || trampoline == nullptr || tramp_size < 48 ||
+	    stolen < 12 || stolen > 32) {
+		return false;
+	}
+	DWORD old_prot = 0;
+	if (VirtualProtect(target, stolen, PAGE_EXECUTE_READWRITE, &old_prot) == 0) {
+		return false;
+	}
+	std::memcpy(trampoline, target, stolen);
+	WriteAbsJmp(static_cast<uint8_t*>(trampoline) + stolen,
+	            static_cast<uint8_t*>(target) + stolen);
+	DWORD tramp_prot = 0;
+	VirtualProtect(trampoline, tramp_size, PAGE_EXECUTE_READWRITE, &tramp_prot);
+	FlushInstructionCache(GetCurrentProcess(), trampoline, tramp_size);
+
+	WriteAbsJmp(target, hook);
+	// NOP-pad remaining stolen bytes past the 12-byte abs jmp.
+	auto* t = static_cast<uint8_t*>(target);
+	for (size_t i = 12; i < stolen; ++i) {
+		t[i] = 0x90;
+	}
+	FlushInstructionCache(GetCurrentProcess(), target, stolen);
+	DWORD ignored = 0;
+	VirtualProtect(target, stolen, old_prot, &ignored);
+	if (original_out != nullptr) {
+		*original_out = trampoline;
+	}
+	return true;
+}
+
+// ucrt/vcruntime __report_gsfailure prologue:
+//   mov [rsp+8],rcx ; sub rsp,38h ; mov ecx,17h ; call [rip+...]
+// Stealing 16 bytes splits the call — use 14 (through mov ecx).
+static size_t ReportGsFailureStealSize(const void* target) {
+	const auto* p = static_cast<const uint8_t*>(target);
+	if (p[0] == 0x48 && p[1] == 0x89 && p[2] == 0x4c && p[3] == 0x24 && p[4] == 0x08 &&
+	    p[5] == 0x48 && p[6] == 0x83 && p[7] == 0xec && p[9] == 0xb9) {
+		return 14;
+	}
+	return 16;
+}
+
+static void LogExitHookFrames(const char* tag, UINT code) {
+	if (g_exit_hook_logs.fetch_add(1, std::memory_order_relaxed) >= 32) {
+		return;
+	}
+	void* frames[10] = {};
+	const USHORT n =
+	    CaptureStackBackTrace(2, static_cast<DWORD>(sizeof(frames) / sizeof(frames[0])), frames,
+	                          nullptr);
+	char message[384];
+	std::snprintf(message, sizeof(message),
+	              "HOOK %s code=%u tid=%lu frames=%u ret0=%p ret1=%p ret2=%p ret3=%p", tag, code,
+	              static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned>(n),
+	              n > 0 ? frames[0] : nullptr, n > 1 ? frames[1] : nullptr,
+	              n > 2 ? frames[2] : nullptr, n > 3 ? frames[3] : nullptr);
+	EmergencyLogRaw(message);
+	FlushHleRingToFatal(tag);
+	FlushFileBuffers(GetStdHandle(STD_ERROR_HANDLE));
+}
+
+static void WINAPI HookedExitProcess(UINT code) {
+	LogExitHookFrames("ExitProcess", code);
+	if (g_real_exit_process != nullptr) {
+		g_real_exit_process(code);
+	}
+}
+
+static BOOL WINAPI HookedTerminateProcess(HANDLE process, UINT code) {
+	LogExitHookFrames("TerminateProcess", code);
+	if (g_real_terminate_process != nullptr) {
+		return g_real_terminate_process(process, code);
+	}
+	return FALSE;
+}
+
+static LONG NTAPI HookedNtTerminateProcess(HANDLE process, LONG status) {
+	LogExitHookFrames("NtTerminateProcess", static_cast<UINT>(status));
+	if (g_real_nt_terminate_process != nullptr) {
+		return g_real_nt_terminate_process(process, status);
+	}
+	return static_cast<LONG>(0xC0000001L);
+}
+
+static void NTAPI HookedRtlExitUserProcess(ULONG status) {
+	LogExitHookFrames("RtlExitUserProcess", status);
+	if (g_real_rtl_exit_user_process != nullptr) {
+		g_real_rtl_exit_user_process(status);
+	}
+}
+
+alignas(16) static uint8_t g_gs_fail_tramps[8][64] {};
+static void* g_gs_hooked_targets[8] {};
+static HANDLE g_gs_log_file = INVALID_HANDLE_VALUE;
+static char   g_gs_msg[256] {};
+static volatile long g_gs_hit_count = 0;
+
+static void GsAppendHex(char*& p, char* end, uint64_t value, int width) {
+	static constexpr char kHex[] = "0123456789abcdef";
+	for (int i = width - 1; i >= 0 && p < end; --i) {
+		*p++ = kHex[(value >> (static_cast<unsigned>(i) * 4u)) & 0xfu];
+	}
+}
+
+static void GsWriteMsg(const char* msg, size_t len) {
+	if (msg == nullptr || len == 0) {
+		return;
+	}
+	DWORD written = 0;
+	if (g_gs_log_file != nullptr && g_gs_log_file != INVALID_HANDLE_VALUE) {
+		(void)WriteFile(g_gs_log_file, msg, static_cast<DWORD>(len), &written, nullptr);
+		(void)WriteFile(g_gs_log_file, "\r\n", 2, &written, nullptr);
+		FlushFileBuffers(g_gs_log_file);
+	}
+	HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+	if (err != nullptr && err != INVALID_HANDLE_VALUE) {
+		(void)WriteFile(err, msg, static_cast<DWORD>(len), &written, nullptr);
+		(void)WriteFile(err, "\r\n", 2, &written, nullptr);
+	}
+}
+
+// Soft-continue: log with static buffers only (no fmt / large locals), then return so
+// __security_check_cookie's caller resumes instead of __fastfail.
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((noinline, no_stack_protector))
+#endif
+static void __cdecl HookedReportGsFailure(uintptr_t cookie) {
+	void* const retaddr = _ReturnAddress();
+	const long hit = InterlockedIncrement(&g_gs_hit_count);
+	char* p = g_gs_msg;
+	char* const end = g_gs_msg + sizeof(g_gs_msg) - 1;
+	const char prefix[] = "HOOK __report_gsfailure soft hit=";
+	for (const char* s = prefix; *s != '\0' && p < end; ++s) {
+		*p++ = *s;
+	}
+	GsAppendHex(p, end, static_cast<uint64_t>(hit), 8);
+	const char mid[] = " cookie=0x";
+	for (const char* s = mid; *s != '\0' && p < end; ++s) {
+		*p++ = *s;
+	}
+	GsAppendHex(p, end, cookie, 16);
+	const char mid2[] = " ret=";
+	for (const char* s = mid2; *s != '\0' && p < end; ++s) {
+		*p++ = *s;
+	}
+	GsAppendHex(p, end, reinterpret_cast<uint64_t>(retaddr), 16);
+	*p = '\0';
+	GsWriteMsg(g_gs_msg, static_cast<size_t>(p - g_gs_msg));
+
+	HMODULE owner = nullptr;
+	if (retaddr != nullptr &&
+	    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       static_cast<LPCSTR>(retaddr), &owner) != 0 &&
+	    owner != nullptr) {
+		char* q = g_gs_msg;
+		const char pfx[] = "HOOK __report_gsfailure rva=0x";
+		for (const char* s = pfx; *s != '\0' && q < end; ++s) {
+			*q++ = *s;
+		}
+		GsAppendHex(q, end,
+		            reinterpret_cast<uint64_t>(retaddr) - reinterpret_cast<uint64_t>(owner), 16);
+		*q = '\0';
+		GsWriteMsg(g_gs_msg, static_cast<size_t>(q - g_gs_msg));
+	}
+}
+
+static void OpenGsLogFile() {
+	char module_path[MAX_PATH] {};
+	const DWORD n = GetModuleFileNameA(nullptr, module_path, MAX_PATH);
+	if (n == 0 || n >= MAX_PATH) {
+		return;
+	}
+	char* slash = std::strrchr(module_path, '\\');
+	if (slash == nullptr) {
+		return;
+	}
+	*(slash + 1) = '\0';
+	char path[MAX_PATH + 32] {};
+	std::snprintf(path, sizeof(path), "%s_kyty_gsfail.txt", module_path);
+	g_gs_log_file =
+	    CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+	                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+static int NopSecurityCheckCookies(HMODULE mod) {
+	// Replace __security_check_cookie entry with a bare `ret`.
+	// Nopping only the first jne is NOT enough: the complement check
+	// (`rol` / `test cx` / `jne` / `jmp __report_gsfailure`) still failfasts.
+	if (mod == nullptr) {
+		return 0;
+	}
+	auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mod);
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+		return 0;
+	}
+	auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(reinterpret_cast<uint8_t*>(mod) + dos->e_lfanew);
+	if (nt->Signature != IMAGE_NT_SIGNATURE) {
+		return 0;
+	}
+	auto* section = IMAGE_FIRST_SECTION(nt);
+	int patched = 0;
+	for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+		if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) {
+			continue;
+		}
+		auto* start = reinterpret_cast<uint8_t*>(mod) + section->VirtualAddress;
+		const size_t size = section->Misc.VirtualSize;
+		for (size_t off = 0; off + 28 <= size; ++off) {
+			uint8_t* p = start + off;
+			if (p[0] != 0x48 || p[1] != 0x3b || p[2] != 0x0d || p[7] != 0x75) {
+				continue;
+			}
+			bool cookie_like = false;
+			for (size_t k = 8; k + 4 < 28 && off + k + 4 < size; ++k) {
+				if (p[k] == 0x48 && p[k + 1] == 0xc1 && p[k + 2] == 0xc1 && p[k + 3] == 0x10) {
+					cookie_like = true;
+					break;
+				}
+			}
+			if (!cookie_like) {
+				continue;
+			}
+			DWORD old_prot = 0;
+			if (VirtualProtect(p, 1, PAGE_EXECUTE_READWRITE, &old_prot) == 0) {
+				continue;
+			}
+			p[0] = 0xc3; // ret — ignore cookie entirely
+			FlushInstructionCache(GetCurrentProcess(), p, 1);
+			DWORD ignored = 0;
+			VirtualProtect(p, 1, old_prot, &ignored);
+			++patched;
+		}
+	}
+	return patched;
+}
+
+// Neutralize inlined `mov ecx, 2; int 29h` (FAST_FAIL_STACK_COOKIE) — used by
+// __report_gsfailure and some CRT epilogues that skip __security_check_cookie.
+static int PatchFastFailStackCookie(HMODULE mod) {
+	if (mod == nullptr) {
+		return 0;
+	}
+	auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mod);
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+		return 0;
+	}
+	auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(reinterpret_cast<uint8_t*>(mod) + dos->e_lfanew);
+	if (nt->Signature != IMAGE_NT_SIGNATURE) {
+		return 0;
+	}
+	auto* section = IMAGE_FIRST_SECTION(nt);
+	int patched = 0;
+	static constexpr uint8_t kPat[] = {0xb9, 0x02, 0x00, 0x00, 0x00, 0xcd, 0x29};
+	for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+		if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) {
+			continue;
+		}
+		auto* start = reinterpret_cast<uint8_t*>(mod) + section->VirtualAddress;
+		const size_t size = section->Misc.VirtualSize;
+		for (size_t off = 0; off + sizeof(kPat) <= size; ++off) {
+			uint8_t* p = start + off;
+			if (std::memcmp(p, kPat, sizeof(kPat)) != 0) {
+				continue;
+			}
+			DWORD old_prot = 0;
+			if (VirtualProtect(p, sizeof(kPat), PAGE_EXECUTE_READWRITE, &old_prot) == 0) {
+				continue;
+			}
+			std::memset(p, 0x90, sizeof(kPat));
+			FlushInstructionCache(GetCurrentProcess(), p, sizeof(kPat));
+			DWORD ignored = 0;
+			VirtualProtect(p, sizeof(kPat), old_prot, &ignored);
+			++patched;
+		}
+	}
+	return patched;
+}
+
+// Patch `int 29h` only when clearly a FAST_FAIL sequence: `mov ecx, imm32; int 29h`.
+// Blanket CD 29 scans corrupt unrelated instructions (especially in ntdll).
+static int PatchFastFailInt29(HMODULE mod) {
+	if (mod == nullptr) {
+		return 0;
+	}
+	auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mod);
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+		return 0;
+	}
+	auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(reinterpret_cast<uint8_t*>(mod) + dos->e_lfanew);
+	if (nt->Signature != IMAGE_NT_SIGNATURE) {
+		return 0;
+	}
+	auto* section = IMAGE_FIRST_SECTION(nt);
+	int patched = 0;
+	for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+		if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) {
+			continue;
+		}
+		auto* start = reinterpret_cast<uint8_t*>(mod) + section->VirtualAddress;
+		const size_t size = section->Misc.VirtualSize;
+		for (size_t off = 0; off + 7 <= size; ++off) {
+			uint8_t* p = start + off;
+			// mov ecx, imm32 ; int 29h
+			if (p[0] != 0xb9 || p[5] != 0xcd || p[6] != 0x29) {
+				continue;
+			}
+			DWORD old_prot = 0;
+			if (VirtualProtect(p, 7, PAGE_EXECUTE_READWRITE, &old_prot) == 0) {
+				continue;
+			}
+			std::memset(p, 0x90, 7);
+			FlushInstructionCache(GetCurrentProcess(), p, 7);
+			DWORD ignored = 0;
+			VirtualProtect(p, 7, old_prot, &ignored);
+			++patched;
+		}
+	}
+	return patched;
+}
+
+static bool IsGsBypassTargetModule(HMODULE mod) {
+	char name[MAX_PATH] {};
+	if (GetModuleFileNameA(mod, name, MAX_PATH) == 0) {
+		return false;
+	}
+	const char* base = std::strrchr(name, '\\');
+	base = base != nullptr ? base + 1 : name;
+	return _stricmp(base, "kyty_emulator.exe") == 0 || _stricmp(base, "ucrtbase.dll") == 0 ||
+	       _stricmp(base, "ucrtbased.dll") == 0 || _stricmp(base, "vcruntime140.dll") == 0 ||
+	       _stricmp(base, "VCRUNTIME140.dll") == 0 || _stricmp(base, "msvcp140.dll") == 0;
+}
+
+static void BypassGsInAllModules() {
+	HMODULE mods[256] {};
+	DWORD needed = 0;
+	int cookie_rets = 0;
+	int fastfail_nops = 0;
+	int int29_nops = 0;
+	int modules = 0;
+	// Safe pattern only (`mov ecx,imm32; int 29h`) — OK on all modules including ntdll.
+	// Never blanket-nop bare CD 29 (false positives → 0x80000003).
+	if (EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed) != 0) {
+		const unsigned count =
+		    static_cast<unsigned>(needed / sizeof(HMODULE) < 256 ? needed / sizeof(HMODULE) : 256);
+		for (unsigned i = 0; i < count; ++i) {
+			cookie_rets += NopSecurityCheckCookies(mods[i]);
+			fastfail_nops += PatchFastFailStackCookie(mods[i]);
+			int29_nops += PatchFastFailInt29(mods[i]);
+			++modules;
+		}
+	} else {
+		HMODULE exe = GetModuleHandleW(nullptr);
+		cookie_rets += NopSecurityCheckCookies(exe);
+		fastfail_nops += PatchFastFailStackCookie(exe);
+		int29_nops += PatchFastFailInt29(exe);
+		modules = 1;
+	}
+	char message[192];
+	std::snprintf(message, sizeof(message),
+	              "CrashTrace: GS bypass modules=%d cookie_ret=%d fastfail2_nops=%d "
+	              "int29_safe_nops=%d",
+	              modules, cookie_rets, fastfail_nops, int29_nops);
+	EmergencyLogRaw(message);
+}
+
+static bool HookReportGsFailureTarget(void* target, const char* tag, int* hooked) {
+	if (target == nullptr || hooked == nullptr) {
+		return false;
+	}
+	const int max_hooks =
+	    static_cast<int>(sizeof(g_gs_fail_tramps) / sizeof(g_gs_fail_tramps[0]));
+	if (*hooked >= max_hooks) {
+		return false;
+	}
+	for (int i = 0; i < *hooked; ++i) {
+		if (g_gs_hooked_targets[i] == target) {
+			return false;
+		}
+	}
+	const size_t stolen = ReportGsFailureStealSize(target);
+	void* orig = nullptr;
+	if (!InstallInlineHook(target, reinterpret_cast<void*>(&HookedReportGsFailure),
+	                       g_gs_fail_tramps[*hooked], sizeof(g_gs_fail_tramps[0]), &orig, stolen)) {
+		char message[192];
+		std::snprintf(message, sizeof(message),
+		              "CrashTrace: __report_gsfailure hook FAILED at %s", tag);
+		EmergencyLogRaw(message);
+		return false;
+	}
+	g_gs_hooked_targets[*hooked] = target;
+	++(*hooked);
+	char message[224];
+	std::snprintf(message, sizeof(message),
+	              "CrashTrace: __report_gsfailure INLINE hooked in %s stolen=%zu ptr=%p", tag,
+	              stolen, target);
+	EmergencyLogRaw(message);
+	return true;
+}
+
+static void ScanModuleForLocalReportGsFailure(HMODULE mod, const char* tag, int* hooked) {
+	// kyty_emulator.exe does NOT import __report_gsfailure — the CRT startup object links a
+	// private copy that __security_check_cookie jmps to, then int 29h. Scan for that prologue.
+	if (mod == nullptr || hooked == nullptr) {
+		return;
+	}
+	auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(mod);
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+		return;
+	}
+	auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(reinterpret_cast<uint8_t*>(mod) + dos->e_lfanew);
+	if (nt->Signature != IMAGE_NT_SIGNATURE) {
+		return;
+	}
+	auto* section = IMAGE_FIRST_SECTION(nt);
+	static constexpr uint8_t kPrologue[] = {0x48, 0x89, 0x4c, 0x24, 0x08, 0x48, 0x83, 0xec,
+	                                        0x38, 0xb9, 0x17, 0x00, 0x00, 0x00};
+	for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+		if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) {
+			continue;
+		}
+		auto* start = reinterpret_cast<uint8_t*>(mod) + section->VirtualAddress;
+		const size_t size = section->Misc.VirtualSize;
+		if (size < sizeof(kPrologue)) {
+			continue;
+		}
+		for (size_t off = 0; off + sizeof(kPrologue) <= size; ++off) {
+			if (std::memcmp(start + off, kPrologue, sizeof(kPrologue)) != 0) {
+				continue;
+			}
+			char local_tag[96];
+			std::snprintf(local_tag, sizeof(local_tag), "%s+.text+0x%zx", tag, off);
+			(void)HookReportGsFailureTarget(start + off, local_tag, hooked);
+		}
+	}
+}
+
+static void InstallGsFailureHook() {
+	OpenGsLogFile();
+	int hooked = 0;
+	// Only hook the LOCAL exe copy — CRT exports are irrelevant here and a 16-byte
+	// steal on vcruntime can split a call instruction.
+	HMODULE exe = GetModuleHandleW(nullptr);
+	ScanModuleForLocalReportGsFailure(exe, "kyty_emulator.exe", &hooked);
+	char message[96];
+	std::snprintf(message, sizeof(message), "CrashTrace: __report_gsfailure hooks=%d", hooked);
+	EmergencyLogRaw(message);
+
+	BypassGsInAllModules();
+}
+
+static bool PatchIatInModule(HMODULE module, const char* dll_name, const char* func_name,
+                             void* hook, void** original_out) {
+	if (module == nullptr || dll_name == nullptr || func_name == nullptr || hook == nullptr) {
+		return false;
+	}
+	auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(module);
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+		return false;
+	}
+	auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(reinterpret_cast<uint8_t*>(module) + dos->e_lfanew);
+	if (nt->Signature != IMAGE_NT_SIGNATURE) {
+		return false;
+	}
+	const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	if (dir.VirtualAddress == 0 || dir.Size == 0) {
+		return false;
+	}
+	auto* import_desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
+	    reinterpret_cast<uint8_t*>(module) + dir.VirtualAddress);
+	for (; import_desc->Name != 0; ++import_desc) {
+		const char* name =
+		    reinterpret_cast<const char*>(reinterpret_cast<uint8_t*>(module) + import_desc->Name);
+		if (_stricmp(name, dll_name) != 0) {
+			continue;
+		}
+		auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(reinterpret_cast<uint8_t*>(module) +
+		                                                  import_desc->FirstThunk);
+		auto* orig_thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(
+		    reinterpret_cast<uint8_t*>(module) +
+		    (import_desc->OriginalFirstThunk != 0 ? import_desc->OriginalFirstThunk
+		                                          : import_desc->FirstThunk));
+		for (; orig_thunk->u1.AddressOfData != 0; ++thunk, ++orig_thunk) {
+			if (IMAGE_SNAP_BY_ORDINAL(orig_thunk->u1.Ordinal)) {
+				continue;
+			}
+			auto* by_name = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
+			    reinterpret_cast<uint8_t*>(module) + orig_thunk->u1.AddressOfData);
+			if (std::strcmp(reinterpret_cast<const char*>(by_name->Name), func_name) != 0) {
+				continue;
+			}
+			DWORD old_protect = 0;
+			if (VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function), PAGE_READWRITE,
+			                   &old_protect) == 0) {
+				return false;
+			}
+			if (original_out != nullptr && *original_out == nullptr) {
+				*original_out = reinterpret_cast<void*>(static_cast<uintptr_t>(thunk->u1.Function));
+			}
+			thunk->u1.Function = reinterpret_cast<ULONG_PTR>(hook);
+			DWORD ignored = 0;
+			VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function), old_protect, &ignored);
+			return true;
+		}
+	}
+	return false;
+}
+
+static void InstallExitHooks() {
+	HMODULE modules[512] {};
+	DWORD   bytes = 0;
+	if (EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes) == 0) {
+		modules[0] = GetModuleHandleA(nullptr);
+		bytes      = sizeof(HMODULE);
+	}
+	const size_t count = bytes / sizeof(HMODULE);
+	void*        exit_orig = nullptr;
+	void*        term_orig = nullptr;
+	const char* dlls[] = {"KERNEL32.dll",
+	                      "kernel32.dll",
+	                      "KERNELBASE.dll",
+	                      "ntdll.dll",
+	                      "NTDLL.dll",
+	                      "api-ms-win-core-processthreads-l1-1-0.dll",
+	                      "api-ms-win-core-processthreads-l1-1-1.dll",
+	                      "api-ms-win-core-processthreads-l1-1-2.dll"};
+	int exit_hits = 0;
+	int term_hits = 0;
+	int nt_hits   = 0;
+	int rtl_hits  = 0;
+	void* nt_orig  = nullptr;
+	void* rtl_orig = nullptr;
+	for (size_t mi = 0; mi < count; ++mi) {
+		if (modules[mi] == nullptr) {
+			continue;
+		}
+		for (const char* dll: dlls) {
+			void* scratch_exit = exit_orig;
+			void* scratch_term = term_orig;
+			void* scratch_nt   = nt_orig;
+			void* scratch_rtl  = rtl_orig;
+			if (PatchIatInModule(modules[mi], dll, "ExitProcess",
+			                     reinterpret_cast<void*>(&HookedExitProcess), &scratch_exit)) {
+				exit_orig = scratch_exit;
+				++exit_hits;
+			}
+			if (PatchIatInModule(modules[mi], dll, "TerminateProcess",
+			                     reinterpret_cast<void*>(&HookedTerminateProcess), &scratch_term)) {
+				term_orig = scratch_term;
+				++term_hits;
+			}
+			if (PatchIatInModule(modules[mi], dll, "NtTerminateProcess",
+			                     reinterpret_cast<void*>(&HookedNtTerminateProcess), &scratch_nt)) {
+				nt_orig = scratch_nt;
+				++nt_hits;
+			}
+			if (PatchIatInModule(modules[mi], dll, "RtlExitUserProcess",
+			                     reinterpret_cast<void*>(&HookedRtlExitUserProcess), &scratch_rtl)) {
+				rtl_orig = scratch_rtl;
+				++rtl_hits;
+			}
+		}
+	}
+	g_real_exit_process =
+	    exit_orig != nullptr ? reinterpret_cast<ExitProcessFn>(exit_orig) : ExitProcess;
+	g_real_terminate_process = term_orig != nullptr
+	                               ? reinterpret_cast<TerminateProcessFn>(term_orig)
+	                               : TerminateProcess;
+
+	// Always inline-hook ntdll entry points — IAT hits alone miss GetProcAddress / direct calls,
+	// and previous runs died with zero HOOK lines after UserEvent/CondWait.
+	{
+		void* nt_target = reinterpret_cast<void*>(
+		    GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtTerminateProcess"));
+		void* nt_orig_fn = nullptr;
+		if (InstallInlineHook(nt_target, reinterpret_cast<void*>(&HookedNtTerminateProcess),
+		                      g_nt_term_tramp, sizeof(g_nt_term_tramp), &nt_orig_fn)) {
+			g_real_nt_terminate_process = reinterpret_cast<NtTerminateProcessFn>(nt_orig_fn);
+			++nt_hits;
+			EmergencyLogRaw("CrashTrace: NtTerminateProcess INLINE hooked");
+		} else if (nt_orig != nullptr) {
+			g_real_nt_terminate_process = reinterpret_cast<NtTerminateProcessFn>(nt_orig);
+			EmergencyLogRaw("CrashTrace: NtTerminateProcess inline FAILED (using IAT orig)");
+		} else {
+			g_real_nt_terminate_process = reinterpret_cast<NtTerminateProcessFn>(nt_target);
+			EmergencyLogRaw("CrashTrace: NtTerminateProcess inline FAILED");
+		}
+	}
+	{
+		void* rtl_target = reinterpret_cast<void*>(
+		    GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlExitUserProcess"));
+		void* rtl_orig_fn = nullptr;
+		if (InstallInlineHook(rtl_target, reinterpret_cast<void*>(&HookedRtlExitUserProcess),
+		                      g_rtl_exit_tramp, sizeof(g_rtl_exit_tramp), &rtl_orig_fn)) {
+			g_real_rtl_exit_user_process = reinterpret_cast<RtlExitUserProcessFn>(rtl_orig_fn);
+			++rtl_hits;
+			EmergencyLogRaw("CrashTrace: RtlExitUserProcess INLINE hooked");
+		} else if (rtl_orig != nullptr) {
+			g_real_rtl_exit_user_process = reinterpret_cast<RtlExitUserProcessFn>(rtl_orig);
+			EmergencyLogRaw("CrashTrace: RtlExitUserProcess inline FAILED (using IAT orig)");
+		} else {
+			g_real_rtl_exit_user_process = reinterpret_cast<RtlExitUserProcessFn>(rtl_target);
+			EmergencyLogRaw("CrashTrace: RtlExitUserProcess inline FAILED");
+		}
+	}
+	char message[256];
+	std::snprintf(message, sizeof(message),
+	              "CrashTrace: Exit=%d Term=%d NtTerm=%d RtlExit=%d modules=%zu", exit_hits,
+	              term_hits, nt_hits, rtl_hits, count);
+	EmergencyLogRaw(message);
+}
+
 void InstallCrashDiagnostics() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef ProcessUserShadowStackPolicy
@@ -225,19 +1035,29 @@ void InstallCrashDiagnostics() {
 		::printf("CrashTrace: FatalFailfast VEH installed\n");
 	}
 
-	const char* const modules[] = {"ucrtbase.dll", "vcruntime140.dll", "msvcrt.dll"};
-	for (const char* module_name : modules) {
-		const HMODULE module = GetModuleHandleA(module_name);
-		if (module == nullptr) {
-			continue;
+	SetUnhandledExceptionFilter(UnhandledFilter);
+	SetConsoleCtrlHandler(ConsoleCtrlFilter, TRUE);
+	std::atexit(AtexitBreadcrumb);
+	std::set_terminate(TerminateBreadcrumb);
+	InstallExitHooks();
+	SpawnExitWatcher();
+	InstallGsFailureHook();
+
+	EmergencyLogRaw("CrashTrace: emergency log + heartbeat + unhandled filter armed");
+
+	// Background pulse — if this stops updating, death was not a clean Exit/Terminate path.
+	std::thread([] {
+		for (uint32_t i = 0;; ++i) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			char beat[80];
+			std::snprintf(beat, sizeof(beat), "heartbeat watchdog tick=%u tid=%lu", i,
+			              static_cast<unsigned long>(GetCurrentThreadId()));
+			HeartbeatLog(beat);
 		}
-		const auto set_handler = reinterpret_cast<SetSecerrHandlerFunc>(
-		    GetProcAddress(module, "_set_security_error_handler"));
-		if (set_handler != nullptr) {
-			(void)set_handler(&SecurityFailureHandler);
-			return;
-		}
-	}
+	}).detach();
+
+	// `_set_security_error_handler` is gone on modern UCRT; rely on InstallGsFailureHook above.
+	EmergencyLogRaw("CrashTrace: security_error_handler skipped (use __report_gsfailure hook)");
 #endif
 }
 

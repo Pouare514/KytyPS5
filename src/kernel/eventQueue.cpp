@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/fatalLog.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -20,6 +21,7 @@
 #include <fmt/format.h>
 #include <list>
 #include <string>
+#include <vector>
 
 namespace Libs::LibKernel::EventQueue {
 
@@ -595,12 +597,44 @@ int KYTY_SYSV_ABI KernelTriggerUserEvent(KernelEqueue eq, int id, void* udata) {
 int KYTY_SYSV_ABI KernelTriggerUserEventForAll(int id, void* udata) {
 	int triggered = 0;
 
-	Common::LockGuard lock(g_equeues_mutex);
+	{
+		Common::LockGuard lock(g_equeues_mutex);
 
-	for (auto* eq: g_equeues) {
-		if (eq != nullptr &&
-		    eq->TriggerEvent(static_cast<uintptr_t>(id), KERNEL_EVFILT_USER, udata)) {
-			triggered++;
+		for (auto* eq: g_equeues) {
+			if (eq != nullptr &&
+			    eq->TriggerEvent(static_cast<uintptr_t>(id), KERNEL_EVFILT_USER, udata)) {
+				triggered++;
+			}
+		}
+	}
+
+	// 0x1800 missing on every EQ (old once-flag / EQ destroy): seed edge on a snapshot of live
+	// EQs, then retry. Do not call Add* while holding g_equeues_mutex (deadlock risk).
+	if (id == AGC_USER_INTERRUPT_EVENT && triggered == 0) {
+		std::vector<KernelEqueue> snapshot;
+		{
+			Common::LockGuard lock(g_equeues_mutex);
+			snapshot.assign(g_equeues.begin(), g_equeues.end());
+		}
+		for (auto* eq: snapshot) {
+			if (eq != nullptr) {
+				(void)KernelAddUserEventEdge(eq, AGC_USER_INTERRUPT_EVENT);
+			}
+		}
+		{
+			Common::LockGuard lock(g_equeues_mutex);
+			for (auto* eq: g_equeues) {
+				if (eq != nullptr &&
+				    eq->TriggerEvent(static_cast<uintptr_t>(id), KERNEL_EVFILT_USER, udata)) {
+					triggered++;
+				}
+			}
+		}
+		static std::atomic<uint32_t> reseed_logs {0};
+		if (reseed_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+			fprintf(stderr,
+			        "SubmitTrace: UserEventTriggerForAll id=0x1800 reseeds triggered=%d snapshot=%zu\n",
+			        triggered, snapshot.size());
 		}
 	}
 
@@ -608,8 +642,15 @@ int KYTY_SYSV_ABI KernelTriggerUserEventForAll(int id, void* udata) {
 		if (triggered > 0) {
 			NoteAgcUserTrigger();
 		}
-		LOGF("SubmitTrace: UserEventTriggerForAll id=0x1800 triggered=%d\n", triggered);
+		// fprintf only — LOGF/fmt on this path has caused /GS fastfail (0xC0000409).
 		fprintf(stderr, "SubmitTrace: UserEventTriggerForAll id=0x1800 triggered=%d\n", triggered);
+		std::fflush(stderr);
+		if (triggered > 0) {
+			char beat[96];
+			std::snprintf(beat, sizeof(beat), "heartbeat UserEvent0x1800 triggered=%d", triggered);
+			Common::HeartbeatLog(beat);
+		}
+		Common::HeartbeatLog("heartbeat UserEvent0x1800 after_trigger_return");
 	}
 
 	return (triggered > 0 ? OK : KERNEL_ERROR_ENOENT);

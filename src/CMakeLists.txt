@@ -193,6 +193,20 @@ list(REMOVE_DUPLICATES kyty_emulator_src)
 
 if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
+	# Guest-stack HLE: /GS cookie checks → STATUS_STACK_BUFFER_OVERRUN (0xC0000409) without VEH.
+	set_property(SOURCE
+		kernel/pthread.cpp
+		kernel/eventQueue.cpp
+		kernel/semaphore.cpp
+		kernel/memory.cpp
+		libs/libC.cpp
+		libs/libKernel.cpp
+		libs/agc.cpp
+		libs/libGraphicsDriver.cpp
+		libs/libVideoOut.cpp
+		graphics/presentation/videoOut.cpp
+		graphics/guest_gpu/graphicsRun.cpp
+		APPEND_STRING PROPERTY COMPILE_FLAGS " /GS-")
 endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9)
@@ -314,6 +328,10 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 add_executable(kyty_emulator main.cpp ${kyty_emulator_src})
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
+if (KYTY_CLANG_CL)
+	# Guest-stack HLE + /GS → silent 0xC0000409 (__fastfail, no VEH). Disable buffer checks.
+	target_compile_options(kyty_emulator PRIVATE /GS-)
+endif()
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)
 	target_link_libraries(kyty_emulator iphlpapi)

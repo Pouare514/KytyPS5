@@ -1005,6 +1005,10 @@ void Phase50NoteSubmitGpu(int handle, int index, uint64_t request_id, uint64_t s
 	     handle, index, request_id, submit_gpu_total, tsc, Common::Thread::GetThreadIdUnique());
 	fprintf(stderr, "FlipTrace: phase50 submit_gpu index=%d total=%" PRIu64 "\n", index,
 	        submit_gpu_total);
+	char beat[128];
+	std::snprintf(beat, sizeof(beat), "heartbeat submit_gpu total=%" PRIu64 " index=%d tid=%d",
+	              submit_gpu_total, index, Common::Thread::GetThreadIdUnique());
+	Common::HeartbeatLog(beat);
 }
 
 bool Phase50ObjNonZeroSeen() {
@@ -5567,10 +5571,10 @@ void Phase65NoteCondWait(const char* role, const char* name, int tid, uint64_t r
 	Phase70NoteGuestRip(ra, r);
 	static std::atomic<uint32_t> logs {0};
 	if (logs.fetch_add(1, std::memory_order_relaxed) < 96) {
-		LOGF("SubmitTrace: phase65 cond_wait role=%s name=%s tid=%d ra=0x%016" PRIx64 "\n", r,
-		     name != nullptr ? name : "?", tid, ra);
+		// fprintf only — LOGF/fmt on guest-stack CondWait → silent 0xC0000409.
 		fprintf(stderr, "SubmitTrace: phase65 cond_wait role=%s name=%s tid=%d ra=0x%016" PRIx64 "\n",
 		        r, name != nullptr ? name : "?", tid, ra);
+		std::fflush(stderr);
 	}
 }
 

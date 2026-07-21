@@ -674,13 +674,11 @@ static void Phase54NoteCondWait(PthreadCondPrivate* cond, PthreadPrivate* thread
 	}
 	static std::atomic<uint32_t> logs {0};
 	if (logs.fetch_add(1, std::memory_order_relaxed) < 128) {
-		LOGF("SubmitTrace: phase54 cond_wait role=%s cond=0x%016" PRIx64 " cycle=%" PRIu64
-		     " tid=%d name=%s guest_rip=0x%016" PRIx64 "\n",
-		     Phase54RoleOf(thread), reinterpret_cast<uint64_t>(cond), cycle, thread->unique_id,
-		     thread->name.c_str(), g_phase70_tls_guest_rip);
+		// fprintf only on guest-stack HLE (avoid fmt /GS fastfail).
 		fprintf(stderr,
 		        "SubmitTrace: phase54 cond_wait role=%s cond=0x%016" PRIx64 " cycle=%" PRIu64 "\n",
 		        Phase54RoleOf(thread), reinterpret_cast<uint64_t>(cond), cycle);
+		std::fflush(stderr);
 	}
 }
 
@@ -766,14 +764,19 @@ static void CondAddWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	if (IsSubmissionRelatedName(thread->name) || main_related) {
 		static std::atomic<uint32_t> logs {0};
 		if (logs.fetch_add(1, std::memory_order_relaxed) < 96) {
-			const uint64_t ra = reinterpret_cast<uint64_t>(__builtin_return_address(0));
-			LOGF("SubmitTrace: CondWait name=%s tid=%d cond=%s ra=0x%016" PRIx64 "\n",
-			     thread->name.c_str(), thread->unique_id, cond->name.c_str(), ra);
+			// fprintf only — LOGF/fmt on guest-stack HLE → /GS 0xC0000409.
 			fprintf(stderr, "SubmitTrace: CondWait name=%s tid=%d cond=%s\n", thread->name.c_str(),
 			        thread->unique_id, cond->name.c_str());
+			std::fflush(stderr);
+			char beat[160];
+			std::snprintf(beat, sizeof(beat), "heartbeat CondWait name=%s tid=%d",
+			              thread->name.c_str(), thread->unique_id);
+			Common::HeartbeatLog(beat);
 		}
 	}
+	Common::HeartbeatLog("heartbeat CondWait before_phase54");
 	Phase54NoteCondWait(cond, thread);
+	Common::HeartbeatLog("heartbeat CondWait after_phase54");
 }
 
 static bool CondRemoveWaiter(PthreadCondPrivate* cond, Pthread thread) {
@@ -1106,7 +1109,8 @@ static void FreeGuestStack(PthreadAttr attr) {
 	attr->stack_map_size = 0;
 }
 
-extern "C" __attribute__((noreturn, noinline)) void GuestThreadFinishOnHost(uint64_t value) {
+extern "C" __attribute__((noreturn, noinline, no_stack_protector)) void GuestThreadFinishOnHost(
+    uint64_t value) {
 	// Still on the guest stack here (arrived from GuestThreadReturnTrampoline).
 	// Do not LOGF/fmt/EXIT — those use movaps and require a 16-byte-aligned host stack.
 	// HostRestoreContext must use a non-zero sentinel: guest may legitimately return 0, and

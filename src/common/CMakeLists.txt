@@ -12,6 +12,10 @@ endif()
 
 add_library(common STATIC ${common_src} ${common_headers})
 
+if(KYTY_CLANG_CL)
+	target_compile_options(common PRIVATE /GS-)
+endif()
+
 target_include_directories(common
 	PUBLIC ${PROJECT_SOURCE_DIR}
 	PRIVATE

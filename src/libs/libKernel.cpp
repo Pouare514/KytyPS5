@@ -1500,54 +1500,31 @@ static void KYTY_SYSV_ABI KernelDebugRaiseException(int /*c1*/, int /*c2*/) {
 }
 
 static void KYTY_SYSV_ABI exit(int code) {
-	PRINT_NAME();
 	fprintf(stderr, "GuestExit: libKernel::exit code=%d\n", code);
-	LOGF("GuestExit: libKernel::exit code=%d\n", code);
+	std::fflush(stderr);
 	char msg[96];
 	std::snprintf(msg, sizeof(msg), "GuestExit: libKernel::exit code=%d", code);
 	Common::LogFatalToFile(msg);
+
+	const char* allow = std::getenv("KYTY_ALLOW_GUEST_EXIT");
+	if (allow != nullptr && allow[0] == '1') {
+		::exit(code);
+	}
+
+	fprintf(stderr,
+	        "GuestExit: suppressing libKernel exit(%d) — soft-idle (KYTY_ALLOW_GUEST_EXIT=1 to honor)\n",
+	        code);
 	std::fflush(stderr);
-	if (Libs::Graphics::WindowShouldIgnoreQuit()) {
-		const char* park = std::getenv("KYTY_PHASE32_PARK_EXIT");
-		if (park != nullptr && park[0] == '1') {
-			LOGF("GuestExit: suppressing libKernel exit(%d) (phase32 arm) — park thread\n",
-			     code);
-			fprintf(stderr, "GuestExit: suppressing libKernel exit(%d) (phase32 arm)\n", code);
-			std::fflush(stderr);
-			for (;;) {
-				std::this_thread::sleep_for(std::chrono::seconds(1));
-				(void)PthreadWakeSubmissionCondWaitersAfterFlip();
-			}
-		}
-		const char* divert = std::getenv("KYTY_PHASE33_DIVERT");
-		if (divert != nullptr && divert[0] == '1') {
-			LOGF("GuestExit: suppressing libKernel exit(%d) (phase33 divert)\n", code);
-			fprintf(stderr, "GuestExit: suppressing libKernel exit(%d) (phase33 divert)\n",
-			        code);
-			std::fflush(stderr);
-			while (Libs::Graphics::WindowShouldIgnoreQuit()) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(16));
-				(void)PthreadWakeSubmissionCondWaitersAfterFlip();
-			}
-			for (;;) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(50));
-				(void)PthreadWakeSubmissionCondWaitersAfterFlip();
-			}
-		}
-		LOGF("GuestExit: suppressing libKernel exit(%d) — phase34 soft-idle\n", code);
-		fprintf(stderr, "GuestExit: suppressing libKernel exit(%d) — phase34 soft-idle\n",
-		        code);
-		std::fflush(stderr);
-		for (int tick = 0;; ++tick) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(16));
-			(void)PthreadWakeSubmissionCondWaitersAfterFlip();
-			if ((tick % 30) == 0) {
-				(void)EventQueue::KernelTriggerUserEventForAll(0x1800, nullptr);
-				Libs::Graphics::WindowArmIgnoreQuit(60);
-			}
+	Common::LogFatalToFile("GuestExit: libKernel::exit suppressed soft-idle");
+	Libs::Graphics::WindowArmIgnoreQuit(120);
+	for (int tick = 0;; ++tick) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(16));
+		(void)PthreadWakeSubmissionCondWaitersAfterFlip();
+		if ((tick % 30) == 0) {
+			(void)EventQueue::KernelTriggerUserEventForAll(0x1800, nullptr);
+			Libs::Graphics::WindowArmIgnoreQuit(60);
 		}
 	}
-	::exit(code);
 }
 
 static KYTY_SYSV_ABI MallocReplace* KernelGetSanitizerMallocReplaceExternal() {

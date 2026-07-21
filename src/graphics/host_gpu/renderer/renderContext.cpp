@@ -79,6 +79,9 @@ void RenderContext::TriggerEopEvent(uint32_t context_id) {
 
 	for (auto& eop_entry: m_eop_eqs) {
 		if (eop_entry.eq != nullptr) {
+			// Re-bind 0x1800 before trigger — EQ recycle / late AddEq must not leave ForAll empty.
+			(void)LibKernel::EventQueue::KernelAddUserEventEdge(eop_entry.eq,
+			                                                   AGC_USER_INTERRUPT_EVENT);
 			const auto id     = static_cast<uintptr_t>(eop_entry.id);
 			auto       result = LibKernel::EventQueue::KernelTriggerEvent(
 			    eop_entry.eq, id, LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS,

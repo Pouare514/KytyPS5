@@ -602,14 +602,13 @@ int AddEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id, void* udata) {
 		g_render_ctx->AddEopEq(eq, id);
 		// Ensure TriggerEopEvent's AGC_USER 0x1800 can land on this EQ (TLOU never AddUserEvent 0x1800).
 		// Edge (EV_CLEAR): level-triggered AddUserEvent sticky-livelocked the IRQ handler (Phase 26).
-		static std::atomic<bool> agc_user_added {false};
-		if (!agc_user_added.exchange(true, std::memory_order_acq_rel)) {
-			const auto user_result =
-			    LibKernel::EventQueue::KernelAddUserEventEdge(eq, AGC_USER_INTERRUPT_EVENT);
-			LOGF("SubmitTrace: EnsureAgcUserEvent eq=0x%016" PRIx64 " id=0x1800 edge=1 result=%d\n",
-			     reinterpret_cast<uint64_t>(eq), user_result);
-			fprintf(stderr, "SubmitTrace: EnsureAgcUserEvent edge result=%d\n", user_result);
-		}
+		// Idempotent per EQ (AddEvent replaces). Do NOT gate on a process-wide once flag — the first
+		// EQ may be destroyed, leaving TriggerForAll at triggered=0 forever.
+		const auto user_result =
+		    LibKernel::EventQueue::KernelAddUserEventEdge(eq, AGC_USER_INTERRUPT_EVENT);
+		LOGF("SubmitTrace: EnsureAgcUserEvent eq=0x%016" PRIx64 " id=0x1800 edge=1 result=%d\n",
+		     reinterpret_cast<uint64_t>(eq), user_result);
+		fprintf(stderr, "SubmitTrace: EnsureAgcUserEvent edge result=%d\n", user_result);
 	}
 	MaybeSyntheticBootstrapEop(eq, id);
 	SubmitTrace::NoteAddEq();

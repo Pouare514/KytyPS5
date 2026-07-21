@@ -81,57 +81,32 @@ const char** GetArgv() {
 }
 
 static KYTY_SYSV_ABI void exit(int code) {
-	PRINT_NAME();
-	void* ra0 = __builtin_return_address(0);
-	fprintf(stderr, "GuestExit: libC::exit code=%d ra=%p\n", code, ra0);
-	LOGF("GuestExit: libC::exit code=%d ra=%p\n", code, ra0);
-	char msg[128];
-	std::snprintf(msg, sizeof(msg), "GuestExit: libC::exit code=%d ra=%p", code, ra0);
-	Common::LogFatalToFile(msg);
+	// Avoid PRINT_NAME/LOGF here: may run on a misaligned guest stack (fmt movaps → silent death).
+	fprintf(stderr, "GuestExit: libC::exit code=%d\n", code);
 	std::fflush(stderr);
-	// Suppress exit under IgnoreQuit. KYTY_PHASE32_PARK_EXIT=1 = park.
-	// KYTY_PHASE33_DIVERT=1 = Phase 33 divert. Default Phase 34 = soft-idle wakes.
-	if (Libs::Graphics::WindowShouldIgnoreQuit()) {
-		const char* park = std::getenv("KYTY_PHASE32_PARK_EXIT");
-		if (park != nullptr && park[0] == '1') {
-			LOGF("GuestExit: suppressing exit(%d) (phase32 arm) — park thread\n", code);
-			fprintf(stderr, "GuestExit: suppressing exit(%d) (phase32 arm) — park thread\n",
-			        code);
-			std::fflush(stderr);
-			for (;;) {
-				std::this_thread::sleep_for(std::chrono::seconds(1));
-				(void)Libs::LibKernel::PthreadWakeSubmissionCondWaitersAfterFlip();
-			}
-		}
-		const char* divert = std::getenv("KYTY_PHASE33_DIVERT");
-		if (divert != nullptr && divert[0] == '1') {
-			LOGF("GuestExit: suppressing exit(%d) (phase33 divert — no CRT return)\n", code);
-			fprintf(stderr, "GuestExit: suppressing exit(%d) (phase33 divert)\n", code);
-			std::fflush(stderr);
-			while (Libs::Graphics::WindowShouldIgnoreQuit()) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(16));
-				(void)Libs::LibKernel::PthreadWakeSubmissionCondWaitersAfterFlip();
-			}
-			LOGF("GuestExit: phase33 divert holding after ignore-quit expiry\n");
-			fprintf(stderr, "GuestExit: phase33 divert holding\n");
-			for (;;) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(50));
-				(void)Libs::LibKernel::PthreadWakeSubmissionCondWaitersAfterFlip();
-			}
-		}
-		LOGF("GuestExit: suppressing exit(%d) — phase34 soft-idle\n", code);
-		fprintf(stderr, "GuestExit: suppressing exit(%d) — phase34 soft-idle\n", code);
-		std::fflush(stderr);
-		for (int tick = 0;; ++tick) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(16));
-			(void)Libs::LibKernel::PthreadWakeSubmissionCondWaitersAfterFlip();
-			if ((tick % 30) == 0) {
-				(void)Libs::LibKernel::EventQueue::KernelTriggerUserEventForAll(0x1800, nullptr);
-				Libs::Graphics::WindowArmIgnoreQuit(60);
-			}
+	char msg[96];
+	std::snprintf(msg, sizeof(msg), "GuestExit: libC::exit code=%d", code);
+	Common::LogFatalToFile(msg);
+
+	// Boot/AGC: guest exit must not tear down the emulator. Opt-in real exit only.
+	const char* allow = std::getenv("KYTY_ALLOW_GUEST_EXIT");
+	if (allow != nullptr && allow[0] == '1') {
+		::exit(code);
+	}
+
+	fprintf(stderr, "GuestExit: suppressing exit(%d) — soft-idle (set KYTY_ALLOW_GUEST_EXIT=1 to honor)\n",
+	        code);
+	std::fflush(stderr);
+	Common::LogFatalToFile("GuestExit: libC::exit suppressed soft-idle");
+	Libs::Graphics::WindowArmIgnoreQuit(120);
+	for (int tick = 0;; ++tick) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(16));
+		(void)Libs::LibKernel::PthreadWakeSubmissionCondWaitersAfterFlip();
+		if ((tick % 30) == 0) {
+			(void)Libs::LibKernel::EventQueue::KernelTriggerUserEventForAll(0x1800, nullptr);
+			Libs::Graphics::WindowArmIgnoreQuit(60);
 		}
 	}
-	::exit(code);
 }
 
 static void PrintAbortStringCandidate(const char* name, uint64_t addr) {
@@ -678,26 +653,26 @@ static KYTY_SYSV_ABI void catchReturnFromMain(int status) {
 	}
 
 	::printf("return from main = %d\n", status);
+	std::fflush(stdout);
 
-	// Phase 34: CRT calls exit() then ud2 after this returns — never return under PENDING0.
-	const char* pending0 = std::getenv("KYTY_PHASE32_PENDING0");
-	if ((pending0 != nullptr && pending0[0] == '1') ||
-	    Libs::Graphics::WindowShouldIgnoreQuit()) {
-		const char* kick   = std::getenv("KYTY_PHASE33_KICK");
-		const char* divert = std::getenv("KYTY_PHASE33_DIVERT");
-		if (kick != nullptr && kick[0] == '1') {
-			Phase33KickGuestSubmitAndFlip();
-		}
-		if (divert != nullptr && divert[0] == '1') {
-			LOGF("GuestExit: catchReturnFromMain status=%d — phase33 divert\n", status);
-			fprintf(stderr, "GuestExit: catchReturnFromMain status=%d — phase33 divert\n",
-			        status);
-			std::fflush(stderr);
-			Common::LogFatalToFile("catchReturnFromMain phase33 divert");
-			Phase33DivertPumpForever();
-		}
-		Phase38DeferredSoftIdle();
+	// CRT calls exit() then ud2 after this returns — never return (TLOU boot soft-idle).
+	const char* kick   = std::getenv("KYTY_PHASE33_KICK");
+	const char* divert = std::getenv("KYTY_PHASE33_DIVERT");
+	if (kick != nullptr && kick[0] == '1') {
+		Phase33KickGuestSubmitAndFlip();
 	}
+	if (divert != nullptr && divert[0] == '1') {
+		LOGF("GuestExit: catchReturnFromMain status=%d — phase33 divert\n", status);
+		fprintf(stderr, "GuestExit: catchReturnFromMain status=%d — phase33 divert\n", status);
+		std::fflush(stderr);
+		Common::LogFatalToFile("catchReturnFromMain phase33 divert");
+		Phase33DivertPumpForever();
+	}
+	fprintf(stderr, "GuestExit: catchReturnFromMain status=%d — soft-idle\n", status);
+	std::fflush(stderr);
+	Common::LogFatalToFile("catchReturnFromMain soft-idle");
+	Libs::Graphics::WindowArmIgnoreQuit(120);
+	Phase38DeferredSoftIdle();
 }
 
 enum class ThrdResult : int {
