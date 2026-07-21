@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/fatalLog.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
 #include "common/stringUtils.h"
@@ -1819,6 +1820,17 @@ bool PhysicalMemory::Alloc(uint64_t search_start, uint64_t search_end, size_t le
 		return false;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// MapViewOfFile* requires the file offset (direct-memory phys) to be a multiple of the host
+	// allocation granularity (64 KiB). Guests often request 16 KiB alignment; without bumping,
+	// the first alloc can leave the free cursor at a non-64K offset and the next MapDirectMemory
+	// fails with KERNEL_ERROR_ENOMEM (seen on PPSA21564 DirectMemoryAllocator.cpp:122).
+	constexpr uint64_t kHostMapGranularity = 0x10000ull;
+	if (alignment < kHostMapGranularity) {
+		alignment = kHostMapGranularity;
+	}
+#endif
+
 	auto range = m_free.upper_bound(search_start);
 	if (range != m_free.begin()) {
 		range--;
@@ -1866,6 +1878,13 @@ bool PhysicalMemory::Available(uint64_t search_start, uint64_t search_end, size_
 	if (search_start >= search_end) {
 		return false;
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	constexpr uint64_t kHostMapGranularity = 0x10000ull;
+	if (alignment < kHostMapGranularity) {
+		alignment = kHostMapGranularity;
+	}
+#endif
 
 	uint64_t best_addr = 0;
 	uint64_t best_size = 0;
@@ -3502,9 +3521,16 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 	}
 	if (direct_memory_start < 0 || len == 0 ||
 	    !g_physical_memory->CanMapDirect(static_cast<uint64_t>(direct_memory_start), len)) {
-		LOGF("\t MapDirectMemory ENOMEM: CanMapDirect failed dmem=0x%016" PRIx64
-		     " len=0x%016" PRIx64 "\n",
-		     static_cast<uint64_t>(direct_memory_start < 0 ? 0 : direct_memory_start), len);
+		char line[256];
+		std::snprintf(line, sizeof(line),
+		              "MapDirectMemory ENOMEM: CanMapDirect failed dmem=0x%016" PRIx64
+		              " len=0x%016" PRIx64 " dmem&0xffff=%04x",
+		              static_cast<uint64_t>(direct_memory_start < 0 ? 0 : direct_memory_start), len,
+		              static_cast<unsigned>(static_cast<uint64_t>(
+		                                        direct_memory_start < 0 ? 0 : direct_memory_start) &
+		                                    0xffffu));
+		LOGF("\t %s\n", line);
+		Common::LogFatalToFile(line);
 		return KERNEL_ERROR_ENOMEM;
 	}
 
@@ -3537,34 +3563,126 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 			const auto region_base = reinterpret_cast<uint64_t>(info.BaseAddress);
 			const auto region_end  = region_base + info.RegionSize;
 			const auto target_end  = target_addr + len;
+			bool       split_ok    = true;
 			if (target_addr < region_base || target_end > region_end) {
-				return false;
+				split_ok = false;
 			}
-			if (region_base < target_addr &&
+			if (split_ok && region_base < target_addr &&
 			    VirtualFree(reinterpret_cast<void*>(region_base), target_addr - region_base,
 			                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
-				return false;
+				split_ok = false;
 			}
-			if (VirtualQuery(reinterpret_cast<const void*>(target_addr), &info, sizeof(info)) ==
-			        0 ||
-			    info.State != MEM_RESERVE) {
-				return false;
+			if (split_ok &&
+			    (VirtualQuery(reinterpret_cast<const void*>(target_addr), &info, sizeof(info)) ==
+			         0 ||
+			     info.State != MEM_RESERVE)) {
+				split_ok = false;
 			}
-			const auto split_base = reinterpret_cast<uint64_t>(info.BaseAddress);
-			const auto split_end  = split_base + info.RegionSize;
-			if (split_base != target_addr || split_end < target_end) {
-				return false;
+			if (split_ok) {
+				const auto split_base = reinterpret_cast<uint64_t>(info.BaseAddress);
+				const auto split_end  = split_base + info.RegionSize;
+				if (split_base != target_addr || split_end < target_end) {
+					split_ok = false;
+				} else if (split_end > target_end &&
+				           VirtualFree(reinterpret_cast<void*>(target_addr), len,
+				                       MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
+					split_ok = false;
+				}
 			}
-			if (split_end > target_end &&
-			    VirtualFree(reinterpret_cast<void*>(target_addr), len,
-			                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0) {
-				return false;
+			if (split_ok) {
+				return g_direct_memory_backing->MapExistingPlaceholderFixed(
+				    target_addr, len, direct_memory_start, mode, &shared_failure);
 			}
-			return g_direct_memory_backing->MapExistingPlaceholderFixed(
-			    target_addr, len, direct_memory_start, mode, &shared_failure);
+
+			// Private (non-placeholder) MEM_RESERVE cannot be partially released. Free the whole
+			// allocation, MapFixed the requested span, then re-reserve the leftovers.
+			if (VirtualQuery(reinterpret_cast<const void*>(target_addr), &info, sizeof(info)) !=
+			        0 &&
+			    info.State == MEM_RESERVE && info.Type != MEM_MAPPED && info.Type != MEM_IMAGE) {
+				const auto alloc_base = reinterpret_cast<uint64_t>(info.AllocationBase);
+				uint64_t   alloc_end  = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+				for (uint64_t scan = alloc_end;;) {
+					MEMORY_BASIC_INFORMATION next {};
+					if (VirtualQuery(reinterpret_cast<const void*>(scan), &next, sizeof(next)) ==
+					        0 ||
+					    reinterpret_cast<uint64_t>(next.AllocationBase) != alloc_base ||
+					    next.State == MEM_FREE) {
+						break;
+					}
+					alloc_end = reinterpret_cast<uint64_t>(next.BaseAddress) + next.RegionSize;
+					scan      = alloc_end;
+				}
+				if (alloc_base <= target_addr && target_addr + len <= alloc_end) {
+					char line[320];
+					std::snprintf(line, sizeof(line),
+					              "MapDirectMemory: carve private reserve "
+					              "alloc=0x%016" PRIx64 "-0x%016" PRIx64 " map=0x%016" PRIx64
+					              "+0x%016" PRIx64,
+					              alloc_base, alloc_end, target_addr, len);
+					LOGF("\t %s\n", line);
+					Common::LogFatalToFile(line);
+					if (VirtualFree(reinterpret_cast<void*>(alloc_base), 0, MEM_RELEASE) == 0) {
+						shared_failure =
+						    DirectMemoryBacking::FailureReason::ReservedContainerReleaseFailed;
+						return false;
+					}
+					if (!g_direct_memory_backing->MapFixed(target_addr, len, direct_memory_start,
+					                                       mode, &shared_failure)) {
+						// Best-effort: put the arena back so a later retry can carve again.
+						VirtualAlloc(reinterpret_cast<void*>(alloc_base), alloc_end - alloc_base,
+						             MEM_RESERVE, PAGE_NOACCESS);
+						return false;
+					}
+					auto rereserve = [&](uint64_t start, uint64_t size) {
+						if (size == 0) {
+							return true;
+						}
+						if (g_placeholder_address_space->ReserveFixed(start, size)) {
+							return true;
+						}
+						return VirtualAlloc(reinterpret_cast<void*>(start), size, MEM_RESERVE,
+						                    PAGE_NOACCESS) != nullptr;
+					};
+					if (!rereserve(alloc_base, target_addr - alloc_base) ||
+					    !rereserve(target_addr + len, alloc_end - (target_addr + len))) {
+						LOGF("\t MapDirectMemory: leftover re-reserve incomplete "
+						     "(map ok, arena remainder best-effort)\n");
+					}
+					return true;
+				}
+			}
 		}
-		if (info.State != MEM_FREE) {
-			return false;
+
+		if (VirtualQuery(reinterpret_cast<const void*>(target_addr), &info, sizeof(info)) != 0 &&
+		    info.State != MEM_FREE) {
+			char line[280];
+			std::snprintf(line, sizeof(line),
+			              "MapDirectMemory: clearing host VA state=%lu base=0x%016" PRIx64
+			              " size=0x%llx target=0x%016" PRIx64 " len=0x%016" PRIx64,
+			              static_cast<unsigned long>(info.State),
+			              reinterpret_cast<uint64_t>(info.BaseAddress),
+			              static_cast<unsigned long long>(info.RegionSize), target_addr, len);
+			LOGF("\t %s\n", line);
+			Common::LogFatalToFile(line);
+			// ClearHostVmSpan refuses protruding private reserves — expand to the full
+			// allocation when the map sits at AllocationBase.
+			uint64_t clear_len = len;
+			if (info.State == MEM_RESERVE && info.Type != MEM_MAPPED && info.Type != MEM_IMAGE) {
+				const auto alloc_base = reinterpret_cast<uint64_t>(info.AllocationBase);
+				if (alloc_base == target_addr) {
+					clear_len = std::max<uint64_t>(len, info.RegionSize);
+				}
+			}
+			if (!ClearHostVmSpan(target_addr, clear_len)) {
+				shared_failure = DirectMemoryBacking::FailureReason::PlaceholderReserveFailed;
+				std::snprintf(line, sizeof(line),
+				              "MapDirectMemory: ClearHostVmSpan failed target=0x%016" PRIx64
+				              " len=0x%016" PRIx64 " err=%lu",
+				              target_addr, clear_len, static_cast<unsigned long>(GetLastError()));
+				LOGF("\t %s\n", line);
+				Common::LogFatalToFile(line);
+				return false;
+			}
 		}
 #endif
 
@@ -3704,6 +3822,16 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 	}
 
 	if (out_addr == 0) {
+		char line[320];
+		std::snprintf(line, sizeof(line),
+		              "MapDirectMemory ENOMEM: map failed in_addr=0x%016" PRIx64
+		              " dmem=0x%016" PRIx64 " len=0x%016" PRIx64 " flags=0x%08" PRIx32
+		              " align=0x%016" PRIx64 " reason=%s dmem&0xffff=%04x",
+		              in_addr, static_cast<uint64_t>(direct_memory_start), len,
+		              static_cast<uint32_t>(flags), alignment, shared_reason,
+		              static_cast<unsigned>(static_cast<uint64_t>(direct_memory_start) & 0xffffu));
+		LOGF("\t %s\n", line);
+		Common::LogFatalToFile(line);
 		if (consumed_reserved) {
 			g_virtual_ranges->Add(in_addr, len, 0, 0, 0, VirtualRangeType::Reserved,
 			                      consumed_range.name, false, consumed_range.placeholder_backed);

@@ -24,7 +24,7 @@ void NoteHleCall(const char* library, const char* module, const char* func);
 void FlushHleRingToFatal(const char* reason);
 
 // Last halt breadcrumb before ExitProcess(321) / FailFast / DbgExit (printed on soft-idle).
-// kind examples: nested | assert | poison | DbgExit | FailFast | ExitProcess
+// kind examples: nested | assert | poison | guest_abort_trap | DbgExit | FailFast | ExitProcess
 void NoteHaltReason(const char* kind, const char* detail = nullptr);
 const char* GetLastHaltReason();
 

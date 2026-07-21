@@ -2,6 +2,7 @@
 
 #include "graphics/host_gpu/guestImageWriteTracker.h"
 #include "common/assert.h"
+#include "common/fatalLog.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -2566,29 +2567,38 @@ TextureCache::RegisterVideoOutSurfaces(const std::vector<VideoOutInfo>& infos) {
 	std::vector<VideoOutVulkanImage*> result;
 	result.reserve(infos.size());
 	for (const auto& info: infos) {
+		{
+			char breadcrumb[160];
+			std::snprintf(breadcrumb, sizeof(breadcrumb),
+			              "FlipTrace: VO create begin addr=0x%016" PRIx64, info.address);
+			Common::EmergencyLogRaw(breadcrumb);
+			Common::LogFatalToFile(breadcrumb);
+		}
 		auto cached       = std::make_shared<CachedImage>(m_graphics);
 		cached->kind      = CachedImage::Kind::VideoOut;
 		cached->video_out = info;
 		cached->image     = ImageOps::CreateVideoOut(info);
+		{
+			char breadcrumb[128];
+			std::snprintf(breadcrumb, sizeof(breadcrumb), "FlipTrace: VO create done image=%p",
+			              static_cast<void*>(cached->image));
+			Common::EmergencyLogRaw(breadcrumb);
+			Common::LogFatalToFile(breadcrumb);
+		}
 		GuestImageWriteTracker::Track(info.address, info.size);
-		if (info.compression == VideoOutCompression::Uncompressed) {
-			m_memory_tracker.ForEachUploadRange(
-			    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
-			    [&]() noexcept {
-				    ImageOps::UploadVideoOut(*static_cast<VideoOutVulkanImage*>(cached->image),
-				                             info, false);
-			    });
-			int64_t gen = 0;
-			if (GuestImageWriteTracker::TryGetWriteGeneration(info.address, &gen)) {
-				GuestImageWriteTracker::RecordUploadedGeneration(info.address, gen);
-			}
-		} else {
-			// A compressed guest surface cannot be decoded without its DCC metadata. Establish the
-			// normal tracked range, but leave the shared native image to be initialized by a GPU
-			// render/clear before any sampled or presentation read.
-			m_memory_tracker.ForEachUploadRange(
-			    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
-			    []() noexcept {});
+		// Skip ForEachUploadRange + CPU upload at Register. Immediate UploadVideoOut of
+		// PPSA21564's 3840x2160 A2R10G10B10 surfaces null-derefs inside nvwgf2umx; even the
+		// empty ForEachUploadRange path races the UMD after CreateImage. RefreshVideoOut
+		// uploads later when the guest range is actually CPU-dirty.
+		{
+			char breadcrumb[192];
+			std::snprintf(breadcrumb, sizeof(breadcrumb),
+			              "FlipTrace: VO registered deferred-upload addr=0x%016" PRIx64
+			              " size=0x%016" PRIx64 " %ux%u compression=%d",
+			              info.address, info.size, info.width, info.height,
+			              static_cast<int>(info.compression));
+			Common::EmergencyLogRaw(breadcrumb);
+			Common::LogFatalToFile(breadcrumb);
 		}
 		result.push_back(static_cast<VideoOutVulkanImage*>(cached->image));
 		m_images.push_back(std::move(cached));
@@ -2681,9 +2691,9 @@ void TextureCache::RefreshVideoOut(VideoOutVulkanImage& image, bool render_targe
 		     " buffer_dirty=%d render_target=%d\n",
 		     info.address, image_dirty, buffer_dirty, render_target ? 1 : 0);
 	}
-	m_memory_tracker.ForEachUploadRange(
-	    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
-	    [&]() noexcept { ImageOps::UploadVideoOut(image, info, true); });
+	// Skip ForEachUploadRange for VO: walking ~32 MiB 4K flip pages stalls PrepareCpuFlip
+	// under AV soft-continue storms, and UploadVideoOut is a UMD-safe no-op anyway.
+	ImageOps::UploadVideoOut(image, info, true);
 	int64_t gen = 0;
 	if (GuestImageWriteTracker::TryGetWriteGeneration(info.address, &gen)) {
 		GuestImageWriteTracker::RecordUploadedGeneration(info.address, gen);

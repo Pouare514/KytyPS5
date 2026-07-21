@@ -26,6 +26,10 @@ int KYTY_SYSV_ABI PthreadSemTimedwait(void* sem, KernelUseconds usec);
 int KYTY_SYSV_ABI PthreadSemPost(void* sem);
 int KYTY_SYSV_ABI PthreadSemGetvalue(void* sem, int* value);
 
+// Soft-wake helper: signal every live KernelSema whose name matches (e.g. "hkSemaphore").
+// Used when Main is stuck waiting on Havok job semas before the first VideoOut submit.
+size_t SignalAllNamedSemaphores(const char* name, int count);
+
 } // namespace Libs::LibKernel::Semaphore
 
 namespace Libs::Posix {

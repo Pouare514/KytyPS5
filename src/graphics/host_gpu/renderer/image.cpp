@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/image.h"
 
 #include "common/assert.h"
+#include "common/fatalLog.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/tile.h"
@@ -17,6 +18,9 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
 
 namespace Libs::Graphics {
 
@@ -386,41 +390,22 @@ void UploadVideoOut(VideoOutVulkanImage& image, const VideoOutInfo& info,
 		     "addr=0x%016" PRIx64 " metadata=0x%016" PRIx64 " dcc=0x%08" PRIx32 "\n",
 		     info.address, info.metadata_address, info.dcc_control);
 	}
-	if (refresh) {
-		Transfer::WaitForGraphicsIdle();
-	}
+	// PPSA21564: GpuDetile/UploadTiledImage of 4K A2R10G10B10 flip buffers null-derefs inside
+	// nvwgf2umx. Leave layout Undefined so WindowPrepareFrame presents a clear instead of
+	// CopyImage-from-Undefined (invalid barriers stall GraphicsRing Flush).
+	(void)refresh;
 	image.layout = vk::ImageLayout::eUndefined;
-	if (!info.bgra16) {
-		auto layout =
-		    TextureCalcUploadLayout(info.guest_format, info.width, info.height, 1, 1, info.pitch,
-		                            info.tile_mode, info.size, false, false, "VideoOut");
-		auto regions = TextureBuildUploadRegions(layout, info.format, info.width, info.height, 1, 1,
-		                                         false, false, TextureUploadDestination::MipLevels);
-		TextureUploadGuestImage(image, reinterpret_cast<const void*>(info.address),
-		                        info.size, regions, layout, info.guest_format, info.width,
-		                        info.height, 1, 1, "VideoOut", vk::ImageLayout::eGeneral);
-		return;
+	static std::atomic<uint32_t> skip_n {0};
+	const uint32_t n = skip_n.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n <= 8 || (n % 64) == 0) {
+		char breadcrumb[192];
+		std::snprintf(breadcrumb, sizeof(breadcrumb),
+		              "FlipTrace: VO upload skipped (UMD-safe) n=%u addr=0x%016" PRIx64
+		              " %ux%u refresh=%d",
+		              n, info.address, info.width, info.height, refresh ? 1 : 0);
+		Common::EmergencyLogRaw(breadcrumb);
+		Common::LogFatalToFile(breadcrumb);
 	}
-	Transfer::ScratchBuffer scratch(info.size);
-	TileBlockLayout         block {};
-	EXIT_NOT_IMPLEMENTED(
-	    !TileGetBlockLayout(TileBlockFamily::RenderTarget64KB, info.bytes_per_element, block));
-	const GpuTileInfo tile_info {block.family,
-	                             block.bytes_per_element,
-	                             0,
-	                             info.size,
-	                             0,
-	                             info.size,
-	                             0,
-	                             info.width,
-	                             info.height,
-	                             1,
-	                             info.pitch};
-	GpuDetile(reinterpret_cast<const void*>(info.address), scratch.Data(), info.size,
-	          info.size, std::span<const GpuTileInfo>(&tile_info, 1));
-	SwapVideoOutBgra16(scratch.Data(), info.size);
-	Transfer::UploadImage(image, scratch.Data(), info.size, info.pitch,
-	                      vk::ImageLayout::eGeneral);
 }
 
 void SwapVideoOutBgra16(void* data, uint64_t size) {

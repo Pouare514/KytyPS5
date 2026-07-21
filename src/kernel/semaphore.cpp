@@ -1,6 +1,7 @@
 #include "kernel/semaphore.h"
 
 #include "common/assert.h"
+#include "common/fatalLog.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -15,6 +16,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <limits>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -27,6 +29,11 @@ namespace Libs::LibKernel::Semaphore {
 LIB_NAME("libkernel", "libkernel");
 
 constexpr uint32_t SIGNAL_APC_POLL_MICROS = 10000;
+
+namespace {
+std::mutex              g_named_sema_mutex;
+std::vector<KernelSema> g_named_semas;
+} // namespace
 
 class KernelSemaPrivate {
 public:
@@ -77,6 +84,12 @@ private:
 };
 
 KernelSemaPrivate::~KernelSemaPrivate() {
+	{
+		std::lock_guard lock(g_named_sema_mutex);
+		g_named_semas.erase(std::remove(g_named_semas.begin(), g_named_semas.end(), this),
+		                    g_named_semas.end());
+	}
+
 	Common::LockGuard lock(m_mutex);
 
 	while (m_status != Status::Set) {
@@ -275,6 +288,11 @@ int KYTY_SYSV_ABI KernelCreateSema(KernelSema* sem, const char* name, uint32_t a
 
 	*sem = new KernelSemaPrivate(std::string(name), fifo, init, max);
 
+	{
+		std::lock_guard lock(g_named_sema_mutex);
+		g_named_semas.push_back(*sem);
+	}
+
 	LOGF("\t Semaphore create: %s, ptr=0x%016" PRIx64 ", init=%d, max=%d\n", name,
 	     reinterpret_cast<uint64_t>(*sem), init, max);
 
@@ -313,6 +331,14 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 			     time == nullptr ? "inf" : "set", ra);
 			fprintf(stderr, "SubmitTrace: SemaWait name=%s tid=%d sem=%s\n", name,
 			        PthreadGetUniqueId(self), sem->GetName().c_str());
+			if (n < 16) {
+				char breadcrumb[256];
+				std::snprintf(breadcrumb, sizeof(breadcrumb),
+				              "SubmitTrace: SemaWait name=%s tid=%d sem=%s need=%d ra=0x%016" PRIx64,
+				              name, PthreadGetUniqueId(self), sem->GetName().c_str(), need, ra);
+				Common::EmergencyLogRaw(breadcrumb);
+				Common::LogFatalToFile(breadcrumb);
+			}
 		}
 	}
 
@@ -360,6 +386,25 @@ int KYTY_SYSV_ABI KernelSignalSema(KernelSema sem, int count) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	if (sem->GetName() == "hkSemaphore") {
+		static std::atomic<uint32_t> hk_sig_n {0};
+		const auto                   n = hk_sig_n.fetch_add(1, std::memory_order_relaxed);
+		if (n < 48) {
+			char tname[32] = {};
+			auto* self     = PthreadSelfOrNull();
+			if (self != nullptr) {
+				PthreadGetname(self, tname);
+			}
+			char breadcrumb[192];
+			std::snprintf(breadcrumb, sizeof(breadcrumb),
+			              "SubmitTrace: SignalSema hkSemaphore by=%s tid=%d count=%d ptr=%p",
+			              tname, PthreadGetUniqueId(self), count, static_cast<void*>(sem));
+			Common::EmergencyLogRaw(breadcrumb);
+			Common::LogFatalToFile(breadcrumb);
+			fprintf(stderr, "%s\n", breadcrumb);
+		}
+	}
+
 	if (PthreadCurrentIsSubmissionRelated()) {
 		static std::atomic<uint32_t> logs {0};
 		const auto                   n = logs.fetch_add(1, std::memory_order_relaxed);
@@ -391,6 +436,27 @@ int KYTY_SYSV_ABI KernelSignalSema(KernelSema sem, int count) {
 	}
 
 	return ret;
+}
+
+size_t SignalAllNamedSemaphores(const char* name, int count) {
+	if (name == nullptr || count < 1) {
+		return 0;
+	}
+	std::vector<KernelSema> snapshot;
+	{
+		std::lock_guard lock(g_named_sema_mutex);
+		snapshot = g_named_semas;
+	}
+	size_t signaled = 0;
+	for (KernelSema sem: snapshot) {
+		if (sem == nullptr || sem->GetName() != name) {
+			continue;
+		}
+		if (sem->Signal(count) == KernelSemaPrivate::Result::Ok) {
+			++signaled;
+		}
+	}
+	return signaled;
 }
 
 int KYTY_SYSV_ABI KernelCancelSema(KernelSema sem, int count, int* threads) {

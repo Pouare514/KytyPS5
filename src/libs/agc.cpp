@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/fatalLog.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -3790,6 +3791,15 @@ uint32_t* KYTY_SYSV_ABI GraphicsDcbSetFlip(CommandBuffer* buf, uint32_t video_ou
 	LOGF("FlipTrace: AGC GraphicsDcbSetFlip handle=%" PRIu32 " index=%" PRId32 " mode=%" PRIu32
 	     " arg=%" PRId64 "\n",
 	     video_out_handle, display_buffer_index, flip_mode, flip_arg);
+	{
+		char breadcrumb[192];
+		std::snprintf(breadcrumb, sizeof(breadcrumb),
+		              "FlipTrace: AGC GraphicsDcbSetFlip handle=%" PRIu32 " index=%" PRId32
+		              " mode=%" PRIu32 " arg=%" PRId64,
+		              video_out_handle, display_buffer_index, flip_mode, flip_arg);
+		Common::EmergencyLogRaw(breadcrumb);
+		Common::LogFatalToFile(breadcrumb);
+	}
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 

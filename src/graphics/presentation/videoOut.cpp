@@ -27,11 +27,13 @@
 #include "common/singleton.h"
 #include "kernel/pthread.h"
 #include "kernel/eventQueue.h"
+#include "kernel/semaphore.h"
 #include "libs/errno.h"
 #include "libs/agc.h"
 #include "libs/libs.h"
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
+#include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
 #include <atomic>
@@ -6555,6 +6557,13 @@ void PhaseDescribeFaultRip(uint64_t rip) {
 		              static_cast<unsigned long long>(mbi.RegionSize),
 		              static_cast<uint32_t>(mbi.Protect), static_cast<uint32_t>(mbi.Type));
 		Common::LogFatalToFile(line);
+		{
+			char abort_detail[160] {};
+			if (Loader::X64InstructionEmulator::DescribeGuestAbortTrap(rip, abort_detail,
+			                                                           sizeof(abort_detail))) {
+				Common::LogFatalToFile(abort_detail);
+			}
+		}
 		HMODULE owner = nullptr;
 		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
 		                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -7557,13 +7566,67 @@ static void AfterGpuQueueEmptyHostTick() {
 	AfterPending0HostTick();
 	static std::atomic<uint64_t> last_submit_gpu {0};
 	static std::atomic<uint32_t> empty_streak {0};
+	static std::atomic<uint32_t> nosubmit_streak {0};
 	const uint64_t               sg = FlipStats::submit_gpu.load(std::memory_order_relaxed);
+	const uint64_t               sc = FlipStats::submit_cpu.load(std::memory_order_relaxed);
 	const uint64_t               prev = last_submit_gpu.load(std::memory_order_relaxed);
 	if (sg != prev) {
 		last_submit_gpu.store(sg, std::memory_order_relaxed);
 		empty_streak.store(0, std::memory_order_relaxed);
+		nosubmit_streak.store(0, std::memory_order_relaxed);
 		return;
 	}
+
+	// PPSA21564: after Reg2, Main blocks on hkSemaphore forever with submit_*=0. The legacy
+	// stall wake only runs once submit_gpu has been seen — extend it for the never-submit case.
+	const uint64_t reg_n = FlipStats::register_buffers.load(std::memory_order_relaxed);
+	if (reg_n > 0 && sg == 0 && sc == 0) {
+		const uint32_t n = nosubmit_streak.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n >= 32 && (n % 32u) == 0u && n <= 512u) {
+			const auto woken = LibKernel::PthreadWakeSubmissionCondWaitersUnlimited();
+			const int  ue =
+			    LibKernel::EventQueue::KernelTriggerUserEventForAll(0x1800, nullptr);
+			const size_t hk =
+			    LibKernel::Semaphore::SignalAllNamedSemaphores("hkSemaphore", 1);
+			const size_t draw =
+			    LibKernel::Semaphore::SignalAllNamedSemaphores("RenderContextDrawSema", 1);
+			char breadcrumb[256];
+			std::snprintf(breadcrumb, sizeof(breadcrumb),
+			              "SubmitTrace: reg2_nosubmit stall wake n=%u woken=%zu ue=%d "
+			              "hk_sig=%zu draw_sig=%zu",
+			              n, woken, ue, hk, draw);
+			Common::EmergencyLogRaw(breadcrumb);
+			Common::LogFatalToFile(breadcrumb);
+			fprintf(stderr, "%s\n", breadcrumb);
+			LOGF("%s\n", breadcrumb);
+
+			// After several soft-wakes still no guest submit: one-shot CPU flip so VO present
+			// path is exercised (producer still diagnosed as never_calls_submit).
+			// Handle 1 is the VO open used by PPSA21564 after Reg2 (avoid g_video_out_context
+			// here — it is defined later in this TU). Inject early (n=32) so Prepare/Flush
+			// have headroom before smoke timeout.
+			if (n == 32 || n == 64 || n == 128) {
+				static std::atomic<bool> injected {false};
+				bool                     expect = false;
+				if (!injected.compare_exchange_strong(expect, true, std::memory_order_acq_rel)) {
+					// already injected once
+				} else {
+					const int flip =
+					    VideoOutSubmitFlip(1, 0, /*VIDEO_OUT_FLIP_MODE_VSYNC*/ 1, 0);
+					char inject[160];
+					std::snprintf(inject, sizeof(inject),
+					              "FlipTrace: reg2_nosubmit inject SubmitFlip handle=1 "
+					              "result=%d n=%u",
+					              flip, n);
+					Common::EmergencyLogRaw(inject);
+					Common::LogFatalToFile(inject);
+					fprintf(stderr, "%s\n", inject);
+				}
+			}
+		}
+		return;
+	}
+
 	if (sg == 0) {
 		return;
 	}
@@ -8138,6 +8201,13 @@ static int ReserveFlipRequest(int handle, int index, int flip_mode, int64_t flip
 			     source == FlipRequestSource::GpuEop ? "gpu" : "cpu");
 			fprintf(stderr, "FlipTrace: phase49 submit reject INVALID_INDEX index=%d vk=%p\n",
 			        index, static_cast<void*>(vk));
+			char breadcrumb[192];
+			std::snprintf(breadcrumb, sizeof(breadcrumb),
+			              "FlipTrace: ReserveFlip INVALID_INDEX index=%d vk=%p closing=%d src=%s",
+			              index, static_cast<void*>(vk), video_out->closing ? 1 : 0,
+			              source == FlipRequestSource::GpuEop ? "gpu" : "cpu");
+			Common::EmergencyLogRaw(breadcrumb);
+			Common::LogFatalToFile(breadcrumb);
 		}
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
@@ -10696,7 +10766,21 @@ static int RegisterBuffersInternal(VideoOutConfig& ctx, int set_id, int start_in
 		     buffer_num);
 		fprintf(stderr, "FlipTrace: phase44 reuse deferred-vk surfaces num=%d\n", buffer_num);
 	} else {
+		{
+			char breadcrumb[128];
+			std::snprintf(breadcrumb, sizeof(breadcrumb),
+			              "FlipTrace: RegisterVideoOutSurfaces begin num=%d", buffer_num);
+			Common::EmergencyLogRaw(breadcrumb);
+			Common::LogFatalToFile(breadcrumb);
+		}
 		images = Graphics::GetRenderContext().GetTextureCache().RegisterVideoOutSurfaces(infos);
+		{
+			char breadcrumb[128];
+			std::snprintf(breadcrumb, sizeof(breadcrumb),
+			              "FlipTrace: RegisterVideoOutSurfaces done num=%zu", images.size());
+			Common::EmergencyLogRaw(breadcrumb);
+			Common::LogFatalToFile(breadcrumb);
+		}
 	}
 	if (images.size() != infos.size()) {
 		EXIT("video-out texture cache returned an incomplete surface set\n");
@@ -10788,6 +10872,18 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
                                            void* option) {
 	PRINT_NAME();
 
+	{
+		char breadcrumb[384];
+		std::snprintf(
+		    breadcrumb, sizeof(breadcrumb),
+		    "FlipTrace: RegisterBuffers2 enter handle=%d set=%d start=%d num=%d attr=%p bufs=%p "
+		    "cat=%d opt=%p",
+		    handle, set_index, buffer_index_start, buffer_num, static_cast<const void*>(attribute),
+		    static_cast<const void*>(buffers), category, option);
+		Common::EmergencyLogRaw(breadcrumb);
+		Common::LogFatalToFile(breadcrumb);
+	}
+
 	EXIT_IF(g_video_out_context == nullptr);
 
 	auto* ctx = g_video_out_context->Get(handle);
@@ -10801,13 +10897,6 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 
 	if (attribute == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_OPTION;
-	}
-
-	if (set_index < 0 || set_index >= VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX ||
-	    buffer_index_start < 0 || buffer_index_start >= VIDEO_OUT_BUFFER_NUM_MAX ||
-	    buffer_num < 1 || buffer_num > VIDEO_OUT_BUFFER_NUM_MAX ||
-	    buffer_index_start + buffer_num > VIDEO_OUT_BUFFER_NUM_MAX) {
-		return VIDEO_OUT_ERROR_INVALID_VALUE;
 	}
 
 	LOGF("\t start_index    = %d\n"
@@ -10824,6 +10913,25 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	     buffer_index_start, buffer_num, set_index, attribute->pixel_format, attribute->tiling_mode,
 	     attribute->aspect_ratio, attribute->width, attribute->height, attribute->pitch_in_pixel,
 	     attribute->option, category);
+
+	{
+		char breadcrumb[384];
+		std::snprintf(breadcrumb, sizeof(breadcrumb),
+		              "FlipTrace: RegisterBuffers2 attrs fmt=0x%016" PRIx64
+		              " %ux%u pitch=%u tiling=%u dcc=0x%08" PRIx32 " cat=%d",
+		              attribute->pixel_format, attribute->width, attribute->height,
+		              attribute->pitch_in_pixel, attribute->tiling_mode, attribute->dcc_control,
+		              category);
+		Common::EmergencyLogRaw(breadcrumb);
+		Common::LogFatalToFile(breadcrumb);
+	}
+
+	if (set_index < 0 || set_index >= VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX ||
+	    buffer_index_start < 0 || buffer_index_start >= VIDEO_OUT_BUFFER_NUM_MAX ||
+	    buffer_num < 1 || buffer_num > VIDEO_OUT_BUFFER_NUM_MAX ||
+	    buffer_index_start + buffer_num > VIDEO_OUT_BUFFER_NUM_MAX) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
 
 	if (option != nullptr) {
 		EXIT("video-out buffer registration options are unsupported\n");
@@ -10898,6 +11006,14 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	const int reg_result =
 	    RegisterBuffersInternal(*ctx, set_index, buffer_index_start, addresses.data(), buffer_num,
 	                            infos);
+	{
+		char breadcrumb[192];
+		std::snprintf(breadcrumb, sizeof(breadcrumb),
+		              "FlipTrace: RegisterBuffers2 leave result=%d set=%d num=%d", reg_result,
+		              set_index, buffer_num);
+		Common::EmergencyLogRaw(breadcrumb);
+		Common::LogFatalToFile(breadcrumb);
+	}
 	if (reg_result == OK) {
 		Phase34SaveMenuSnapshot(handle, set_index, buffer_index_start, buffer_num,
 		                        addresses.data(), infos);
@@ -11044,6 +11160,15 @@ namespace Libs::VideoOut {
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
 	PRINT_NAME();
 
+	{
+		char breadcrumb[192];
+		std::snprintf(breadcrumb, sizeof(breadcrumb),
+		              "FlipTrace: SubmitFlipCPU enter handle=%d index=%d mode=%d arg=%" PRId64,
+		              handle, index, flip_mode, flip_arg);
+		Common::EmergencyLogRaw(breadcrumb);
+		Common::LogFatalToFile(breadcrumb);
+	}
+
 	uint64_t  request_id = 0;
 	const int result =
 	    ReserveFlipRequest(handle, index, flip_mode, flip_arg, FlipRequestSource::Cpu, request_id);
@@ -11051,11 +11176,25 @@ KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64
 		LOGF("\t unsupported flip_mode = %d\n", flip_mode);
 	}
 	if (result != OK) {
+		char breadcrumb[160];
+		std::snprintf(breadcrumb, sizeof(breadcrumb),
+		              "FlipTrace: SubmitFlipCPU reject handle=%d index=%d result=0x%08x", handle,
+		              index, static_cast<unsigned>(result));
+		Common::EmergencyLogRaw(breadcrumb);
+		Common::LogFatalToFile(breadcrumb);
 		return result;
 	}
 	FlipStats::submit_cpu.fetch_add(1, std::memory_order_relaxed);
 	LOGF("FlipTrace: SubmitFlipCPU handle=%d index=%d mode=%d arg=%" PRId64 " id=%" PRIu64 "\n",
 	     handle, index, flip_mode, flip_arg, request_id);
+	{
+		char breadcrumb[192];
+		std::snprintf(breadcrumb, sizeof(breadcrumb),
+		              "FlipTrace: SubmitFlipCPU ok handle=%d index=%d id=%" PRIu64, handle, index,
+		              request_id);
+		Common::EmergencyLogRaw(breadcrumb);
+		Common::LogFatalToFile(breadcrumb);
+	}
 	FlipStats::Log("submit_cpu");
 	Phase37NoteGuestSubmitFlip(index);
 	Graphics::GraphicsRunSubmitFlipPreparation();
@@ -11071,14 +11210,37 @@ int DisplayBufferSubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handle, 
                                    int flip_mode, int64_t flip_arg, uint64_t& request_id) {
 	EXIT_IF(VideoOut::g_video_out_context == nullptr || buffer.IsInvalid());
 
+	{
+		char breadcrumb[192];
+		std::snprintf(breadcrumb, sizeof(breadcrumb),
+		              "FlipTrace: SubmitFlipGPU enter handle=%d index=%d mode=%d arg=%" PRId64,
+		              handle, index, flip_mode, flip_arg);
+		Common::EmergencyLogRaw(breadcrumb);
+		Common::LogFatalToFile(breadcrumb);
+	}
+
 	const int result = VideoOut::ReserveFlipRequest(
 	    handle, index, flip_mode, flip_arg, VideoOut::FlipRequestSource::GpuEop, request_id);
 	if (result != OK) {
+		char breadcrumb[160];
+		std::snprintf(breadcrumb, sizeof(breadcrumb),
+		              "FlipTrace: SubmitFlipGPU reject handle=%d index=%d result=0x%08x", handle,
+		              index, static_cast<unsigned>(result));
+		Common::EmergencyLogRaw(breadcrumb);
+		Common::LogFatalToFile(breadcrumb);
 		return result;
 	}
 	VideoOut::FlipStats::submit_gpu.fetch_add(1, std::memory_order_relaxed);
 	LOGF("FlipTrace: SubmitFlipGPU handle=%d index=%d mode=%d arg=%" PRId64 " id=%" PRIu64 "\n",
 	     handle, index, flip_mode, flip_arg, request_id);
+	{
+		char breadcrumb[160];
+		std::snprintf(breadcrumb, sizeof(breadcrumb),
+		              "FlipTrace: SubmitFlipGPU ok handle=%d index=%d id=%" PRIu64, handle, index,
+		              request_id);
+		Common::EmergencyLogRaw(breadcrumb);
+		Common::LogFatalToFile(breadcrumb);
+	}
 	VideoOut::FlipStats::Log("submit_gpu");
 	VideoOut::Phase50NoteSubmitGpu(
 	    handle, index, request_id,

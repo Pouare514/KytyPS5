@@ -486,6 +486,42 @@ bool TrySoftContinuePoisonAccess(void* native_context, uint64_t fault_vaddr, boo
 	return true;
 }
 
+bool DescribeGuestAbortTrap(uint64_t rip, char* detail, size_t detail_size) {
+	if (detail == nullptr || detail_size == 0) {
+		return false;
+	}
+	detail[0] = '\0';
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION mbi {};
+	if (VirtualQuery(reinterpret_cast<const void*>(rip), &mbi, sizeof(mbi)) == 0 ||
+	    mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+		return false;
+	}
+	const auto region_end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+	if (rip + 2 > region_end) {
+		return false;
+	}
+	const auto* p = reinterpret_cast<const uint8_t*>(rip);
+	if (p[0] == 0xcd) {
+		std::snprintf(detail, detail_size,
+		              "int 0x%02x (Windows AV Read[-1] — guest abort/trap, not poison memop)",
+		              static_cast<unsigned>(p[1]));
+		return true;
+	}
+	if (p[0] == 0xcc) {
+		std::snprintf(detail, detail_size, "int3 (guest abort/trap)");
+		return true;
+	}
+	if (p[0] == 0x0f && p[1] == 0x0b) {
+		std::snprintf(detail, detail_size, "ud2 (guest abort/trap)");
+		return true;
+	}
+#else
+	(void)rip;
+#endif
+	return false;
+}
+
 static bool LooksLikeAlignedSseMemOp(const uint8_t* rip, size_t* out_len) {
 	if (rip == nullptr) {
 		return false;
@@ -1027,6 +1063,14 @@ bool TryFixMisalignedSseAccess(void* native_context, uint64_t fault_vaddr) {
 bool TrySoftContinueCfgBitmap(void* native_context, uint64_t fault_vaddr) {
 	(void)native_context;
 	(void)fault_vaddr;
+	return false;
+}
+
+bool DescribeGuestAbortTrap(uint64_t rip, char* detail, size_t detail_size) {
+	(void)rip;
+	if (detail != nullptr && detail_size > 0) {
+		detail[0] = '\0';
+	}
 	return false;
 }
 #endif

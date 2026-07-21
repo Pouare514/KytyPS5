@@ -622,6 +622,48 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			        info->native_context, info->access_violation_vaddr, is_write, true)) {
 				return true;
 			}
+			// GPU UMD null-page AV (e.g. nvwgf2umx Read[8] after soft-continued Read[0]).
+			if (info->access_violation_vaddr < 0x10000ull) {
+				bool gpu_umd = false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				HMODULE owner = nullptr;
+				if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				                       reinterpret_cast<LPCSTR>(info->exception_address),
+				                       &owner) != 0 &&
+				    owner != nullptr) {
+					char module_name[MAX_PATH] = {};
+					if (GetModuleFileNameA(owner, module_name, MAX_PATH) != 0) {
+						for (char* p = module_name; *p != '\0'; ++p) {
+							if (*p >= 'A' && *p <= 'Z') {
+								*p = static_cast<char>(*p - 'A' + 'a');
+							}
+						}
+						gpu_umd = std::strstr(module_name, "nvwgf2um") != nullptr ||
+						          std::strstr(module_name, "nvoglv") != nullptr ||
+						          std::strstr(module_name, "amdvlk") != nullptr ||
+						          std::strstr(module_name, "amdxc64") != nullptr ||
+						          std::strstr(module_name, "igc64") != nullptr ||
+						          std::strstr(module_name, "igd10") != nullptr;
+					}
+				}
+#endif
+				if (gpu_umd && Loader::X64InstructionEmulator::TrySoftContinuePoisonAccess(
+				                   info->native_context, info->access_violation_vaddr, is_write,
+				                   true, true)) {
+					static std::atomic<uint32_t> umd_canon_n {0};
+					const uint32_t n = umd_canon_n.fetch_add(1, std::memory_order_relaxed) + 1;
+					char line[192];
+					std::snprintf(line, sizeof(line),
+					              "MemoryTrace: GPU UMD null-page soft-continue addr=0x%016" PRIx64
+					              " rip=0x%016" PRIx64 " n=%u",
+					              info->access_violation_vaddr, info->exception_address, n);
+					Common::LogFatalToFile(line);
+					std::fprintf(stderr, "%s\n", line);
+					// Do not park — can freeze GraphicsRing / flip producer threads.
+					return true;
+				}
+			}
 
 			// System-DLL RIP: only CONTINUE_SEARCH (defer-to-OS) for true Windows thread-stack
 			// growth (same AllocationBase as GetCurrentThreadStackLimits). Guest-stack / orphan
@@ -909,15 +951,143 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 
 			const bool is_write = info->access_violation_type == CoreAccess::Write;
-			if (Loader::X64InstructionEmulator::TryFixMisalignedSseAccess(
-			        info->native_context, info->access_violation_vaddr)) {
-				return true;
-			}
-			if (Loader::X64InstructionEmulator::TrySoftContinuePoisonAccess(
-			        info->native_context, info->access_violation_vaddr, is_write)) {
-				Common::NoteHaltReason("poison", "soft-continued AV -1/non-canonical");
-				std::fflush(stderr);
-				return true;
+			char       abort_detail[160] {};
+			const bool guest_abort_trap = Loader::X64InstructionEmulator::DescribeGuestAbortTrap(
+			    info->exception_address, abort_detail, sizeof(abort_detail));
+			if (!guest_abort_trap) {
+				if (Loader::X64InstructionEmulator::TryFixMisalignedSseAccess(
+				        info->native_context, info->access_violation_vaddr)) {
+					return true;
+				}
+				if (Loader::X64InstructionEmulator::TrySoftContinuePoisonAccess(
+				        info->native_context, info->access_violation_vaddr, is_write)) {
+					Common::NoteHaltReason("poison", "soft-continued AV -1/non-canonical");
+					std::fflush(stderr);
+					return true;
+				}
+				// NVIDIA/AMD/Intel UMD null-page deref during VideoOut create/upload: skip the
+				// faulting memop instead of soft-halting (PPSA21564 RegisterBuffers2).
+				{
+					bool gpu_umd = false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+					HMODULE owner = nullptr;
+					if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+					                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+					                       reinterpret_cast<LPCSTR>(info->exception_address),
+					                       &owner) != 0 &&
+					    owner != nullptr) {
+						char module_name[MAX_PATH] = {};
+						if (GetModuleFileNameA(owner, module_name, MAX_PATH) != 0) {
+							const char* base = module_name;
+							for (const char* p = module_name; *p != '\0'; ++p) {
+								if (*p == '\\' || *p == '/') {
+									base = p + 1;
+								}
+							}
+							char lower[MAX_PATH] = {};
+							size_t n = 0;
+							for (; base[n] != '\0' && n + 1 < sizeof(lower); ++n) {
+								const unsigned char c = static_cast<unsigned char>(base[n]);
+								lower[n] = static_cast<char>(
+								    (c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c);
+							}
+							lower[n] = '\0';
+							gpu_umd = std::strstr(lower, "nvwgf2um") != nullptr ||
+							          std::strstr(lower, "nvoglv") != nullptr ||
+							          std::strstr(lower, "amdvlk") != nullptr ||
+							          std::strstr(lower, "amdxc64") != nullptr ||
+							          std::strstr(lower, "atiogl") != nullptr ||
+							          std::strstr(lower, "igc64") != nullptr ||
+							          std::strstr(lower, "igd10") != nullptr ||
+							          std::strstr(lower, "intelocl") != nullptr;
+							if (gpu_umd) {
+								std::snprintf(line, sizeof(line),
+								              "MemoryTrace: GPU UMD poison AV mod=%s — "
+								              "soft-continue allow_system_module",
+								              base);
+								Common::LogFatalToFile(line);
+								std::fprintf(stderr, "%s\n", line);
+							}
+						}
+					}
+#endif
+					const bool null_page = info->access_violation_vaddr < 0x10000ull;
+					if (gpu_umd && null_page) {
+						static std::atomic<uint32_t> umd_soft_n {0};
+						const uint32_t n =
+						    umd_soft_n.fetch_add(1, std::memory_order_relaxed) + 1;
+						// Never park: GraphicsRing PrepareCpuFlip / present can fault in the
+						// UMD; parking that thread leaves VO stuck at Recording forever.
+						if (n > 64 && (n % 256u) == 0u) {
+							std::snprintf(line, sizeof(line),
+							              "MemoryTrace: GPU UMD null-page soft-continue "
+							              "n=%u (no park — keep producer alive)",
+							              n);
+							Common::LogFatalToFile(line);
+							std::fprintf(stderr, "%s\n", line);
+						}
+						if (Loader::X64InstructionEmulator::TrySoftContinuePoisonAccess(
+						        info->native_context, info->access_violation_vaddr, is_write,
+						        /*force=*/true, /*allow_system_module=*/true)) {
+							Common::NoteHaltReason("poison",
+							                       "soft-continued GPU UMD null-page AV");
+							std::fflush(stderr);
+							return true;
+						}
+					}
+				}
+			} else {
+				// Prefer guest C-strings often left in SysV arg regs after puts/assert.
+				auto log_guest_cstr = [](const char* reg, uint64_t addr) {
+					if (addr == 0 || addr == UINT64_MAX || addr >= (1ull << 47)) {
+						return;
+					}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+					MEMORY_BASIC_INFORMATION mbi {};
+					if (VirtualQuery(reinterpret_cast<const void*>(addr), &mbi, sizeof(mbi)) == 0 ||
+					    mbi.State != MEM_COMMIT ||
+					    (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+						return;
+					}
+					const auto*        p   = reinterpret_cast<const char*>(addr);
+					const auto         end = reinterpret_cast<uint64_t>(mbi.BaseAddress) +
+					                 mbi.RegionSize;
+					char               buf[240];
+					size_t             n = 0;
+					while (n + 1 < sizeof(buf) && addr + n < end) {
+						const char c = p[n];
+						if (c == '\0') {
+							break;
+						}
+						if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') {
+							return; // not a C string
+						}
+						buf[n++] = c;
+					}
+					if (n == 0) {
+						return;
+					}
+					buf[n] = '\0';
+					char line[320];
+					std::snprintf(line, sizeof(line), "guest_abort_trap %s=\"%s\"", reg, buf);
+					Common::LogFatalToFile(line);
+					std::fprintf(stderr, "%s\n", line);
+#else
+					(void)reg;
+#endif
+				};
+				log_guest_cstr("rdi", info->rdi);
+				log_guest_cstr("rsi", info->rsi);
+				log_guest_cstr("rcx", info->rcx);
+				log_guest_cstr("r8", info->r8);
+				Common::LogFatalToFile(abort_detail);
+				std::fprintf(stderr, "guest_abort_trap: %s\n", abort_detail);
+				Common::NoteHaltReason("guest_abort_trap", abort_detail);
+				Common::FlushHleRingToFatal("guest_abort_trap");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				TerminateProcess(GetCurrentProcess(), 321);
+#endif
+				std::_Exit(321);
 			}
 
 			Common::NoteHaltReason("poison", "unresolvable AV — halt 321");

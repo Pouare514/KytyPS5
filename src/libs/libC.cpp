@@ -417,6 +417,10 @@ static KYTY_SYSV_ABI int libc_printf(VA_ARGS) {
 static KYTY_SYSV_ABI int puts(const char* s) {
 	PRINT_NAME();
 
+	if (s != nullptr) {
+		Common::LogFatalToFile(s);
+	}
+
 	return GetGuestPrintfStdFunc()("%s\n", s);
 }
 

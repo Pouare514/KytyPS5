@@ -42,6 +42,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -58,6 +59,10 @@
 #define KYTY_DBG_INPUT
 
 namespace Libs::Graphics {
+
+namespace {
+std::atomic<uint32_t> g_present_ok_count {0};
+} // namespace
 
 struct PreparedFrame {
 	VulkanImage                    image {VulkanImageType::Unknown};
@@ -332,7 +337,15 @@ static void VulkanDeleteSwapchain(VulkanSwapchain* s) {
 	auto  swapchain_owner = std::unique_ptr<VulkanSwapchain>(s);
 	auto& graphics        = g_window_ctx->graphic_ctx;
 
-	Transfer::WaitForGraphicsIdle();
+	// First show-path recreate runs while GraphicsRing may still own in-flight GFX work from
+	// PrepareCpuFlip. deviceWaitIdle under all queue locks can hang indefinitely there; skip
+	// until at least one present has completed successfully.
+	if (g_present_ok_count.load(std::memory_order_acquire) > 0) {
+		Transfer::WaitForGraphicsIdle();
+	} else {
+		LOGF("FlipTrace: swapchain delete skip waitIdle (never presented)\n");
+		fprintf(stderr, "FlipTrace: swapchain delete skip waitIdle\n");
+	}
 
 	if (s->image_acquired_semaphores != nullptr) {
 		for (uint32_t i = 0; i < s->swapchain_images_count; i++) {
@@ -376,9 +389,15 @@ static void VulkanRefreshSurfaceSize() {
 
 static void VulkanRecreateSwapchain() {
 	LOGF("Recreating Vulkan swapchain\n");
+	fprintf(stderr, "FlipTrace: swapchain recreate begin\n");
 	VulkanRefreshSurfaceSize();
+	fprintf(stderr, "FlipTrace: swapchain recreate after refresh size=%ux%u\n",
+	        g_window_ctx->graphic_ctx.screen_width, g_window_ctx->graphic_ctx.screen_height);
 	VulkanDeleteSwapchain(g_window_ctx->swapchain);
+	g_window_ctx->swapchain = nullptr;
+	fprintf(stderr, "FlipTrace: swapchain recreate after delete\n");
 	g_window_ctx->swapchain = VulkanCreateSwapchain(2);
+	fprintf(stderr, "FlipTrace: swapchain recreate done\n");
 }
 
 static void ValidatePreparedCommand(CommandBuffer& buffer) {
@@ -398,6 +417,25 @@ PreparedFrame& WindowPrepareFrame(CommandBuffer& buffer, VideoOutVulkanImage& im
 	Common::LockGuard render_lock(GetRenderContext().GetMutex());
 	GetRenderContext().GetTextureCache().RefreshVideoOut(image);
 	ConfigurePreparedFrame(*frame, image.extent, image.format);
+	// After UMD-safe UploadVideoOut skip the VO image stays Undefined. CopyImage from that
+	// layout records invalid barriers and stalls GraphicsRing Flush before Complete/Ready.
+	if (image.layout == vk::ImageLayout::eUndefined) {
+		vk::ClearColorValue clear {};
+		// Opaque dark blue so a successful present is visible without guest CPU pixels.
+		clear.float32[0] = 0.05f;
+		clear.float32[1] = 0.10f;
+		clear.float32[2] = 0.25f;
+		clear.float32[3] = 1.0f;
+		Transfer::ClearColorImage(buffer, frame->image, clear);
+		static std::atomic<uint32_t> clear_n {0};
+		const uint32_t n = clear_n.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n <= 8 || (n % 64) == 0) {
+			LOGF("FlipTrace: VO present clear (no CPU upload) n=%u %ux%u\n", n,
+			     image.extent.width, image.extent.height);
+			fprintf(stderr, "FlipTrace: VO present clear (no CPU upload) n=%u\n", n);
+		}
+		return *frame;
+	}
 	ImageImageCopy copy {image};
 	copy.width  = image.extent.width;
 	copy.height = image.extent.height;
@@ -434,9 +472,21 @@ void WindowPresentFrame(PreparedFrame& frame) {
 		WindowUpdateIcon();
 
 		SDL_ShowWindow(g_window_ctx->window);
+		SDL_RaiseWindow(g_window_ctx->window);
+		SDL_PumpEvents();
 
 		g_window_ctx->window_hidden = false;
-		VulkanRecreateSwapchain();
+		// WindowEnsureVisible already showed the HWND. Recreating here races PrepareCpuFlip's
+		// in-flight GFX work (waitIdle deadlocks; skip-waitIdle hangs in destroy). Reuse the
+		// init swapchain for the first present.
+		if (g_window_ctx->swapchain == nullptr) {
+			fprintf(stderr, "FlipTrace: WindowPresentFrame first-show create swapchain\n");
+			g_window_ctx->swapchain = VulkanCreateSwapchain(2);
+		} else {
+			VulkanRefreshSurfaceSize();
+			fprintf(stderr, "FlipTrace: WindowPresentFrame first-show reuse swapchain\n");
+			LOGF("FlipTrace: WindowPresentFrame first-show reuse swapchain\n");
+		}
 	}
 
 	auto* swapchain = g_window_ctx->swapchain;
@@ -533,6 +583,12 @@ void WindowPresentFrame(PreparedFrame& frame) {
 	}
 
 	swapchain->present_frame = (present_frame + 1u) % swapchain->swapchain_images_count;
+
+	g_present_ok_count.fetch_add(1, std::memory_order_release);
+	LOGF("FlipTrace: WindowPresentFrame ok n=%u\n",
+	     g_present_ok_count.load(std::memory_order_relaxed));
+	fprintf(stderr, "FlipTrace: WindowPresentFrame ok n=%u\n",
+	        g_present_ok_count.load(std::memory_order_relaxed));
 
 	RenderDocOnPresent();
 	WindowUpdateTitle();

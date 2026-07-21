@@ -416,6 +416,12 @@ static BOOL WINAPI ConsoleCtrlFilter(DWORD ctrl) {
 	char message[96];
 	std::snprintf(message, sizeof(message), "ConsoleCtrl: type=%" PRIu32, ctrl);
 	EmergencyLogRaw(message);
+	LogFatalToFile(message);
+	// CTRL_CLOSE_EVENT (2): keep process alive so a hung RegisterBuffers2 / soft-idle is not
+	// misreported as a clean exit (watcher would otherwise see 0xC000013A).
+	if (ctrl == 2u /* CTRL_CLOSE_EVENT */) {
+		return TRUE;
+	}
 	return FALSE;
 }
 
@@ -519,10 +525,16 @@ static void LogExitHookFrames(const char* tag, UINT code) {
 }
 
 static void SoftIdleForever(const char* why, UINT code) {
-	if (code == 321u || code == 0xC0000025u) {
+	if (code == 321u || code == 0xC0000025u || code == 0xC0000417u) {
 		char detail[96];
 		std::snprintf(detail, sizeof(detail), "%s code=%u", why != nullptr ? why : "exit", code);
-		NoteHaltReason(code == 321u ? "ExitProcess321" : "TerminateNonContinuable", detail);
+		const char* kind = "ExitProcess321";
+		if (code == 0xC0000025u) {
+			kind = "TerminateNonContinuable";
+		} else if (code == 0xC0000417u) {
+			kind = "InvalidCruntimeParameter";
+		}
+		NoteHaltReason(kind, detail);
 	}
 	char message[320];
 	std::snprintf(message, sizeof(message),
@@ -559,6 +571,10 @@ static bool ShouldSoftIdleExitCode(UINT code) {
 		return true;
 	}
 	if (code == 0xC0000025u) { // EXCEPTION_NONCONTINUABLE_EXCEPTION (HostException::FailFast)
+		return true;
+	}
+	// CRT invalid-parameter / abort teardown — soft-idle so we can inspect RegisterBuffers2.
+	if (code == 0xC0000417u) { // STATUS_INVALID_CRUNTIME_PARAMETER
 		return true;
 	}
 	return false;
