@@ -740,7 +740,8 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline& pipeline, vk::Rende
 	rasterizer.polygonMode             = vk::PolygonMode::eFill;
 	rasterizer.cullMode                = cull_mode;
 	rasterizer.frontFace               = front_face;
-	rasterizer.depthBiasEnable         = VK_FALSE;
+	rasterizer.depthBiasEnable =
+	    static_params.depth_bias_enable ? VK_TRUE : VK_FALSE;
 	rasterizer.depthBiasConstantFactor = 0.0f;
 	rasterizer.depthBiasClamp          = 0.0f;
 	rasterizer.depthBiasSlopeFactor    = 0.0f;
@@ -898,6 +899,7 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline& pipeline, vk::Rende
 	    vk::DynamicState::eViewport,
 	    vk::DynamicState::eScissor,
 	    vk::DynamicState::eLineWidth,
+	    vk::DynamicState::eDepthBias,
 	    vk::DynamicState::eStencilCompareMask,
 	    vk::DynamicState::eStencilReference,
 	    vk::DynamicState::eStencilWriteMask,
@@ -907,6 +909,7 @@ void CreatePipelineInternal(PipelineCache::GraphicsPipeline& pipeline, vk::Rende
 	    vk::DynamicState::eViewport,
 	    vk::DynamicState::eScissor,
 	    vk::DynamicState::eLineWidth,
+	    vk::DynamicState::eDepthBias,
 	    vk::DynamicState::eStencilCompareMask,
 	    vk::DynamicState::eStencilReference,
 	    vk::DynamicState::eStencilWriteMask,

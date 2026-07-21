@@ -246,7 +246,15 @@ static void RtCheck(const HW::RenderTarget& rt) {
 		//  EXIT_NOT_IMPLEMENTED(rt.base_addr == 0);
 
 		EXIT_NOT_IMPLEMENTED(rt.pitch.pitch_div8_minus1 != 0);
-		EXIT_NOT_IMPLEMENTED(rt.pitch.fmask_pitch_div8_minus1 != 0);
+		if (rt.pitch.fmask_pitch_div8_minus1 != 0) {
+			static bool logged = false;
+			if (!logged) {
+				LOGF("RenderTarget: temporary: ignoring PS5 FMASK pitch "
+				     "fmask_pitch_div8_minus1=0x%08" PRIx32 "\n",
+				     rt.pitch.fmask_pitch_div8_minus1);
+				logged = true;
+			}
+		}
 		EXIT_NOT_IMPLEMENTED(rt.slice.slice_div64_minus1 != 0);
 
 		EXIT_NOT_IMPLEMENTED(rt.view.base_array_slice_index > rt.view.last_array_slice_index);
@@ -272,16 +280,29 @@ static void RtCheck(const HW::RenderTarget& rt) {
 			EXIT_NOT_IMPLEMENTED(rt.attrib.num_samples == 0 && rt.attrib.num_fragments == 0);
 			static bool logged = false;
 			if (!logged) {
-				LOGF("RenderTarget: temporary: ignoring PS5 FMASK metadata for single-sample MSAA "
-				     "fallback, fmask=0x%016" PRIx64 "\n",
-				     rt.fmask.addr);
+				LOGF("RenderTarget: temporary: ignoring PS5 FMASK metadata for native MSAA "
+				     "path, fmask=0x%016" PRIx64 " samples=0x%08" PRIx32
+				     " fragments=0x%08" PRIx32 "\n",
+				     rt.fmask.addr, rt.attrib.num_samples, rt.attrib.num_fragments);
 				logged = true;
 			}
 		}
 
 		// EXIT_NOT_IMPLEMENTED(rt.info.fmask_compression_mode != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(rt.info.fmask_data_compression_disable != false);
-		EXIT_NOT_IMPLEMENTED(rt.info.fmask_one_frag_mode != false);
+		if (rt.info.fmask_data_compression_disable) {
+			static bool logged = false;
+			if (!logged) {
+				LOGF("RenderTarget: temporary: ignoring PS5 FMASK data compression disable\n");
+				logged = true;
+			}
+		}
+		if (rt.info.fmask_one_frag_mode) {
+			static bool logged = false;
+			if (!logged) {
+				LOGF("RenderTarget: temporary: ignoring PS5 FMASK one-frag mode\n");
+				logged = true;
+			}
+		}
 
 		if (rt.info.cmask_fast_clear_enable || rt.info.dcc_compression_enable) {
 			static bool logged = false;
@@ -406,13 +427,33 @@ static void RtCheck(const HW::RenderTarget& rt) {
 
 		// EXIT_NOT_IMPLEMENTED(rt.dcc_max_uncompressed_block_size != 0x00000002);
 		// EXIT_NOT_IMPLEMENTED(rt.dcc.max_compressed_block_size != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(rt.dcc.min_compressed_block_size != 0x00000000);
+		if (rt.dcc.min_compressed_block_size != 0x00000000) {
+			static bool logged = false;
+			if (!logged) {
+				LOGF("RenderTarget: temporary: ignoring PS5 DCC min_compressed_block_size="
+				     "0x%08" PRIx32 "\n",
+				     rt.dcc.min_compressed_block_size);
+				logged = true;
+			}
+		}
 		// EXIT_NOT_IMPLEMENTED(rt.dcc.color_transform != 0x00000000);
-		EXIT_NOT_IMPLEMENTED(rt.dcc.overwrite_combiner_disable != false);
+		if (rt.dcc.overwrite_combiner_disable) {
+			static bool logged = false;
+			if (!logged) {
+				LOGF("RenderTarget: temporary: ignoring PS5 DCC overwrite combiner disable\n");
+				logged = true;
+			}
+		}
 		// EXIT_NOT_IMPLEMENTED(rt.dcc.force_independent_blocks != false);
 		// EXIT_NOT_IMPLEMENTED(rt.dcc.independent_128b_blocks != false);
 		// EXIT_NOT_IMPLEMENTED(rt.dcc.data_write_on_dcc_clear_to_reg != false);
-		EXIT_NOT_IMPLEMENTED(rt.dcc.dcc_clear_key_enable != false);
+		if (rt.dcc.dcc_clear_key_enable) {
+			static bool logged = false;
+			if (!logged) {
+				LOGF("RenderTarget: temporary: ignoring PS5 DCC clear key enable\n");
+				logged = true;
+			}
+		}
 		if (rt.cmask.addr != 0x0000000000000000 || rt.cmask_slice.slice_minus1 != 0x00000000 ||
 		    rt.fmask.addr != 0x0000000000000000 ||
 		    (rt.fmask_slice.slice_minus1 != 0x00000000 &&
@@ -772,14 +813,6 @@ static void McCheck(const HW::ModeControl& c) {
 	}
 	EXIT_NOT_IMPLEMENTED(c.polymode_front_ptype != 0 && c.polymode_front_ptype != 2);
 	EXIT_NOT_IMPLEMENTED(c.polymode_back_ptype != 0 && c.polymode_back_ptype != 2);
-	if (c.poly_offset_front_enable || c.poly_offset_back_enable) {
-		static bool logged = false;
-		if (!logged) {
-			LOGF("\t temporary: PA_SU_SC_MODE_CNTL.POLY_OFFSET_*_ENABLE is not implemented; "
-			     "continuing without depth bias\n");
-			logged = true;
-		}
-	}
 	if (c.vtx_window_offset_enable) {
 		static bool logged = false;
 		if (!logged) {
