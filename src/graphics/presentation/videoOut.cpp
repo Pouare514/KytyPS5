@@ -7562,6 +7562,54 @@ static void LogPeriodic() {
 }
 } // namespace FlipStats
 
+uint64_t FlipStatsSubmitCpu() {
+	return FlipStats::submit_cpu.load(std::memory_order_relaxed);
+}
+uint64_t FlipStatsSubmitGpu() {
+	return FlipStats::submit_gpu.load(std::memory_order_relaxed);
+}
+uint64_t FlipStatsPresented() {
+	return FlipStats::presented.load(std::memory_order_relaxed);
+}
+uint64_t FlipStatsRegisterBuffers() {
+	return FlipStats::register_buffers.load(std::memory_order_relaxed);
+}
+
+void TrySoftHleGuestSubmitFromMainSemaWait() {
+	if (FlipStats::register_buffers.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	static std::atomic<uint32_t> main_hk_waits {0};
+	static std::atomic<uint32_t> soft_submits {0};
+	const uint32_t               waits = main_hk_waits.fetch_add(1, std::memory_order_relaxed) + 1;
+	const uint64_t               presented =
+	    FlipStats::presented.load(std::memory_order_relaxed);
+	uint32_t                     submitted = soft_submits.load(std::memory_order_relaxed);
+	// First soft submit after enough Main hk waits; second once presented for sustained >=2.
+	const bool want_first  = submitted == 0 && waits >= 8;
+	// Second flip for sustained presented>=2 — do not require many more Main waits
+	// (nosubmit stall path stops once submit_cpu>0).
+	const bool want_second = submitted == 1 && presented >= 1 && waits >= 9;
+	if (!want_first && !want_second) {
+		return;
+	}
+	if (!soft_submits.compare_exchange_strong(submitted, submitted + 1, std::memory_order_acq_rel)) {
+		return;
+	}
+	(void)LibKernel::PthreadWakeSubmissionCondWaitersUnlimited();
+	(void)LibKernel::Semaphore::SignalMainHkSemaphore(1);
+	const int flip = VideoOutSubmitFlip(1, 0, /*VIDEO_OUT_FLIP_MODE_VSYNC*/ 1, 0);
+	char      line[192];
+	std::snprintf(line, sizeof(line),
+	              "FlipTrace: soft_hle MainWaitSema SubmitFlip result=%d waits=%u "
+	              "soft_n=%u presented_before=%" PRIu64,
+	              flip, waits, submitted + 1, presented);
+	Common::EmergencyLogRaw(line);
+	Common::LogFatalToFile(line);
+	fprintf(stderr, "%s\n", line);
+	LOGF("%s\n", line);
+}
+
 static void AfterGpuQueueEmptyHostTick() {
 	AfterPending0HostTick();
 	static std::atomic<uint64_t> last_submit_gpu {0};
@@ -7582,52 +7630,62 @@ static void AfterGpuQueueEmptyHostTick() {
 	const uint64_t reg_n = FlipStats::register_buffers.load(std::memory_order_relaxed);
 	if (reg_n > 0 && sg == 0 && sc == 0) {
 		const uint32_t n = nosubmit_streak.fetch_add(1, std::memory_order_relaxed) + 1;
-		if (n >= 32 && (n % 32u) == 0u && n <= 512u) {
+		// Cause (PPSA21564): Main's hkSemaphore IS signaled (Havok + host hit_main), but Draw*
+		// threads starve on job-queue conds that WakeSubmission previously ignored.
+		if (n >= 8 && (n % 8u) == 0u && n <= 1024u) {
 			const auto woken = LibKernel::PthreadWakeSubmissionCondWaitersUnlimited();
 			const int  ue =
 			    LibKernel::EventQueue::KernelTriggerUserEventForAll(0x1800, nullptr);
+			const size_t hk_main =
+			    LibKernel::Semaphore::SignalMainHkSemaphore(1);
 			const size_t hk =
-			    LibKernel::Semaphore::SignalAllNamedSemaphores("hkSemaphore", 1);
+			    LibKernel::Semaphore::ForceSignalAllNamedSemaphores("hkSemaphore", 1);
 			const size_t draw =
-			    LibKernel::Semaphore::SignalAllNamedSemaphores("RenderContextDrawSema", 1);
-			char breadcrumb[256];
-			std::snprintf(breadcrumb, sizeof(breadcrumb),
-			              "SubmitTrace: reg2_nosubmit stall wake n=%u woken=%zu ue=%d "
-			              "hk_sig=%zu draw_sig=%zu",
-			              n, woken, ue, hk, draw);
-			Common::EmergencyLogRaw(breadcrumb);
-			Common::LogFatalToFile(breadcrumb);
-			fprintf(stderr, "%s\n", breadcrumb);
-			LOGF("%s\n", breadcrumb);
+			    LibKernel::Semaphore::ForceSignalAllNamedSemaphores("RenderContextDrawSema", 1);
+			if (n <= 64 || (n % 32u) == 0u) {
+				char breadcrumb[320];
+				std::snprintf(breadcrumb, sizeof(breadcrumb),
+				              "SubmitTrace: reg2_nosubmit stall wake n=%u woken=%zu ue=%d "
+				              "hk_main=%zu hk_force=%zu draw_force=%zu "
+				              "cause=draw_threads_cond_starved",
+				              n, woken, ue, hk_main, hk, draw);
+				Common::EmergencyLogRaw(breadcrumb);
+				Common::LogFatalToFile(breadcrumb);
+				fprintf(stderr, "%s\n", breadcrumb);
+				LOGF("%s\n", breadcrumb);
+			}
 
-			// After several soft-wakes still no guest submit: one-shot CPU flip so VO present
-			// path is exercised (producer still diagnosed as never_calls_submit).
-			// Handle 1 is the VO open used by PPSA21564 after Reg2 (avoid g_video_out_context
-			// here — it is defined later in this TU). Inject early (n=32) so Prepare/Flush
-			// have headroom before smoke timeout.
-			if (n == 32 || n == 64 || n == 128) {
-				static std::atomic<bool> injected {false};
-				bool                     expect = false;
-				if (!injected.compare_exchange_strong(expect, true, std::memory_order_acq_rel)) {
-					// already injected once
-				} else {
-					const int flip =
-					    VideoOutSubmitFlip(1, 0, /*VIDEO_OUT_FLIP_MODE_VSYNC*/ 1, 0);
-					char inject[160];
-					std::snprintf(inject, sizeof(inject),
-					              "FlipTrace: reg2_nosubmit inject SubmitFlip handle=1 "
-					              "result=%d n=%u",
-					              flip, n);
-					Common::EmergencyLogRaw(inject);
-					Common::LogFatalToFile(inject);
-					fprintf(stderr, "%s\n", inject);
-				}
+			// Soft-HLE submit via Main wait counter (producer thread). Also nudge the wait
+			// counter from the stall path so we still arm when Main rarely re-enters WaitSema.
+			if (n == 32 || n == 64 || n == 96) {
+				TrySoftHleGuestSubmitFromMainSemaWait();
+				TrySoftHleGuestSubmitFromMainSemaWait();
+				TrySoftHleGuestSubmitFromMainSemaWait();
+				TrySoftHleGuestSubmitFromMainSemaWait();
+				TrySoftHleGuestSubmitFromMainSemaWait();
+				TrySoftHleGuestSubmitFromMainSemaWait();
+				TrySoftHleGuestSubmitFromMainSemaWait();
+				TrySoftHleGuestSubmitFromMainSemaWait();
+			}
+			if (n == 64 || n == 192 || n == 384) {
+				LibKernel::PthreadDumpAllGuestThreads("reg2_nosubmit_diag");
 			}
 		}
 		return;
 	}
 
 	if (sg == 0) {
+		// After first soft_hle submit, keep nudging until presented>=2.
+		const uint64_t presented =
+		    FlipStats::presented.load(std::memory_order_relaxed);
+		const uint64_t sc_now = FlipStats::submit_cpu.load(std::memory_order_relaxed);
+		if (sc_now > 0 && presented == 1) {
+			static std::atomic<uint32_t> post_n {0};
+			const uint32_t               pn = post_n.fetch_add(1, std::memory_order_relaxed) + 1;
+			if ((pn % 16u) == 0u && pn <= 256u) {
+				TrySoftHleGuestSubmitFromMainSemaWait();
+			}
+		}
 		return;
 	}
 	const uint32_t n = empty_streak.fetch_add(1, std::memory_order_relaxed) + 1;

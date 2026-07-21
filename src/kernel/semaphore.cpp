@@ -33,6 +33,10 @@ constexpr uint32_t SIGNAL_APC_POLL_MICROS = 10000;
 namespace {
 std::mutex              g_named_sema_mutex;
 std::vector<KernelSema> g_named_semas;
+// PPSA21564: Main's current hkSemaphore wait target (host KernelSemaPrivate*).
+std::atomic<uintptr_t> g_main_hk_wait_ptr {0};
+std::atomic<uint32_t>  g_main_hk_guest_signal_hits {0};
+std::atomic<uint32_t>  g_main_hk_host_signal_hits {0};
 } // namespace
 
 class KernelSemaPrivate {
@@ -48,6 +52,9 @@ public:
 
 	Result Cancel(int set_count, int* num_waiting_threads);
 	Result Signal(int signal_count);
+	// Like Signal but never returns InvalCount when already at max — still wakes waiters.
+	// Used by host soft-HLE when Draw/Havok semas sit at max with no forward progress.
+	Result ForceSignal(int signal_count);
 	Result Wait(int need_count, uint32_t* ptr_micros);
 
 	Result Poll(int need_count) {
@@ -164,6 +171,25 @@ KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
 
 	m_cond_var.SignalAll();
 
+	return Result::Ok;
+}
+
+KernelSemaPrivate::Result KernelSemaPrivate::ForceSignal(int signal_count) {
+	Common::LockGuard lock(m_mutex);
+
+	if (m_status == Status::Deleted) {
+		return Result::Deleted;
+	}
+	if (signal_count < 1) {
+		return Result::InvalCount;
+	}
+
+	if (m_count < m_max_count) {
+		const int room = m_max_count - m_count;
+		m_count += (signal_count < room) ? signal_count : room;
+	}
+	WakeWaiters();
+	m_cond_var.SignalAll();
 	return Result::Ok;
 }
 
@@ -317,6 +343,11 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 	}
 
 	if (PthreadCurrentIsSubmissionRelated() || PthreadCurrentIsMainRelated()) {
+		if (sem->GetName() == "hkSemaphore" && PthreadCurrentIsMainRelated()) {
+			g_main_hk_wait_ptr.store(reinterpret_cast<uintptr_t>(sem),
+			                         std::memory_order_release);
+			Libs::VideoOut::TrySoftHleGuestSubmitFromMainSemaWait();
+		}
 		static std::atomic<uint32_t> logs {0};
 		const auto                   n = logs.fetch_add(1, std::memory_order_relaxed);
 		if (n < 64) {
@@ -326,16 +357,19 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 				PthreadGetname(self, name);
 			}
 			const uint64_t ra = reinterpret_cast<uint64_t>(__builtin_return_address(0));
-			LOGF("SubmitTrace: SemaWait name=%s tid=%d sem=%s need=%d timo=%s ra=0x%016" PRIx64 "\n",
+			LOGF("SubmitTrace: SemaWait name=%s tid=%d sem=%s need=%d timo=%s ra=0x%016" PRIx64
+			     " ptr=%p\n",
 			     name, PthreadGetUniqueId(self), sem->GetName().c_str(), need,
-			     time == nullptr ? "inf" : "set", ra);
-			fprintf(stderr, "SubmitTrace: SemaWait name=%s tid=%d sem=%s\n", name,
-			        PthreadGetUniqueId(self), sem->GetName().c_str());
-			if (n < 16) {
-				char breadcrumb[256];
+			     time == nullptr ? "inf" : "set", ra, static_cast<void*>(sem));
+			fprintf(stderr, "SubmitTrace: SemaWait name=%s tid=%d sem=%s ptr=%p\n", name,
+			        PthreadGetUniqueId(self), sem->GetName().c_str(), static_cast<void*>(sem));
+			if (n < 24 || (sem->GetName() == "hkSemaphore" && n < 48)) {
+				char breadcrumb[288];
 				std::snprintf(breadcrumb, sizeof(breadcrumb),
-				              "SubmitTrace: SemaWait name=%s tid=%d sem=%s need=%d ra=0x%016" PRIx64,
-				              name, PthreadGetUniqueId(self), sem->GetName().c_str(), need, ra);
+				              "SubmitTrace: SemaWait name=%s tid=%d sem=%s need=%d "
+				              "ra=0x%016" PRIx64 " ptr=%p",
+				              name, PthreadGetUniqueId(self), sem->GetName().c_str(), need, ra,
+				              static_cast<void*>(sem));
 				Common::EmergencyLogRaw(breadcrumb);
 				Common::LogFatalToFile(breadcrumb);
 			}
@@ -389,16 +423,24 @@ int KYTY_SYSV_ABI KernelSignalSema(KernelSema sem, int count) {
 	if (sem->GetName() == "hkSemaphore") {
 		static std::atomic<uint32_t> hk_sig_n {0};
 		const auto                   n = hk_sig_n.fetch_add(1, std::memory_order_relaxed);
-		if (n < 48) {
+		const uintptr_t              main_wait =
+		    g_main_hk_wait_ptr.load(std::memory_order_acquire);
+		const bool hits_main = main_wait != 0 && main_wait == reinterpret_cast<uintptr_t>(sem);
+		if (hits_main) {
+			g_main_hk_guest_signal_hits.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (n < 48 || hits_main) {
 			char tname[32] = {};
 			auto* self     = PthreadSelfOrNull();
 			if (self != nullptr) {
 				PthreadGetname(self, tname);
 			}
-			char breadcrumb[192];
+			char breadcrumb[256];
 			std::snprintf(breadcrumb, sizeof(breadcrumb),
-			              "SubmitTrace: SignalSema hkSemaphore by=%s tid=%d count=%d ptr=%p",
-			              tname, PthreadGetUniqueId(self), count, static_cast<void*>(sem));
+			              "SubmitTrace: SignalSema hkSemaphore by=%s tid=%d count=%d ptr=%p "
+			              "hits_main=%d main_wait=%p",
+			              tname, PthreadGetUniqueId(self), count, static_cast<void*>(sem),
+			              hits_main ? 1 : 0, reinterpret_cast<void*>(main_wait));
 			Common::EmergencyLogRaw(breadcrumb);
 			Common::LogFatalToFile(breadcrumb);
 			fprintf(stderr, "%s\n", breadcrumb);
@@ -448,15 +490,79 @@ size_t SignalAllNamedSemaphores(const char* name, int count) {
 		snapshot = g_named_semas;
 	}
 	size_t signaled = 0;
+	size_t matched  = 0;
+	size_t inval    = 0;
+	const uintptr_t main_wait = g_main_hk_wait_ptr.load(std::memory_order_acquire);
+	bool            hit_main  = false;
 	for (KernelSema sem: snapshot) {
 		if (sem == nullptr || sem->GetName() != name) {
 			continue;
 		}
-		if (sem->Signal(count) == KernelSemaPrivate::Result::Ok) {
+		++matched;
+		const auto result = sem->Signal(count);
+		if (result == KernelSemaPrivate::Result::Ok) {
+			++signaled;
+			if (main_wait != 0 && main_wait == reinterpret_cast<uintptr_t>(sem)) {
+				hit_main = true;
+				g_main_hk_host_signal_hits.fetch_add(1, std::memory_order_relaxed);
+			}
+		} else if (result == KernelSemaPrivate::Result::InvalCount) {
+			++inval;
+		}
+	}
+	static std::atomic<uint32_t> dump_n {0};
+	const uint32_t               dn = dump_n.fetch_add(1, std::memory_order_relaxed);
+	if (dn < 16 || (hit_main && dn < 32)) {
+		char line[256];
+		std::snprintf(line, sizeof(line),
+		              "SubmitTrace: SignalAllNamed name=%s matched=%zu ok=%zu inval=%zu "
+		              "hit_main=%d main_wait=%p guest_hits=%u host_hits=%u",
+		              name, matched, signaled, inval, hit_main ? 1 : 0,
+		              reinterpret_cast<void*>(main_wait),
+		              g_main_hk_guest_signal_hits.load(std::memory_order_relaxed),
+		              g_main_hk_host_signal_hits.load(std::memory_order_relaxed));
+		Common::EmergencyLogRaw(line);
+		Common::LogFatalToFile(line);
+		fprintf(stderr, "%s\n", line);
+	}
+	return signaled;
+}
+
+size_t ForceSignalAllNamedSemaphores(const char* name, int count) {
+	if (name == nullptr || count < 1) {
+		return 0;
+	}
+	std::vector<KernelSema> snapshot;
+	{
+		std::lock_guard lock(g_named_sema_mutex);
+		snapshot = g_named_semas;
+	}
+	size_t signaled = 0;
+	for (KernelSema sem: snapshot) {
+		if (sem == nullptr || sem->GetName() != name) {
+			continue;
+		}
+		if (sem->ForceSignal(count) == KernelSemaPrivate::Result::Ok) {
 			++signaled;
 		}
 	}
 	return signaled;
+}
+
+size_t SignalMainHkSemaphore(int count) {
+	if (count < 1) {
+		return 0;
+	}
+	const uintptr_t main_wait = g_main_hk_wait_ptr.load(std::memory_order_acquire);
+	if (main_wait == 0) {
+		return 0;
+	}
+	auto* sem = reinterpret_cast<KernelSema>(main_wait);
+	if (sem->ForceSignal(count) != KernelSemaPrivate::Result::Ok) {
+		return 0;
+	}
+	g_main_hk_host_signal_hits.fetch_add(1, std::memory_order_relaxed);
+	return 1;
 }
 
 int KYTY_SYSV_ABI KernelCancelSema(KernelSema sem, int count, int* threads) {

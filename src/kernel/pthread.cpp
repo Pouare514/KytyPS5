@@ -505,6 +505,17 @@ static bool IsSubmissionRelatedName(const std::string& name) {
 	       name.find("Submit") != std::string::npos;
 }
 
+// PPSA21564: Draw*/Havok/Gfx sit on job-queue conds that never get Mixed/Compute wakes.
+// Without them the render pipeline stays idle and Main never reaches guest SubmitFlip.
+static bool IsProducerPipelineName(const std::string& name) {
+	if (IsSubmissionRelatedName(name)) {
+		return true;
+	}
+	return name.find("Draw") != std::string::npos || name.find("Havok") != std::string::npos ||
+	       name.find("Gfx") != std::string::npos || name.find("Render") != std::string::npos ||
+	       name.find("Geometry") != std::string::npos || name.find("Streamer") != std::string::npos;
+}
+
 static bool IsMixedName(const std::string& name) {
 	return name.find("Mixed") != std::string::npos;
 }
@@ -2058,6 +2069,7 @@ void PthreadSnapshotGuestThread(int unique_id, uint32_t host_tid_hint, const cha
 // Wake those waiters once when synthetic EOP / AGC user interrupt runs.
 // Also wake Main-related (incl. unique_id==8 / "VMem" on MCL) — otherwise queue_empty stall
 // kicks only Mixed/Compute (woken=0) while Main stays CondWait and submit_gpu freezes ~60–70.
+// PPSA21564: also wake Draw*/Havok/Gfx producer-pipeline waiters (see IsProducerPipelineName).
 size_t PthreadPool::WakeSubmissionCondWaiters() {
 	Common::LockGuard lock(m_mutex);
 	size_t            woken = 0;
@@ -2065,7 +2077,7 @@ size_t PthreadPool::WakeSubmissionCondWaiters() {
 		if (p == nullptr || p->free || p->waiting_cond == nullptr) {
 			continue;
 		}
-		if (!IsSubmissionRelatedName(p->name) && !IsMainRelatedThread(p)) {
+		if (!IsProducerPipelineName(p->name) && !IsMainRelatedThread(p)) {
 			continue;
 		}
 		auto* cond = p->waiting_cond;

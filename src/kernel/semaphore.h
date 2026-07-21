@@ -29,6 +29,10 @@ int KYTY_SYSV_ABI PthreadSemGetvalue(void* sem, int* value);
 // Soft-wake helper: signal every live KernelSema whose name matches (e.g. "hkSemaphore").
 // Used when Main is stuck waiting on Havok job semas before the first VideoOut submit.
 size_t SignalAllNamedSemaphores(const char* name, int count);
+// Like SignalAllNamed but clamps at max instead of failing — wakes Draw/Havok semas at ceiling.
+size_t ForceSignalAllNamedSemaphores(const char* name, int count);
+// Signal only the hkSemaphore instance Main is currently waiting on (if any).
+size_t SignalMainHkSemaphore(int count);
 
 } // namespace Libs::LibKernel::Semaphore
 
