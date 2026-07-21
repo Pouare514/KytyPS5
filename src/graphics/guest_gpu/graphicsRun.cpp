@@ -128,8 +128,8 @@ public:
 	void WaitForIdle();
 	bool IsIdle();
 
-	void SetCp(CommandProcessor* cp) {
-		m_cp = cp;
+	void SetCp(CommandProcessor& cp) {
+		m_cp = &cp;
 		Start();
 	}
 
@@ -177,8 +177,8 @@ public:
 	void WaitForIdle();
 	bool IsIdle();
 
-	void SetCp(CommandProcessor* cp) {
-		m_cp = cp;
+	void SetCp(CommandProcessor& cp) {
+		m_cp = &cp;
 		Start();
 	}
 
@@ -390,7 +390,7 @@ void Gpu::Init() {
 	m_gfx_cp   = new CommandProcessor;
 	m_gfx_ring = new GraphicsRing;
 	m_gfx_cp->SetQueue(GraphicContext::QUEUE_GFX);
-	m_gfx_ring->SetCp(m_gfx_cp);
+	m_gfx_ring->SetCp(*m_gfx_cp);
 
 	EXIT_IF(GraphicContext::QUEUE_COMPUTE_NUM < 8);
 }
@@ -408,7 +408,7 @@ ComputeRing* Gpu::GetRing(uint32_t ring_id) {
 	if (m_compute_ring[v] == nullptr) {
 		m_compute_ring[v] = new ComputeRing;
 		m_compute_ring[v]->SetQueueId(queue_id);
-		m_compute_ring[v]->SetCp(m_compute_cp[pipe_id]);
+		m_compute_ring[v]->SetCp(*m_compute_cp[pipe_id]);
 	}
 
 	return m_compute_ring[v];
@@ -483,14 +483,12 @@ void CommandProcessor::BufferFlush() {
 }
 
 void CommandProcessor::BufferFlushAndWait() {
-	CommandBuffer* submitted = nullptr;
-
-	{
+	auto& submitted = [&]() -> CommandBuffer& {
 		Common::LockGuard lock(m_mutex);
-		submitted = m_scheduler.FlushAndGetSubmitted();
-	}
+		return m_scheduler.FlushAndGetSubmitted();
+	}();
 
-	submitted->WaitForFence();
+	submitted.WaitForFence();
 }
 
 void CommandProcessor::BufferWait() {
@@ -501,7 +499,7 @@ void CommandProcessor::BufferWait() {
 		std::array<CommandBuffer*, CommandScheduler::BuffersNum> buffers {};
 		{
 			Common::LockGuard lock(m_mutex);
-			m_scheduler.CopyBuffers(&buffers);
+			m_scheduler.CopyBuffers(buffers);
 		}
 
 		for (auto* buf: buffers) {
@@ -839,14 +837,14 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
 	}
 	if (src_sel == 2) {
-		GetGpuResources()->FillBuffer(
+		GetGpuResources().FillBuffer(
 		    CurrentBuffer(), dst_address_or_offset, num_bytes,
 		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu));
 		return;
 	}
 	if (src_memory) {
-		GetGpuResources()->CopyBuffer(CurrentBuffer(), dst_address_or_offset,
-		                              src_address_or_offset_or_immediate, num_bytes);
+		GetGpuResources().CopyBuffer(CurrentBuffer(), dst_address_or_offset,
+		                             src_address_or_offset_or_immediate, num_bytes);
 		return;
 	}
 	EXIT("unsupported dmaData source selector 0x%02" PRIx8 "\n", src_sel);
@@ -858,9 +856,6 @@ void GraphicsRing::Submit(OwnedCmdBuffer draw_buffer, OwnedCmdBuffer const_buffe
 	EXIT_IF(m_cp == nullptr);
 
 	Common::LockGuard lock(m_mutex);
-
-	WindowWaitForGraphicInitialized();
-	GraphicsRenderCreateContext();
 
 	if (m_done) {
 		while (!m_idle) {
@@ -893,8 +888,6 @@ void GraphicsRing::SubmitFlipPreparation() {
 	EXIT_IF(m_cp == nullptr);
 	Common::LockGuard lock(m_mutex);
 
-	WindowWaitForGraphicInitialized();
-	GraphicsRenderCreateContext();
 	if (m_done) {
 		while (!m_idle) {
 			m_idle_cond_var.Wait(&m_mutex);
@@ -1080,9 +1073,6 @@ void ComputeRing::Submit(OwnedCmdBuffer buffer, bool trigger_agc_interrupt_on_do
 	EXIT_IF(buffer.data == nullptr);
 	EXIT_IF(buffer.num_dw == 0);
 
-	WindowWaitForGraphicInitialized();
-	GraphicsRenderCreateContext();
-
 	if (m_done) {
 		m_done = false;
 	}
@@ -1117,11 +1107,11 @@ void CommandProcessor::Run(uint32_t* data, uint32_t num_dw) {
 	KYTY_PROFILER_BLOCK("CommandProcessor::Run");
 
 	struct RunScope {
-		explicit RunScope(CommandProcessor* cp): prev(g_current_run_cp) { g_current_run_cp = cp; }
+		explicit RunScope(CommandProcessor& cp): prev(g_current_run_cp) { g_current_run_cp = &cp; }
 		~RunScope() { g_current_run_cp = prev; }
 
 		CommandProcessor* prev;
-	} run_scope(this);
+	} run_scope(*this);
 
 	auto* cmd = data;
 	auto  dw  = num_dw;
@@ -1190,7 +1180,7 @@ void CommandProcessor::Run(uint32_t* data, uint32_t num_dw) {
 			EXIT("unknown op\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n", num_dw - dw, cmd_id);
 		}
 
-		auto s = pfunc(this, cmd_id & ~1u, cmd, dw, num_dw);
+		auto s = pfunc(*this, cmd_id & ~1u, cmd, dw, num_dw);
 
 		// LOGF("\t %05" PRIx32 ": %u\n", num_dw - dw, s);
 
@@ -1299,26 +1289,9 @@ void CommandProcessor::DrawIndex(uint32_t index_count, const void* index_addr, u
 		     "\n",
 		     vertex_offset_add, first_instance);
 	}
-	const auto frame_num = GraphicsRunGetFrameNum();
-	if (frame_num >= 480) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
-			const auto& oa = m_ucfg.GetGdsOaCounter(m_ucfg.GetGdsOaState().GetIndex());
-			LOGF("QueuePoint DrawIndex: frame=%u submit=%" PRIu64
-			     " queue=%d index_count=%u instances=%u prim=%u "
-			     "es=0x%016" PRIx64 " ps=0x%016" PRIx64
-			     " oa_index=%u oa_enabled=%s oa_addr=0x%04" PRIx32 " oa_space=0x%08" PRIx32 "\n",
-			     frame_num, m_submit_id, m_scheduler.Queue(), index_count, instance_count,
-			     m_ucfg.GetPrimType(), m_sh_ctx.GetVs().es_regs.data_addr,
-			     m_sh_ctx.GetPs().ps_regs.data_addr, m_ucfg.GetGdsOaState().GetIndex(),
-			     oa.IsCounterEnabled() ? "true" : "false", oa.GetAddressBytes(),
-			     oa.GetSpaceAvailable());
-		}
-	}
-
-	RenderDrawIndex(m_submit_id, CurrentBuffer(), &m_ctx, &m_ucfg, &m_sh_ctx, m_index_type_and_size,
-	                index_count, index_addr, flags, type, instance_count,
-	                render_target_slice_offset, vertex_offset_add, first_instance);
+	RenderDrawIndex(m_submit_id, CurrentBuffer(), m_index_type_and_size, index_count, index_addr,
+	                flags, type, instance_count, render_target_slice_offset, vertex_offset_add,
+	                first_instance);
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count,
@@ -1338,8 +1311,8 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	auto* index_addr = reinterpret_cast<const void*>(
 	    m_index_base_addr + static_cast<uint64_t>(index_offset) * index_size);
 
-	RenderDrawIndex(m_submit_id, CurrentBuffer(), &m_ctx, &m_ucfg, &m_sh_ctx, m_index_type_and_size,
-	                index_count, index_addr, flags, 1, m_num_instances);
+	RenderDrawIndex(m_submit_id, CurrentBuffer(), m_index_type_and_size, index_count, index_addr,
+	                flags, 1, m_num_instances);
 }
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
@@ -1567,8 +1540,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
-		RenderDispatchDirect(m_submit_id, CurrentBuffer(), &m_ctx, &m_sh_ctx, thread_group_x,
-		                     thread_group_y, thread_group_z, mode);
+		RenderDispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x, thread_group_y,
+		                     thread_group_z, mode);
 	}
 
 	constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
@@ -1615,26 +1588,9 @@ void CommandProcessor::DrawIndexAuto(uint32_t index_count, uint32_t flags,
 	Common::LockGuard lock(m_mutex);
 
 	CheckBuffer();
-	const auto frame_num = GraphicsRunGetFrameNum();
-	if (frame_num >= 480) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
-			const auto& oa = m_ucfg.GetGdsOaCounter(m_ucfg.GetGdsOaState().GetIndex());
-			LOGF("QueuePoint DrawIndexAuto: frame=%u submit=%" PRIu64
-			     " queue=%d index_count=%u instances=%u prim=%u "
-			     "first_vertex=%u first_instance=%u es=0x%016" PRIx64 " ps=0x%016" PRIx64
-			     " oa_index=%u oa_enabled=%s oa_addr=0x%04" PRIx32 " oa_space=0x%08" PRIx32 "\n",
-			     frame_num, m_submit_id, m_scheduler.Queue(), index_count, instance_count,
-			     m_ucfg.GetPrimType(), first_vertex, first_instance,
-			     m_sh_ctx.GetVs().es_regs.data_addr, m_sh_ctx.GetPs().ps_regs.data_addr,
-			     m_ucfg.GetGdsOaState().GetIndex(), oa.IsCounterEnabled() ? "true" : "false",
-			     oa.GetAddressBytes(), oa.GetSpaceAvailable());
-		}
-	}
 
-	RenderDrawIndexAuto(m_submit_id, CurrentBuffer(), &m_ctx, &m_ucfg, &m_sh_ctx, index_count,
-	                    flags, render_target_slice_offset, instance_count, first_vertex,
-	                    first_instance);
+	RenderDrawIndexAuto(m_submit_id, CurrentBuffer(), index_count, flags,
+	                    render_target_slice_offset, instance_count, first_vertex, first_instance);
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
@@ -1971,7 +1927,7 @@ void CommandProcessor::Flip() {
 		     m_flip.handle, m_flip.index, m_flip.flip_mode, m_flip.flip_arg);
 	}
 
-	auto* command = CurrentBuffer();
+	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareDisplayBufferFlip(command, m_flip.handle, m_flip.index,
 	                                               m_flip.flip_mode, m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, m_flip.handle, m_flip.index,
@@ -1992,7 +1948,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	}
 
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
-	auto* command = CurrentBuffer();
+	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareDisplayBufferFlip(command, m_flip.handle, m_flip.index,
 	                                               m_flip.flip_mode, m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
@@ -2020,7 +1976,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 		EXIT("unknown event type\n");
 	}
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
-	auto* command = CurrentBuffer();
+	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareDisplayBufferFlip(command, m_flip.handle, m_flip.index,
 	                                               m_flip.flip_mode, m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(
@@ -2037,10 +1993,10 @@ void CommandProcessor::PrepareCpuFlip() {
 		EXIT("invalid graphics-thread CPU flip preparation\n");
 	}
 	struct RunScope {
-		explicit RunScope(CommandProcessor* cp) { g_current_run_cp = cp; }
+		explicit RunScope(CommandProcessor& cp) { g_current_run_cp = &cp; }
 		~RunScope() { g_current_run_cp = nullptr; }
 	};
-	RunScope run_scope(this);
+	RunScope run_scope(*this);
 
 	auto prepared_id = Presentation::DisplayBufferPrepareNextFlipOnGpu(CurrentBuffer());
 	LOGF("FlipTrace: PrepareCpuFlip prepared_id=%" PRIu64 " flushing\n", prepared_id);

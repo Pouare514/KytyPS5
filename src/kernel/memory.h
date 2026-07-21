@@ -103,6 +103,7 @@ void     ApplyMemoryRegionsFromProcParam(uint64_t flex_scalar);
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+void PrepareHostWrite(uint64_t vaddr, uint64_t size);
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);
