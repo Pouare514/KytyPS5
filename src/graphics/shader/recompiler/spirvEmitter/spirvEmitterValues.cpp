@@ -388,6 +388,15 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	return value;
 }
 
+uint32_t EmitSubgroupId(EmitterState& state) {
+	if (state.subgroup_id_variable == 0) {
+		return ConstantU32(state, 0);
+	}
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction({OpLoad, state.uint_type, value, state.subgroup_id_variable});
+	return value;
+}
+
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind) {
 	for (const auto& input: state.inputs) {
 		if (input.kind == kind) {

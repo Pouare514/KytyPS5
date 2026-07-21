@@ -269,7 +269,14 @@ static void vs_check(const HW::VertexShaderInfo& vs, const HW::ShaderRegisters& 
 		EXIT_NOT_IMPLEMENTED(vs.gs_regs.rsrc1.lds_configuration != false);
 		EXIT_NOT_IMPLEMENTED(vs.gs_regs.rsrc1.gs_vgpr_component_count != 3);
 		EXIT_NOT_IMPLEMENTED(vs.gs_regs.rsrc1.fp16_overflow != false);
-		EXIT_NOT_IMPLEMENTED(vs.gs_regs.rsrc2.scratch_en != false);
+		if (vs.gs_regs.rsrc2.scratch_en) {
+			static std::atomic_uint log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+				LOGF("\t temporary: accepting GS scratch_en "
+				     "(host TMPRING SSBO + SubgroupId wave base; FLAT_SCRATCH aperture not "
+				     "emulated)\n");
+			}
+		}
 		EXIT_NOT_IMPLEMENTED(vs.gs_regs.rsrc2.offchip_lds != false);
 		EXIT_NOT_IMPLEMENTED(vs.gs_regs.rsrc2.es_vgpr_component_count != 3);
 		EXIT_NOT_IMPLEMENTED(vs.gs_regs.rsrc2.lds_size != 0);
@@ -328,7 +335,14 @@ static void ps_check(const HW::PsStageRegisters& ps, const HW::ShaderRegisters& 
 	EXIT_NOT_IMPLEMENTED(ps.rsrc1.cu_group_disable != false);
 	EXIT_NOT_IMPLEMENTED(ps.rsrc1.require_forward_progress != false);
 	EXIT_NOT_IMPLEMENTED(ps.rsrc1.fp16_overflow != false);
-	EXIT_NOT_IMPLEMENTED(ps.rsrc2.scratch_en != false);
+	if (ps.rsrc2.scratch_en) {
+		static std::atomic_uint log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+			LOGF("\t temporary: accepting PS scratch_en "
+			     "(host TMPRING SSBO + SubgroupId wave base; FLAT_SCRATCH aperture not "
+			     "emulated)\n");
+		}
+	}
 	// EXIT_NOT_IMPLEMENTED(ps.user_sgpr != 0 && ps.user_sgpr != 4 && ps.user_sgpr != 12);
 	EXIT_NOT_IMPLEMENTED(ps.rsrc2.wave_cnt_en != false);
 	if (ps.rsrc2.extra_lds_size != 0) {
@@ -411,7 +425,16 @@ static void cs_check(const HW::CsStageRegisters& cs, const HW::ShaderRegisters& 
 	// EXIT_NOT_IMPLEMENTED(cs.vgprs != 0x00 && cs.vgprs != 0x01);
 	// EXIT_NOT_IMPLEMENTED(cs.sgprs != 0x01 && cs.sgprs != 0x02);
 	EXIT_NOT_IMPLEMENTED(cs.bulky != 0x00);
-	EXIT_NOT_IMPLEMENTED(cs.scratch_en != 0x00);
+	if (cs.scratch_en != 0x00) {
+		static std::atomic_uint log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+			LOGF("\t temporary: accepting CS scratch_en=0x%02" PRIx8
+			     " tmpring=0x%08" PRIx32
+			     " (host TMPRING SSBO + SubgroupId wave base; FLAT_SCRATCH aperture not "
+			     "emulated)\n",
+			     cs.scratch_en, cs.tmpring_size);
+		}
+	}
 	// EXIT_NOT_IMPLEMENTED(cs.user_sgpr != 0x0c);
 	if (cs.tgid_x_en == 0x00) {
 		static bool logged = false;
@@ -992,6 +1015,9 @@ static std::string ShaderDescribeSpecialization(const ShaderRecompiler::IR::Prog
 	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
 		ret += fmt::format(" a{}[base=0x{:x}]", i, program.info.addresses[i].specialized_base);
 	}
+	if (program.scratch_wave_bytes != 0) {
+		ret += fmt::format(" scratch_wave={}", program.scratch_wave_bytes);
+	}
 	return ret;
 }
 
@@ -1030,6 +1056,7 @@ static void ShaderAppendNativeSpecialization(std::vector<uint32_t>&             
 		ids.push_back(static_cast<uint32_t>(address.specialized_base));
 		ids.push_back(static_cast<uint32_t>(address.specialized_base >> 32u));
 	}
+	ids.push_back(program.scratch_wave_bytes);
 }
 
 static std::span<const uint32_t> AddShaderProgramPermutation(const char* stage,
@@ -1077,7 +1104,8 @@ bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegis
 		return false;
 	}
 	const auto shader_hash = regs.gs_regs.chksum;
-	const auto program_id  = ShaderGetIdVS(regs, info, false);
+	auto       program_id  = ShaderGetIdVS(regs, info, false);
+	program_id.ids.push_back(HW::DecodeTmpringSize(sh.m_spiTmpringSize).wave_bytes);
 	const auto key =
 	    MakeShaderStageProgramKey(ShaderType::Vertex, shader_hash, program_id, lane_mask_mode);
 
@@ -1116,7 +1144,8 @@ bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegist
 	ShaderGetStaticInputInfoPS(regs, sh, vs_info, target_export_mapping, ps_info);
 	const auto shader_hash =
 	    regs.ps_regs.chksum != 0 ? regs.ps_regs.chksum : regs.ps_regs.data_addr;
-	const auto program_id = ShaderGetIdPS(regs, ps_info, false);
+	auto       program_id = ShaderGetIdPS(regs, ps_info, false);
+	program_id.ids.push_back(HW::DecodeTmpringSize(sh.m_spiTmpringSize).wave_bytes);
 	const auto key =
 	    MakeShaderStageProgramKey(ShaderType::Pixel, shader_hash, program_id, lane_mask_mode);
 
@@ -1152,7 +1181,8 @@ bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegi
 
 	ShaderGetStaticInputInfoCS(regs, sh, info);
 	const auto shader_hash = regs.cs_regs.data_addr;
-	const auto program_id  = ShaderGetIdCS(regs, info, false);
+	auto       program_id  = ShaderGetIdCS(regs, info, false);
+	program_id.ids.push_back(HW::DecodeTmpringSize(regs.cs_regs.tmpring_size).wave_bytes);
 	const auto key         = MakeShaderStageProgramKey(ShaderType::Compute, shader_hash, program_id,
 	                                                   ShaderLaneMaskMode::NativeWave);
 
@@ -1403,6 +1433,7 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler VS";
+	options.scratch_tmpring_size = sh.m_spiTmpringSize;
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
@@ -1456,6 +1487,7 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler PS";
+	options.scratch_tmpring_size = sh.m_spiTmpringSize;
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
@@ -1506,6 +1538,7 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler CS";
+	options.scratch_tmpring_size = regs.cs_regs.tmpring_size;
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;

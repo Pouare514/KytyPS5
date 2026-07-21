@@ -388,6 +388,16 @@ void RenderDispatchDirect(uint64_t submit_id, RenderCommandBuffer& buffer, uint3
 		     cs_regs.cs_regs.data_addr);
 	}
 
+	{
+		const uint32_t tmpring = cs_regs.cs_regs.tmpring_size;
+		if (cs_regs.cs_regs.scratch_en != 0 || tmpring != 0) {
+			const auto layout = HW::DecodeTmpringSize(tmpring);
+			if (layout.ring_bytes != 0) {
+				GetRenderContext().GetScratchRingBuffer().EnsureCapacity(layout.ring_bytes);
+			}
+		}
+	}
+
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	if (use_thread_dimensions) {
 		input_info.dispatch_thread_dimensions = true;

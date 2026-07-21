@@ -1,5 +1,9 @@
 #include "graphics/shader/recompiler/spirvEmitter/spirvEmitterInternal.h"
 
+#include "common/logging/log.h"
+
+#include <atomic>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitDppWriteActiveBool(EmitterState& state, const IR::Operand& dst) {
@@ -352,17 +356,42 @@ uint32_t EmitFlatVirtualAddress(EmitterState& state, const IR::Instruction& inst
 	return EmitSelectU32Value(state, valid, relative_low, ConstantU32(state, UINT32_MAX));
 }
 
+uint32_t EmitScratchByteAddress(EmitterState& state, const IR::Instruction& inst,
+                                uint32_t first_src, uint32_t src_count) {
+	auto relative = EmitRelativeAddress(state, inst, first_src, src_count);
+	const auto wave_bytes = state.program.scratch_wave_bytes;
+	if (wave_bytes == 0) {
+		return relative;
+	}
+	static std::atomic_uint log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+		LOGF("temporary: Scratch byte address uses SubgroupId * %u wave_bytes "
+		     "(host TMPRING SSBO; not guest FLAT_SCRATCH)\n",
+		     wave_bytes);
+	}
+	const auto in_range = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpULessThan, state.bool_type, in_range, relative, ConstantU32(state, wave_bytes)});
+	relative = EmitSelectU32Value(state, in_range, relative, ConstantU32(state, 0));
+	const auto wave_base =
+	    EmitBinaryU32(state, OpIMul, EmitSubgroupId(state), ConstantU32(state, wave_bytes));
+	return EmitAddU32(state, wave_base, relative);
+}
+
 uint32_t EmitMemoryByteAddress(EmitterState& state, const IR::Instruction& inst,
                                const IR::MemoryInfo& mem, uint32_t first_src, uint32_t src_count) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
 		return EmitBufferByteAddress(state, inst, first_src, src_count);
 	}
+	if (mem.kind == IR::ResourceKind::Scratch) {
+		return EmitScratchByteAddress(state, inst, first_src, src_count);
+	}
 	if (mem.kind == IR::ResourceKind::Flat ||
-	    ((mem.kind == IR::ResourceKind::Global || mem.kind == IR::ResourceKind::Scratch) &&
+	    (mem.kind == IR::ResourceKind::Global &&
 	     state.program.info.addresses[mem.resource].source == IR::ScalarProvenance::Unknown)) {
 		return EmitFlatVirtualAddress(state, inst, first_src, src_count);
 	}
-	if (mem.kind == IR::ResourceKind::Global || mem.kind == IR::ResourceKind::Scratch) {
+	if (mem.kind == IR::ResourceKind::Global) {
 		return EmitRelativeAddress(state, inst, first_src, src_count);
 	}
 	return EmitByteAddress(state, inst, first_src, src_count);

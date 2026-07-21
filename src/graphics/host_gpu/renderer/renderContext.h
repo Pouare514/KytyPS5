@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/framebufferCache.h"
 #include "graphics/host_gpu/renderer/gdsBuffer.h"
 #include "graphics/host_gpu/renderer/gpuResourceManager.h"
+#include "graphics/host_gpu/renderer/scratchRingBuffer.h"
 #include "graphics/host_gpu/renderer/pipelineCache.h"
 #include "graphics/host_gpu/renderer/samplerCache.h"
 #include "graphics/host_gpu/renderer/textureCache.h"
@@ -35,6 +36,7 @@ public:
 	FramebufferCache&   GetFramebufferCache() { return m_framebuffer_cache; }
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	GdsBuffer&          GetGdsBuffer() { return m_gds_buffer; }
+	ScratchRingBuffer&  GetScratchRingBuffer() { return m_scratch_ring; }
 	GpuResourceManager& GetGpuResources() { return m_gpu_resources; }
 	BufferCache&        GetBufferCache() { return m_gpu_resources.GetBufferCache(); }
 	TextureCache&       GetTextureCache() { return m_gpu_resources.GetTextureCache(); }
@@ -57,6 +59,7 @@ private:
 	FramebufferCache   m_framebuffer_cache;
 	SamplerCache       m_sampler_cache;
 	GdsBuffer          m_gds_buffer;
+	ScratchRingBuffer  m_scratch_ring;
 	GpuResourceManager m_gpu_resources;
 
 	Common::Mutex                  m_eop_mutex;

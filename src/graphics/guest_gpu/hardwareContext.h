@@ -531,7 +531,25 @@ struct CsStageRegisters {
 	uint8_t  tg_size_en     = 0;
 	uint8_t  tidig_comp_cnt = 0;
 	uint8_t  lds_size       = 0;
+	// Raw COMPUTE_TMPRING_SIZE (RDNA2 / Pre-GFX11 encoding). See DecodeTmpringSize.
+	uint32_t tmpring_size   = 0;
 };
+
+// Pre-GFX11 SPI/COMPUTE_TMPRING_SIZE: WAVES [11:0], WAVESIZE [24:12] in units of 256 dwords.
+struct TmpringLayout {
+	uint32_t waves      = 0;
+	uint32_t wave_bytes = 0;
+	uint64_t ring_bytes = 0;
+};
+
+inline TmpringLayout DecodeTmpringSize(uint32_t raw) {
+	TmpringLayout layout;
+	layout.waves            = raw & 0xfffu;
+	const uint32_t wavesize = (raw >> 12u) & 0x1fffu;
+	layout.wave_bytes       = wavesize << 10u; // wavesize * 256 dwords * 4 bytes
+	layout.ring_bytes = static_cast<uint64_t>(layout.waves) * static_cast<uint64_t>(layout.wave_bytes);
+	return layout;
+}
 
 struct EsStageRegisters {
 	uint64_t data_addr = 0;
@@ -585,6 +603,9 @@ struct ShaderRegisters {
 	uint32_t m_spiVsOutConfig     = 0;
 	uint32_t m_spiShaderPosFormat = 0;
 	uint32_t m_paClVsOutCntl      = 0;
+	// Raw SPI_TMPRING_SIZE (RDNA2 / Pre-GFX11). Decoded via DecodeTmpringSize for the
+	// host scratch SSBO; FLAT_SCRATCH guest aperture is still not emulated.
+	uint32_t m_spiTmpringSize     = 0;
 
 	uint32_t ps_interpolator_settings[32] = {0};
 	// uint32_t ps_input_num                 = 0;
@@ -916,6 +937,8 @@ public:
 	void SetVsOutConfig(uint32_t value) { m_sh_regs.m_spiVsOutConfig = value; }
 	void SetShaderPosFormat(uint32_t value) { m_sh_regs.m_spiShaderPosFormat = value; }
 	void SetClVsOutCntl(uint32_t value) { m_sh_regs.m_paClVsOutCntl = value; }
+	void SetSpiTmpringSize(uint32_t value) { m_sh_regs.m_spiTmpringSize = value; }
+	[[nodiscard]] uint32_t GetSpiTmpringSize() const { return m_sh_regs.m_spiTmpringSize; }
 	void SetShaderIdxFormat(uint32_t value) { m_sh_regs.m_spiShaderIdxFormat = value; }
 	void SetNggSubgrpCntl(uint32_t value) { m_sh_regs.m_geNggSubgrpCntl = value; }
 	void SetGsInstanceCnt(uint32_t value) { m_sh_regs.m_vgtGsInstanceCnt = value; }

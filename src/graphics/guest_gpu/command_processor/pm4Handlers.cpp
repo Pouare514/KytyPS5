@@ -226,10 +226,15 @@ static void HwCtxIgnorePointState([[maybe_unused]] uint32_t cmd_offset,
 static void HwCtxIgnoreBorderColorTableAddr([[maybe_unused]] uint32_t cmd_offset,
                                             [[maybe_unused]] uint32_t value) {}
 
-static void HwCtxIgnoreSpiTmpringSize(uint32_t value) {
+static void HwCtxSetSpiTmpringSizeValue(CommandProcessor& cp, uint32_t value) {
+	// RDNA2 §9.8: SPI_TMPRING_SIZE sizes the private scratch ring. Store the raw
+	// register; FLAT_SCRATCH / per-wave offset injection is not wired yet.
+	cp.GetCtx().SetSpiTmpringSize(value);
 	static std::atomic<uint32_t> log_count {0};
 	if (log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
-		LOGF("\t temporary: accepting SPI_TMPRING_SIZE = 0x%08" PRIx32 "\n", value);
+		LOGF("\t temporary: storing SPI_TMPRING_SIZE = 0x%08" PRIx32
+		     " (RDNA2 private scratch; FLAT_SCRATCH not yet emulated)\n",
+		     value);
 	}
 }
 
@@ -238,7 +243,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetSpiTmpringSize) {
 
 	EXIT_NOT_IMPLEMENTED(reg_num != 1);
 
-	HwCtxIgnoreSpiTmpringSize(buffer[0]);
+	HwCtxSetSpiTmpringSizeValue(cp, buffer[0]);
 
 	return 1;
 }
@@ -1492,13 +1497,23 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 		case Pm4::COMPUTE_NUM_THREAD_X: cs_regs.num_thread_x = value; break;
 		case Pm4::COMPUTE_NUM_THREAD_Y: cs_regs.num_thread_y = value; break;
 		case Pm4::COMPUTE_NUM_THREAD_Z: cs_regs.num_thread_z = value; break;
+		case Pm4::COMPUTE_TMPRING_SIZE: {
+			// RDNA2 §9.8: COMPUTE_TMPRING_SIZE sizes the compute scratch ring.
+			cs_regs.tmpring_size = value;
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+				LOGF("\t temporary: storing COMPUTE_TMPRING_SIZE = 0x%08" PRIx32
+				     " (RDNA2 private scratch; FLAT_SCRATCH not yet emulated)\n",
+				     value);
+			}
+			break;
+		}
 		case Pm4::COMPUTE_START_X:
 		case Pm4::COMPUTE_START_Y:
 		case Pm4::COMPUTE_START_Z:
 		case Pm4::COMPUTE_RESOURCE_LIMITS:
 		case Pm4::COMPUTE_DESTINATION_EN_SE0:
 		case Pm4::COMPUTE_DESTINATION_EN_SE1:
-		case Pm4::COMPUTE_TMPRING_SIZE:
 		case Pm4::COMPUTE_DESTINATION_EN_SE2:
 		case Pm4::COMPUTE_DESTINATION_EN_SE3:
 		case Pm4::COMPUTE_PGM_RSRC3:
@@ -3821,7 +3836,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 		cp.GetCtx().SetShaderIdxFormat(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::SPI_TMPRING_SIZE] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreSpiTmpringSize(value);
+		HwCtxSetSpiTmpringSizeValue(cp, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_CL_VS_OUT_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetClVsOutCntl(value);

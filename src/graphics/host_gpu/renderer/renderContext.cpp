@@ -12,7 +12,7 @@ namespace Libs::Graphics {
 RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_pipeline_cache(graphics), m_descriptor_cache(graphics),
       m_framebuffer_cache(graphics), m_sampler_cache(graphics), m_gds_buffer(graphics),
-      m_gpu_resources(graphics) {
+      m_scratch_ring(graphics), m_gpu_resources(graphics) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 }
 

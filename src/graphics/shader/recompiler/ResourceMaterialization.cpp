@@ -48,6 +48,9 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 
 uint64_t AddressSpecialization(const AddressResource&           resource,
                                const ResourceSnapshot::Address& snapshot) {
+	if (resource.kind == ResourceKind::Scratch) {
+		return 0;
+	}
 	return resource.kind == ResourceKind::Flat || resource.source == ScalarProvenance::Unknown
 	           ? snapshot.binding_base
 	           : snapshot.guest_base - snapshot.binding_base;
@@ -222,6 +225,9 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 		requests.push_back({sampler.source, sampler.first_use_pc});
 	}
 	for (const auto& address: program.info.addresses) {
+		if (address.kind == ResourceKind::Scratch) {
+			continue;
+		}
 		if (address.source != ScalarProvenance::Unknown) {
 			requests.push_back({address.source, address.first_use_pc});
 		}
@@ -247,6 +253,11 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	next.samplers.assign(cursor, cursor + program.info.samplers.size());
 	cursor += program.info.samplers.size();
 	for (const auto& address: program.info.addresses) {
+		if (address.kind == ResourceKind::Scratch) {
+			// Host scratch SSBO: bind at offset 0; wave base is applied in the emitter.
+			next.addresses.push_back({0, 0});
+			continue;
+		}
 		if (address.source != ScalarProvenance::Unknown) {
 			const auto value = *cursor++;
 			auto       base  = (static_cast<uint64_t>(value.dwords[0]) |

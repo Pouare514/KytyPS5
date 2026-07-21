@@ -538,6 +538,15 @@ bool ProgramNeedsSubgroupLocalInvocationId(const IR::Program& program) {
 	return false;
 }
 
+bool ProgramNeedsSubgroupId(const IR::Program& program) {
+	for (const auto& address: program.info.addresses) {
+		if (address.kind == IR::ResourceKind::Scratch) {
+			return true;
+		}
+	}
+	return false;
+}
+
 uint32_t PointerForRegister(const EmitterState& state, IR::Register reg) {
 	for (const auto& binding: state.registers) {
 		if (binding.reg == reg) {

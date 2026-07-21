@@ -761,6 +761,8 @@ struct Program {
 	uint32_t                wave_size           = 64;
 	uint32_t                user_data_base      = 0;
 	uint32_t                user_data_count     = 64;
+	uint32_t                scratch_wave_bytes  = 0;
+	uint64_t                scratch_ring_bytes  = 0;
 	bool                    dispatcher_fallback = false;
 	CFG::FailureKind        cfg_failure_kind    = CFG::FailureKind::None;
 	std::string             fallback_reason;

@@ -722,7 +722,21 @@ static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw
 		EXIT("ShaderCompileInfoVS failed for draw %s\n", draw.name);
 	}
 
+	auto ensure_scratch_ring = [&]() {
+		const bool scratch_en =
+		    vertex_shader_info.gs_regs.rsrc2.scratch_en ||
+		    (state.ps_active && pixel_shader_info.ps_regs.rsrc2.scratch_en);
+		const uint32_t tmpring = shader_regs.m_spiTmpringSize;
+		if (scratch_en || tmpring != 0) {
+			const auto layout = HW::DecodeTmpringSize(tmpring);
+			if (layout.ring_bytes != 0) {
+				GetRenderContext().GetScratchRingBuffer().EnsureCapacity(layout.ring_bytes);
+			}
+		}
+	};
+
 	if (!state.ps_active) {
+		ensure_scratch_ring();
 		return;
 	}
 	if (log_phases) {
@@ -732,6 +746,7 @@ static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw
 	                         target_export_mapping, state.ps_input_info, state.ps_shader)) {
 		EXIT("ShaderCompileInfoPS failed for draw %s\n", draw.name);
 	}
+	ensure_scratch_ring();
 }
 
 static void BindDrawVertexBuffers(uint64_t submit_id, RenderCommandBuffer& buffer,

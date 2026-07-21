@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/shader/recompiler/BindingLayout.h"
 #include "graphics/shader/recompiler/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ResourceTracking.h"
@@ -819,6 +820,11 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	}
 	if (!IR::SpecializeResources(ir, resources, error)) {
 		return false;
+	}
+	{
+		const auto layout       = HW::DecodeTmpringSize(options.scratch_tmpring_size);
+		ir.scratch_wave_bytes = layout.wave_bytes;
+		ir.scratch_ring_bytes = layout.ring_bytes;
 	}
 
 	ShaderVertexInputInfo  default_vertex {};

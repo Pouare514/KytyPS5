@@ -185,6 +185,10 @@ void AllocateInputVariables(EmitterState& state) {
 		state.subgroup_local_invocation_id_variable = state.builder.AllocateId();
 		state.interface_variables.push_back(state.subgroup_local_invocation_id_variable);
 	}
+	if (state.needs_subgroup_id) {
+		state.subgroup_id_variable = state.builder.AllocateId();
+		state.interface_variables.push_back(state.subgroup_id_variable);
+	}
 }
 
 static uint32_t AllocateInterfaceVariable(EmitterState& state) {
@@ -245,6 +249,15 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 		if (state.stage == ShaderType::Pixel) {
 			state.builder.AddAnnotation(
 			    {OpDecorate, state.subgroup_local_invocation_id_variable, DecorationFlat});
+		}
+	}
+	if (state.subgroup_id_variable != 0) {
+		state.builder.AddName(state.subgroup_id_variable, "gl_SubgroupID");
+		state.builder.AddAnnotation(
+		    {OpDecorate, state.subgroup_id_variable, DecorationBuiltIn, BuiltInSubgroupId});
+		if (state.stage == ShaderType::Pixel) {
+			state.builder.AddAnnotation(
+			    {OpDecorate, state.subgroup_id_variable, DecorationFlat});
 		}
 	}
 	for (const auto& input: state.inputs) {
@@ -503,7 +516,7 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		state.builder.AddCapability({CapabilityStorageImageWriteWithoutFormat});
 	}
 	if (state.needs_subgroup_ballot || state.needs_subgroup_shuffle ||
-	    state.needs_subgroup_local_invocation_id) {
+	    state.needs_subgroup_local_invocation_id || state.needs_subgroup_id) {
 		state.builder.AddCapability({CapabilityGroupNonUniform});
 	}
 	if (state.needs_subgroup_ballot) {
@@ -613,6 +626,10 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	if (state.subgroup_local_invocation_id_variable != 0) {
 		state.builder.AddType({OpVariable, state.ptr_input_uint,
 		                        state.subgroup_local_invocation_id_variable, StorageClassInput});
+	}
+	if (state.subgroup_id_variable != 0) {
+		state.builder.AddType(
+		    {OpVariable, state.ptr_input_uint, state.subgroup_id_variable, StorageClassInput});
 	}
 	for (const auto& input: state.inputs) {
 		uint32_t ptr_type = state.ptr_input_uint;

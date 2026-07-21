@@ -78,6 +78,7 @@ enum : uint32_t {
 	BuiltInLocalInvocationId         = 27,
 	BuiltInGlobalInvocationId        = 28,
 	BuiltInLocalInvocationIndex      = 29,
+	BuiltInSubgroupId                = 40,
 	BuiltInSubgroupLocalInvocationId = 41,
 	BuiltInVertexIndex               = 42,
 	BuiltInInstanceIndex             = 43,
@@ -429,12 +430,14 @@ struct EmitterState {
 	uint32_t                               dispatch_merge_label                          = 0;
 	uint32_t                               glsl_std450                                   = 0;
 	uint32_t                               subgroup_local_invocation_id_variable         = 0;
+	uint32_t                               subgroup_id_variable                          = 0;
 	uint32_t                               per_vertex_variable                           = 0;
 	uint32_t                               depth_variable                                = 0;
 	uint32_t                               sample_mask_variable                          = 0;
 	bool                                   needs_subgroup_ballot                         = false;
 	bool                                   needs_subgroup_shuffle                        = false;
 	bool                                   needs_subgroup_local_invocation_id            = false;
+	bool                                   needs_subgroup_id                             = false;
 	bool                                   needs_compute_derivatives                     = false;
 	bool                                   uses_shader_atomic_float                      = false;
 	bool                                   needs_image_gather_extended                   = false;
@@ -613,6 +616,7 @@ bool ProgramNeedsSubgroupShuffle(const IR::Program& program);
 bool IsCompareOpcode(IR::Opcode op);
 
 bool ProgramNeedsSubgroupLocalInvocationId(const IR::Program& program);
+bool ProgramNeedsSubgroupId(const IR::Program& program);
 
 uint32_t PointerForRegister(const EmitterState& state, IR::Register reg);
 
@@ -621,6 +625,7 @@ uint32_t ConstantU32(EmitterState& state, uint32_t value);
 void EmitStoreU32(EmitterState& state, const IR::Operand& dst, uint32_t value);
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+uint32_t EmitSubgroupId(EmitterState& state);
 
 uint32_t EmitLaneIndexActiveBool(EmitterState& state, uint32_t lane);
 
@@ -738,6 +743,7 @@ uint32_t EmitExecActiveBool(EmitterState& state);
 uint32_t EmitConditionBool(EmitterState& state, const IR::Operand& operand);
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+uint32_t EmitSubgroupId(EmitterState& state);
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind);
 

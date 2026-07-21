@@ -159,6 +159,17 @@ NativeAddressBuffer(uint64_t submit_id, CommandBuffer& command_buffer,
                     const ShaderRecompiler::IR::AddressResource&           resource,
                     const ShaderRecompiler::IR::ResourceSnapshot::Address& address) {
 	BufferView result;
+	if (resource.kind == ShaderRecompiler::IR::ResourceKind::Scratch) {
+		auto& scratch = GetRenderContext().GetScratchRingBuffer();
+		if (scratch.Capacity() == 0) {
+			BindNullStorageBuffer(command_buffer, result);
+			return result;
+		}
+		result.buffer = &scratch.GetBuffer();
+		result.offset = 0;
+		result.range  = static_cast<vk::DeviceSize>(scratch.Capacity());
+		return result;
+	}
 	if (address.binding_base == 0) {
 		BindNullStorageBuffer(command_buffer, result);
 		return result;
@@ -780,10 +791,25 @@ void BindDescriptors(uint64_t submit_id, CommandBuffer& buffer,
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		descriptors.samplers.push_back(NativeSampler(program, i, snapshot.samplers[i]));
 	}
+	if (program.scratch_ring_bytes != 0) {
+		GetRenderContext().GetScratchRingBuffer().EnsureCapacity(program.scratch_ring_bytes);
+	}
 	descriptors.addresses.reserve(program.info.addresses.size());
+	bool needs_scratch = false;
 	for (uint32_t i = 0; i < program.info.addresses.size(); i++) {
+		if (program.info.addresses[i].kind == ShaderRecompiler::IR::ResourceKind::Scratch) {
+			needs_scratch = true;
+		}
 		descriptors.addresses.push_back(NativeAddressBuffer(
 		    submit_id, buffer, program.info.addresses[i], snapshot.addresses[i]));
+	}
+	if (needs_scratch && GetRenderContext().GetScratchRingBuffer().Capacity() != 0) {
+		const auto barrier =
+		    MakeGdsDependency(GetRenderContext().GetScratchRingBuffer().GetBuffer());
+		vk_buffer.pipelineBarrier(
+		    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
+		        vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader,
+		    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) !=

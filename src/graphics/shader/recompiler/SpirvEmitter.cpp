@@ -459,6 +459,7 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	state.needs_subgroup_ballot              = ProgramNeedsSubgroupBallot(program);
 	state.needs_subgroup_shuffle             = ProgramNeedsSubgroupShuffle(program);
 	state.needs_subgroup_local_invocation_id = ProgramNeedsSubgroupLocalInvocationId(program);
+	state.needs_subgroup_id                  = ProgramNeedsSubgroupId(program);
 	state.needs_compute_derivatives          = ProgramNeedsComputeDerivatives(program);
 	state.needs_image_gather_extended        = ProgramNeedsImageGatherExtended(program);
 	state.needs_function_lds                 = ProgramNeedsFunctionLds(program);
