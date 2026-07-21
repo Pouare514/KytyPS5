@@ -52,6 +52,9 @@ public:
 			           static_cast<uint32_t>(GetLastError()));
 			CloseHandle(m_handle);
 			m_handle = nullptr;
+		} else {
+			LOGF("\t direct-memory backing alias base=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			     reinterpret_cast<uint64_t>(m_backing_base), m_size);
 		}
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", 0));
@@ -370,6 +373,46 @@ public:
 		return true;
 	}
 
+	// Repair a MEM_MAPPED|MEM_RESERVE hole created by illegal MEM_DECOMMIT on a Direct view:
+	// unmap the whole MapEntry at its real view base, then MapViewOfFile3 REPLACE again.
+	bool RematerializeContainingView(uint64_t vaddr) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		MapEntry entry {};
+		{
+			std::lock_guard lock(m_mutex);
+			if (!FindContainingUnlocked(vaddr, 1, &entry)) {
+				return false;
+			}
+		}
+		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size) &&
+		    !UnmapView(reinterpret_cast<void*>(entry.vaddr), entry.size)) {
+			return false;
+		}
+		{
+			std::lock_guard lock(m_mutex);
+			m_maps.erase(entry.vaddr);
+		}
+		if (!MapExistingPlaceholderFixed(entry.vaddr, entry.size, entry.backing_offset,
+		                                  entry.mode)) {
+			// View gone — try private placeholder commit so the faulting page is at least RW.
+			auto* ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(entry.vaddr),
+			                          entry.size, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+			                          PAGE_READWRITE, nullptr, 0);
+			if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != entry.vaddr) {
+				if (ptr != nullptr) {
+					VirtualFree(ptr, 0, MEM_RELEASE);
+				}
+				return false;
+			}
+			return true;
+		}
+		return true;
+#else
+		(void)vaddr;
+		return false;
+#endif
+	}
+
 	bool UnmapOne(uint64_t vaddr, uint64_t size, bool preserve_placeholder = false,
 	              bool* placeholder_preserved = nullptr) {
 		MapEntry old {};
@@ -486,6 +529,118 @@ public:
 				entry.mode = mode;
 			}
 		}
+	}
+
+	[[nodiscard]] bool CoversBackingAlias(uint64_t vaddr) const {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (m_backing_base == nullptr || m_size == 0) {
+			return false;
+		}
+		const auto base = reinterpret_cast<uint64_t>(m_backing_base);
+		return vaddr >= base && vaddr < base + m_size;
+#else
+		(void)vaddr;
+		return false;
+#endif
+	}
+
+	[[nodiscard]] uint64_t GetBackingBase() const {
+		return m_backing_base != nullptr ? reinterpret_cast<uint64_t>(m_backing_base) : 0;
+	}
+
+	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
+
+	// True when vaddr shares AllocationBase with the Direct writable alias (even if Covers*
+	// fails after a partial remap / stale pointer).
+	[[nodiscard]] bool SharesBackingAllocation(uint64_t vaddr) const {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (m_backing_base == nullptr) {
+			return false;
+		}
+		MEMORY_BASIC_INFORMATION backing_info {};
+		MEMORY_BASIC_INFORMATION fault_info {};
+		if (VirtualQuery(m_backing_base, &backing_info, sizeof(backing_info)) == 0 ||
+		    VirtualQuery(reinterpret_cast<const void*>(vaddr), &fault_info, sizeof(fault_info)) ==
+		        0) {
+			return false;
+		}
+		return backing_info.AllocationBase != nullptr &&
+		       backing_info.AllocationBase == fault_info.AllocationBase;
+#else
+		(void)vaddr;
+		return false;
+#endif
+	}
+
+	// If the OS Direct writable alias was illegally decommitted, rematerialize the whole view.
+	bool RematerializeBackingAlias() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (m_handle == nullptr || m_size == 0) {
+			return false;
+		}
+		if (m_backing_base != nullptr) {
+			UnmapViewOfFile(m_backing_base);
+			m_backing_base = nullptr;
+		}
+		m_backing_base = static_cast<uint8_t*>(
+		    MapViewOfFile(m_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size));
+		return m_backing_base != nullptr;
+#else
+		return false;
+#endif
+	}
+
+	// Last-ditch: MapViewOfFile3 REPLACE a Direct page into a corrupted MEM_MAPPED hole.
+	bool TryReplaceMappedHole(uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (!IsAvailable() || size == 0 || !RangeOk(0, size)) {
+			return false;
+		}
+		// MapViewOfFileEx requires 64 KiB alignment; expand to the containing granule.
+		const uint64_t granule = m_granularity != 0 ? m_granularity : 0x10000ull;
+		const uint64_t map_va  = vaddr & ~(granule - 1ull);
+		const uint64_t map_sz  = ((vaddr + size + granule - 1ull) & ~(granule - 1ull)) - map_va;
+		if (map_sz == 0 || !RangeOk(0, map_sz)) {
+			return false;
+		}
+
+		using NtUnmapViewOfSection_t = LONG(NTAPI*)(HANDLE, PVOID);
+		static NtUnmapViewOfSection_t nt_unmap = nullptr;
+		if (nt_unmap == nullptr) {
+			nt_unmap = reinterpret_cast<NtUnmapViewOfSection_t>(
+			    GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtUnmapViewOfSection"));
+		}
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) != 0 &&
+		    info.AllocationBase != nullptr && nt_unmap != nullptr) {
+			(void)nt_unmap(GetCurrentProcess(), info.AllocationBase);
+		}
+
+		void* ptr =
+		    MapViewOfFile3(m_handle, GetCurrentProcess(), reinterpret_cast<void*>(map_va), 0, map_sz,
+		                   MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != map_va) {
+			if (ptr != nullptr) {
+				UnmapViewOfFile(ptr);
+			}
+			ptr = MapViewOfFileEx(m_handle, FILE_MAP_READ | FILE_MAP_WRITE | FILE_MAP_EXECUTE, 0, 0,
+			                      map_sz, reinterpret_cast<void*>(map_va));
+		}
+		if (ptr != nullptr && reinterpret_cast<uint64_t>(ptr) == map_va) {
+			(void)ApplyProtection(ptr, map_sz, VirtualMemory::Mode::ReadWrite);
+			std::lock_guard lock(m_mutex);
+			m_maps[map_va] = MapEntry {map_va, map_sz, 0, VirtualMemory::Mode::ReadWrite};
+			return true;
+		}
+		if (ptr != nullptr) {
+			UnmapViewOfFile(ptr);
+		}
+		return false;
+#else
+		(void)vaddr;
+		(void)size;
+		return false;
+#endif
 	}
 
 	bool Contains(uint64_t vaddr, uint64_t size) {
@@ -828,6 +983,15 @@ private:
 
 	void* ReplacePlaceholderView(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                             VirtualMemory::Mode mode, FailureReason* failure_reason) {
+		if (vaddr >= 0x00007d0000000000ull && vaddr < 0x00007e0000000000ull) {
+			LOGF("MemoryTrace: Direct MapViewOfFile3 high-va vaddr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 " off=0x%016" PRIx64 "\n",
+			     vaddr, size, backing_offset);
+			fprintf(stderr,
+			        "MemoryTrace: Direct MapViewOfFile3 high-va vaddr=0x%016" PRIx64
+			        " size=0x%016" PRIx64 "\n",
+			        vaddr, size);
+		}
 		const DWORD map_protect =
 		    mode == VirtualMemory::Mode::NoAccess ? PAGE_READWRITE : GetProtect(mode);
 		void* ptr =

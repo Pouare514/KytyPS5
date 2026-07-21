@@ -330,7 +330,8 @@ add_executable(kyty_emulator main.cpp ${kyty_emulator_src})
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (KYTY_CLANG_CL)
 	# Guest-stack HLE + /GS → silent 0xC0000409 (__fastfail, no VEH). Disable buffer checks.
-	target_compile_options(kyty_emulator PRIVATE /GS-)
+	# CFG bitmap demand-faults on high guest stacks / rejects guest call targets — disable CF.
+	target_compile_options(kyty_emulator PRIVATE /GS- /guard:cf-)
 endif()
 if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)

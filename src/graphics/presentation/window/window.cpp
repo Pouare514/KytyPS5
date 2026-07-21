@@ -19,6 +19,7 @@
 #include "SDL_vulkan.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/crashDiagnostics.h"
 #include "common/emulatorConfig.h"
 #include "common/fatalLog.h"
 #include "common/file.h"
@@ -391,6 +392,15 @@ void WindowArmIgnoreQuit(uint32_t seconds) {
 	fprintf(stderr, "FlipTrace: WindowArmIgnoreQuit %us\n", seconds);
 	Common::LogFatalToFile("WindowArmIgnoreQuit");
 }
+
+namespace {
+struct SoftIdleKeepAliveRegistration {
+	SoftIdleKeepAliveRegistration() {
+		Common::SetSoftIdleKeepAlive(&WindowArmIgnoreQuit);
+	}
+};
+const SoftIdleKeepAliveRegistration g_soft_idle_keep_alive_registration {};
+} // namespace
 
 void WindowDisarmIgnoreQuit() {
 	g_phase32_hold_process.store(false, std::memory_order_release);

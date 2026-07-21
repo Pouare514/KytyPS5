@@ -33,6 +33,7 @@ static_assert(decltype(g_install_state)::is_always_lock_free);
 	char message[256];
 	std::snprintf(message, sizeof(message), "HostException fail-fast: %s",
 	              reason != nullptr ? reason : "unspecified");
+	Common::NoteHaltReason("FailFast", reason);
 	Common::LogFatalToFile(message);
 	std::fflush(stderr);
 	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(EXCEPTION_NONCONTINUABLE_EXCEPTION));
@@ -43,8 +44,9 @@ class FilterScope final {
 public:
 	FilterScope() noexcept {
 		if (g_in_exception_filter) {
+			Common::NoteHaltReason("nested", "exception while resolving a host fault");
 			Common::LogFatalToFile(
-			    "HostException: nested exception while resolving a host fault");
+			    "HostException: nested exception while resolving a host fault (continue search)");
 			nested = true;
 			return;
 		}
@@ -145,7 +147,9 @@ static LONG WINAPI UnhandledTopLevelFilter(PEXCEPTION_POINTERS exception) {
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 	FilterScope filter_scope;
 	if (filter_scope.IsNested()) {
-		FailFast("nested exception while resolving a host fault");
+		// Do not FailFast/TerminateProcess — that parks Main via soft-idle(321) and kills MCL boot.
+		// Let the outer filter finish (or CONTINUE_SEARCH) so poison AV can soft-continue.
+		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
 	auto* exception_record = exception->ExceptionRecord;

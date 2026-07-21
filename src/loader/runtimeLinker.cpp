@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/crashDiagnostics.h"
 #include "common/emulatorConfig.h"
 #include "common/fatalLog.h"
 #include "common/file.h"
@@ -523,6 +524,13 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
 		using CoreAccess  = Common::HostException::AccessViolationType;
 		using GpuAccess   = Libs::Graphics::PageFaultAccess;
+
+		// SSE #GP on misaligned guest RSP is often reported as AV[-1] (see poison-rsp logs).
+		if (Loader::X64InstructionEmulator::TryFixMisalignedSseAccess(
+		        info->native_context, info->access_violation_vaddr)) {
+			return true;
+		}
+
 		// Poisoned / non-canonical guest pointers (e.g. empty NdJob head) fault at ~0.
 		// They are never GPU-tracked or demand-committed; skip recovery before diagnostics.
 		const bool unresolvable_vaddr =
@@ -603,6 +611,169 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 #endif
+		// Canonical guest AV not handled by GPU/reserved/retry — last-chance soft-continue
+		// (misaligned SSE / decode-skip) instead of falling through to EXIT+LOGF (nests AVs).
+		{
+			const bool is_write = info->access_violation_type == CoreAccess::Write;
+			if (Loader::X64InstructionEmulator::TryFixMisalignedSseAccess(
+			        info->native_context, info->access_violation_vaddr)) {
+				return true;
+			}
+			if (Loader::X64InstructionEmulator::TrySoftContinuePoisonAccess(
+			        info->native_context, info->access_violation_vaddr, is_write, true)) {
+				return true;
+			}
+
+			// System-DLL RIP: only CONTINUE_SEARCH (defer-to-OS) for true Windows thread-stack
+			// growth (same AllocationBase as GetCurrentThreadStackLimits). Guest-stack / orphan
+			// RESERVE pages must be demand-committed by us — the OS will not.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			{
+				const uint64_t fault_va = info->access_violation_vaddr;
+				if (Libs::LibKernel::Memory::KernelHandleReservedRangeAccessViolation(fault_va)) {
+					return true;
+				}
+
+				HMODULE owner = nullptr;
+				if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				                       reinterpret_cast<LPCSTR>(info->exception_address),
+				                       &owner) != 0 &&
+				    owner != nullptr) {
+					char module_name[MAX_PATH] = {};
+					if (GetModuleFileNameA(owner, module_name, MAX_PATH) != 0) {
+						for (char* p = module_name; *p != '\0'; ++p) {
+							if (*p >= 'A' && *p <= 'Z') {
+								*p = static_cast<char>(*p - 'A' + 'a');
+							}
+						}
+						if (std::strstr(module_name, "\\ntdll.dll") != nullptr ||
+						    std::strstr(module_name, "\\kernel32.dll") != nullptr ||
+						    std::strstr(module_name, "\\kernelbase.dll") != nullptr) {
+							bool host_stack_growth = false;
+							ULONG_PTR stack_low    = 0;
+							ULONG_PTR stack_high   = 0;
+							GetCurrentThreadStackLimits(&stack_low, &stack_high);
+							MEMORY_BASIC_INFORMATION fault_mbi {};
+							MEMORY_BASIC_INFORMATION stack_mbi {};
+							if (VirtualQuery(reinterpret_cast<const void*>(fault_va), &fault_mbi,
+							                 sizeof(fault_mbi)) != 0 &&
+							    VirtualQuery(reinterpret_cast<const void*>(stack_low), &stack_mbi,
+							                 sizeof(stack_mbi)) != 0 &&
+							    fault_mbi.AllocationBase != nullptr &&
+							    fault_mbi.AllocationBase == stack_mbi.AllocationBase &&
+							    (fault_mbi.State == MEM_RESERVE ||
+							     (fault_mbi.Protect & PAGE_GUARD) != 0)) {
+								host_stack_growth = true;
+							}
+							char line[320];
+							if (host_stack_growth) {
+								std::snprintf(line, sizeof(line),
+								              "MemoryTrace: AV defer-to-OS rip=0x%016" PRIx64
+								              " addr=0x%016" PRIx64 " mod=%s",
+								              info->exception_address, fault_va, module_name);
+								Common::LogFatalToFile(line);
+								std::fprintf(stderr, "%s\n", line);
+								return false;
+							}
+							// CFG bitmap (ntdll!LdrpValidateUserCallTarget): high MEM_MAPPED
+							// sparse section. Prefer soft-continue (ret from check + retarget
+							// non-executable RCX). CONTINUE_SEARCH → Fatal 0xC0000005.
+							MEMORY_BASIC_INFORMATION cfg_mbi {};
+							if (VirtualQuery(reinterpret_cast<const void*>(fault_va), &cfg_mbi,
+							                 sizeof(cfg_mbi)) != 0 &&
+							    cfg_mbi.Type == MEM_MAPPED && cfg_mbi.AllocationBase != nullptr &&
+							    reinterpret_cast<uint64_t>(cfg_mbi.AllocationBase) >=
+							        0x0000700000000000ull &&
+							    (cfg_mbi.State == MEM_RESERVE ||
+							     (cfg_mbi.State == MEM_COMMIT &&
+							      (cfg_mbi.Protect & PAGE_NOACCESS) != 0))) {
+								if (Loader::X64InstructionEmulator::TrySoftContinueCfgBitmap(
+								        info->native_context, fault_va)) {
+									std::snprintf(line, sizeof(line),
+									              "MemoryTrace: AV CFG-bitmap soft-continue "
+									              "rip=0x%016" PRIx64 " addr=0x%016" PRIx64
+									              " alloc=0x%016" PRIx64 " rcx=0x%016" PRIx64,
+									              info->exception_address, fault_va,
+									              reinterpret_cast<uint64_t>(cfg_mbi.AllocationBase),
+									              info->rcx);
+									Common::LogFatalToFile(line);
+									std::fprintf(stderr, "%s\n", line);
+									return true;
+								}
+								std::snprintf(line, sizeof(line),
+								              "MemoryTrace: AV CFG-bitmap soft-halt "
+								              "rip=0x%016" PRIx64 " addr=0x%016" PRIx64
+								              " alloc=0x%016" PRIx64 " rcx=0x%016" PRIx64,
+								              info->exception_address, fault_va,
+								              reinterpret_cast<uint64_t>(cfg_mbi.AllocationBase),
+								              info->rcx);
+								Common::LogFatalToFile(line);
+								std::fprintf(stderr, "%s\n", line);
+								// Fall through to soft-halt 321.
+							}
+							std::snprintf(line, sizeof(line),
+							              "MemoryTrace: AV system-dll non-host-stack "
+							              "rip=0x%016" PRIx64 " addr=0x%016" PRIx64 " mod=%s",
+							              info->exception_address, fault_va, module_name);
+							Common::LogFatalToFile(line);
+							std::fprintf(stderr, "%s\n", line);
+							// Fall through to soft-halt — OS cannot commit this MEM_MAPPED RESERVE
+							// (VirtualAlloc/Unmap/VirtualFree all return ERROR_INVALID_PARAMETER).
+							// Soft-continuing ntdll here corrupts unwind and dies with 0xC0000005.
+						}
+					}
+				}
+			}
+#endif
+
+			char line[320];
+			std::snprintf(line, sizeof(line),
+			              "MemoryTrace: AV unhandled canonical addr=0x%016" PRIx64
+			              " rip=0x%016" PRIx64 " av=%u — soft-halt 321",
+			              info->access_violation_vaddr, info->exception_address,
+			              static_cast<unsigned>(info->access_violation_type));
+			Common::LogFatalToFile(line);
+			std::fprintf(stderr, "%s\n", line);
+			{
+				char regs[384];
+				std::snprintf(regs, sizeof(regs),
+				              "MemoryTrace: AV soft-halt regs rax=%016" PRIx64 " rcx=%016" PRIx64
+				              " rdx=%016" PRIx64 " rbx=%016" PRIx64 " rsi=%016" PRIx64
+				              " rdi=%016" PRIx64 " rsp=%016" PRIx64 " rbp=%016" PRIx64,
+				              info->rax, info->rcx, info->rdx, info->rbx, info->rsi, info->rdi,
+				              info->rsp, info->rbp);
+				Common::LogFatalToFile(regs);
+				std::fprintf(stderr, "%s\n", regs);
+				std::snprintf(regs, sizeof(regs),
+				              "MemoryTrace: AV soft-halt regs r8=%016" PRIx64 " r9=%016" PRIx64
+				              " r10=%016" PRIx64 " r11=%016" PRIx64 " r12=%016" PRIx64
+				              " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64,
+				              info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
+				              info->r14, info->r15);
+				Common::LogFatalToFile(regs);
+				std::fprintf(stderr, "%s\n", regs);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+				if (ntdll != nullptr) {
+					std::snprintf(regs, sizeof(regs),
+					              "MemoryTrace: AV soft-halt ntdll_base=%p rip_off=0x%llX",
+					              static_cast<void*>(ntdll),
+					              static_cast<unsigned long long>(
+					                  info->exception_address -
+					                  reinterpret_cast<uint64_t>(ntdll)));
+					Common::LogFatalToFile(regs);
+					std::fprintf(stderr, "%s\n", regs);
+				}
+#endif
+			}
+			Common::FlushHleRingToFatal("av_unhandled_canonical");
+			Common::NoteHaltReason("av_unhandled", line);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			TerminateProcess(GetCurrentProcess(), 321);
+#endif
+			std::_Exit(321);
+		}
 		} else {
 			// VEH-safe fatal path: no LOGF/EnumName/EXIT/stack walk (those can nest another AV).
 			const char* av_type = "Unknown";
@@ -618,6 +789,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			              " av=%s",
 			              info->access_violation_vaddr, info->exception_address, av_type);
 			Common::LogFatalToFile(line);
+			std::fprintf(stderr, "%s\n", line);
 			std::snprintf(line, sizeof(line),
 			              "regs: rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64
 			              " rdx=%016" PRIx64,
@@ -644,6 +816,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 						char neg[64];
 						std::snprintf(neg, sizeof(neg), "guest reg -1: %s", name);
 						Common::LogFatalToFile(neg);
+						std::fprintf(stderr, "%s\n", neg);
 					}
 				};
 				log_if_neg1("rax", info->rax);
@@ -665,6 +838,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			              "Access violation: %s [%016" PRIx64 "] (non-canonical/poisoned)", av_type,
 			              info->access_violation_vaddr);
 			Common::LogFatalToFile(line);
+			Common::FlushHleRingToFatal("av_unresolvable");
 			// Host-only diagnostics: match RIP to unresolved-import thunk pages / hot stubs.
 			{
 				constexpr uint64_t kThunkSize = 162;
@@ -728,6 +902,20 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					Common::LogFatalToFile(line);
 				}
 			}
+
+			const bool is_write = info->access_violation_type == CoreAccess::Write;
+			if (Loader::X64InstructionEmulator::TryFixMisalignedSseAccess(
+			        info->native_context, info->access_violation_vaddr)) {
+				return true;
+			}
+			if (Loader::X64InstructionEmulator::TrySoftContinuePoisonAccess(
+			        info->native_context, info->access_violation_vaddr, is_write)) {
+				Common::NoteHaltReason("poison", "soft-continued AV -1/non-canonical");
+				std::fflush(stderr);
+				return true;
+			}
+
+			Common::NoteHaltReason("poison", "unresolvable AV — halt 321");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			TerminateProcess(GetCurrentProcess(), 321);
 #endif

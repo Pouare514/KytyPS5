@@ -1,5 +1,6 @@
 #include "common/assert.h"
 
+#include "common/crashDiagnostics.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
@@ -33,6 +34,10 @@ static std::string BuildFatalReport(const char* title, std::string_view text, co
 }
 
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
+	char detail[320];
+	std::snprintf(detail, sizeof(detail), "%s:%d %.200s", file != nullptr ? file : "?", line,
+	              text.empty() ? title : std::string(text).c_str());
+	NoteHaltReason("assert", detail);
 	Log::WriteFatal(BuildFatalReport(title, text, file, line));
 	SubsystemsListSingleton::Instance()->ShutdownAll();
 	return 1;
@@ -48,16 +53,27 @@ int DbgNotImplementedHandler(const char* expr, const char* file, int line) {
 }
 
 int DbgExitHandler(const char* file, int line, std::string_view text) {
+	char detail[320];
+	std::snprintf(detail, sizeof(detail), "%s:%d %.200s", file != nullptr ? file : "?", line,
+	              std::string(text).c_str());
+	NoteHaltReason("EXIT", detail);
 	Log::WriteFatal(BuildFatalReport("--- Error ---", text, file, line));
 	return 1;
 }
 
 int DbgExitHandler(const char* file, int line, fmt::text_style style, std::string_view text) {
+	char detail[320];
+	std::snprintf(detail, sizeof(detail), "%s:%d %.200s", file != nullptr ? file : "?", line,
+	              std::string(text).c_str());
+	NoteHaltReason("EXIT", detail);
 	Log::WriteFatal(style, BuildFatalReport("--- Error ---", text, file, line));
 	return 1;
 }
 
 void DbgExit(int status) {
+	char detail[64];
+	std::snprintf(detail, sizeof(detail), "status=%d", status);
+	NoteHaltReason("DbgExit", detail);
 	std::fflush(nullptr);
 	std::_Exit(status);
 }

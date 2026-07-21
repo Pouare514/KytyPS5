@@ -35,8 +35,11 @@ struct HleRingEntry {
 
 std::atomic<uint32_t> g_hle_seq {0};
 HleRingEntry          g_hle_ring[kHleRingSize] {};
-std::atomic<bool>     g_log_guest_av {false};
-std::atomic<uint32_t> g_guest_av_logs {0};
+std::atomic<bool>               g_log_guest_av {false};
+std::atomic<uint32_t>           g_guest_av_logs {0};
+Common::SoftIdleKeepAliveFn     g_soft_idle_keep_alive = nullptr;
+char                            g_halt_reason[256] {"(none)"};
+std::atomic<uint32_t>           g_halt_reason_seq {0};
 
 void CopyCapped(char* dst, size_t dst_size, const char* src) {
 	if (dst == nullptr || dst_size == 0) {
@@ -184,6 +187,27 @@ void FlushHleRingToFatal(const char* reason) {
 #endif
 }
 
+void NoteHaltReason(const char* kind, const char* detail) {
+	const uint32_t seq = g_halt_reason_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+	char           line[256];
+	if (detail != nullptr && detail[0] != '\0') {
+		std::snprintf(line, sizeof(line), "HaltReason: kind=%s detail=%s seq=%" PRIu32,
+		              kind != nullptr ? kind : "?", detail, seq);
+	} else {
+		std::snprintf(line, sizeof(line), "HaltReason: kind=%s seq=%" PRIu32,
+		              kind != nullptr ? kind : "?", seq);
+	}
+	std::snprintf(g_halt_reason, sizeof(g_halt_reason), "%s", line);
+	EmergencyLogRaw(line);
+	LogFatalToFile(line);
+	std::fprintf(stderr, "%s\n", line);
+	std::fflush(stderr);
+}
+
+const char* GetLastHaltReason() {
+	return g_halt_reason;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 using SecerrHandlerFunc    = void(__cdecl*)(int, void*);
@@ -220,6 +244,18 @@ static LONG CALLBACK FatalFailfastVectoredHandler(PEXCEPTION_POINTERS exception)
 	if (exception == nullptr || exception->ExceptionRecord == nullptr) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
+
+	// Prevent recursive CrashVEH logging from eating the stack (seen as rsp decreasing
+	// ~0xFC0 per frame until STATUS_STACK_OVERFLOW while soft-idle teardown faults).
+	static thread_local int tls_veh_depth = 0;
+	if (tls_veh_depth > 0) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	struct DepthGuard {
+		DepthGuard() { ++tls_veh_depth; }
+		~DepthGuard() { --tls_veh_depth; }
+	} depth_guard;
+
 	const auto code = static_cast<uint32_t>(exception->ExceptionRecord->ExceptionCode);
 	auto*      ctx  = exception->ContextRecord;
 	const auto rip  = ctx != nullptr ? ctx->Rip : 0ull;
@@ -229,13 +265,25 @@ static LONG CALLBACK FatalFailfastVectoredHandler(PEXCEPTION_POINTERS exception)
 	        ? exception->ExceptionRecord->ExceptionInformation[1]
 	        : 0ull;
 
+	// STACK_OVERFLOW: log once, no heavy work (FlushHleRing / GetModuleHandle can re-fault).
+	if (code == 0xC00000FDu) {
+		static std::atomic<uint32_t> so_logs {0};
+		if (so_logs.fetch_add(1, std::memory_order_relaxed) < 4) {
+			char message[256];
+			std::snprintf(message, sizeof(message),
+			              "FatalFailfast VEH: STACK_OVERFLOW rip=0x%016" PRIx64 " rsp=0x%016" PRIx64,
+			              rip, rsp);
+			EmergencyLogRaw(message);
+		}
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
 	// Always breadcrumb hard faults (even when guest-AV logging is off) — silent deaths
 	// were leaving only UserShadowStack in _kyty_fatal.txt.
 	const bool interesting =
 	    code == 0xC0000005u || // ACCESS_VIOLATION
 	    code == 0xC000001Du || // ILLEGAL_INSTRUCTION
 	    code == 0xC0000096u || // PRIVILEGED_INSTRUCTION
-	    code == 0xC00000FDu || // STACK_OVERFLOW
 	    code == 0xC0000409u || // STACK_BUFFER_OVERRUN
 	    code == 0xC0000374u || // HEAP_CORRUPTION
 	    code == 0xC0000094u || // INTEGER_DIVIDE_BY_ZERO
@@ -248,9 +296,9 @@ static LONG CALLBACK FatalFailfastVectoredHandler(PEXCEPTION_POINTERS exception)
 			char message[384];
 			std::snprintf(message, sizeof(message),
 			              "CrashVEH: code=0x%08" PRIx32 " rip=0x%016" PRIx64 " rsp=0x%016" PRIx64
-			              " addr=0x%016" PRIx64 " tid=%u",
+			              " addr=0x%016" PRIx64 " tid=%lu",
 			              code, rip, rsp, static_cast<uint64_t>(addr),
-			              GetCurrentThreadId());
+			              static_cast<unsigned long>(GetCurrentThreadId()));
 			EmergencyLogRaw(message);
 		}
 	}
@@ -273,8 +321,8 @@ static LONG CALLBACK FatalFailfastVectoredHandler(PEXCEPTION_POINTERS exception)
 	if (code == 0xC0000005u) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
-	// STATUS_STACK_BUFFER_OVERRUN / HEAP_CORRUPTION / STACK_OVERFLOW — often from __fastfail.
-	if (code != 0xC0000409u && code != 0xC0000374u && code != 0xC00000FDu) {
+	// STATUS_STACK_BUFFER_OVERRUN / HEAP_CORRUPTION — often from __fastfail.
+	if (code != 0xC0000409u && code != 0xC0000374u) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
@@ -446,15 +494,73 @@ static void LogExitHookFrames(const char* tag, UINT code) {
 	FlushFileBuffers(GetStdHandle(STD_ERROR_HANDLE));
 }
 
+static void SoftIdleForever(const char* why, UINT code) {
+	if (code == 321u || code == 0xC0000025u) {
+		char detail[96];
+		std::snprintf(detail, sizeof(detail), "%s code=%u", why != nullptr ? why : "exit", code);
+		NoteHaltReason(code == 321u ? "ExitProcess321" : "TerminateNonContinuable", detail);
+	}
+	char message[320];
+	std::snprintf(message, sizeof(message),
+	              "GuestExit: intercepted %s code=%u — soft-idle (KYTY_ALLOW_GUEST_EXIT=1 to honor) "
+	              "last=%s",
+	              why != nullptr ? why : "exit", code, g_halt_reason);
+	EmergencyLogRaw(message);
+	LogFatalToFile(message);
+	std::fprintf(stderr, "%s\n", message);
+	FlushFileBuffers(GetStdHandle(STD_ERROR_HANDLE));
+	if (g_soft_idle_keep_alive != nullptr) {
+		g_soft_idle_keep_alive(180);
+	}
+	for (uint32_t tick = 0;; ++tick) {
+		Sleep(1000);
+		if (g_soft_idle_keep_alive != nullptr && (tick % 30) == 0) {
+			g_soft_idle_keep_alive(60);
+		}
+	}
+}
+
+static bool AllowGuestProcessExit() {
+	const char* allow = std::getenv("KYTY_ALLOW_GUEST_EXIT");
+	return allow != nullptr && allow[0] == '1';
+}
+
+// Soft-idle only Kyty EXIT_HALT (321) and FailFast NONCONTINUABLE. Never block:
+// ExitProcess(0), exit(1) CRT failures, Ctrl+C (STATUS_CONTROL_C_EXIT).
+static bool ShouldSoftIdleExitCode(UINT code) {
+	if (AllowGuestProcessExit()) {
+		return false;
+	}
+	if (code == 321u) {
+		return true;
+	}
+	if (code == 0xC0000025u) { // EXCEPTION_NONCONTINUABLE_EXCEPTION (HostException::FailFast)
+		return true;
+	}
+	return false;
+}
+
 static void WINAPI HookedExitProcess(UINT code) {
 	LogExitHookFrames("ExitProcess", code);
+	if (ShouldSoftIdleExitCode(code)) {
+		SoftIdleForever("ExitProcess", code);
+	}
 	if (g_real_exit_process != nullptr) {
 		g_real_exit_process(code);
 	}
 }
 
 static BOOL WINAPI HookedTerminateProcess(HANDLE process, UINT code) {
-	LogExitHookFrames("TerminateProcess", code);
+	HANDLE self = GetCurrentProcess();
+	const bool self_target =
+	    process == self || process == reinterpret_cast<HANDLE>(static_cast<intptr_t>(-1)) ||
+	    process == nullptr;
+	if (self_target) {
+		LogExitHookFrames("TerminateProcess", code);
+		if (ShouldSoftIdleExitCode(code)) {
+			SoftIdleForever("TerminateProcess", code);
+		}
+	}
 	if (g_real_terminate_process != nullptr) {
 		return g_real_terminate_process(process, code);
 	}
@@ -462,7 +568,16 @@ static BOOL WINAPI HookedTerminateProcess(HANDLE process, UINT code) {
 }
 
 static LONG NTAPI HookedNtTerminateProcess(HANDLE process, LONG status) {
-	LogExitHookFrames("NtTerminateProcess", static_cast<UINT>(status));
+	HANDLE self = GetCurrentProcess();
+	const bool self_target =
+	    process == nullptr || process == self ||
+	    process == reinterpret_cast<HANDLE>(static_cast<intptr_t>(-1));
+	if (self_target) {
+		LogExitHookFrames("NtTerminateProcess", static_cast<UINT>(status));
+		if (ShouldSoftIdleExitCode(static_cast<UINT>(status))) {
+			SoftIdleForever("NtTerminateProcess", static_cast<UINT>(status));
+		}
+	}
 	if (g_real_nt_terminate_process != nullptr) {
 		return g_real_nt_terminate_process(process, status);
 	}
@@ -471,6 +586,9 @@ static LONG NTAPI HookedNtTerminateProcess(HANDLE process, LONG status) {
 
 static void NTAPI HookedRtlExitUserProcess(ULONG status) {
 	LogExitHookFrames("RtlExitUserProcess", status);
+	if (ShouldSoftIdleExitCode(status)) {
+		SoftIdleForever("RtlExitUserProcess", status);
+	}
 	if (g_real_rtl_exit_user_process != nullptr) {
 		g_real_rtl_exit_user_process(status);
 	}
@@ -704,18 +822,6 @@ static int PatchFastFailInt29(HMODULE mod) {
 		}
 	}
 	return patched;
-}
-
-static bool IsGsBypassTargetModule(HMODULE mod) {
-	char name[MAX_PATH] {};
-	if (GetModuleFileNameA(mod, name, MAX_PATH) == 0) {
-		return false;
-	}
-	const char* base = std::strrchr(name, '\\');
-	base = base != nullptr ? base + 1 : name;
-	return _stricmp(base, "kyty_emulator.exe") == 0 || _stricmp(base, "ucrtbase.dll") == 0 ||
-	       _stricmp(base, "ucrtbased.dll") == 0 || _stricmp(base, "vcruntime140.dll") == 0 ||
-	       _stricmp(base, "VCRUNTIME140.dll") == 0 || _stricmp(base, "msvcp140.dll") == 0;
 }
 
 static void BypassGsInAllModules() {
@@ -1059,6 +1165,10 @@ void InstallCrashDiagnostics() {
 	// `_set_security_error_handler` is gone on modern UCRT; rely on InstallGsFailureHook above.
 	EmergencyLogRaw("CrashTrace: security_error_handler skipped (use __report_gsfailure hook)");
 #endif
+}
+
+void SetSoftIdleKeepAlive(SoftIdleKeepAliveFn fn) {
+	g_soft_idle_keep_alive = fn;
 }
 
 } // namespace Common

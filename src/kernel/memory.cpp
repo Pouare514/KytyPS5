@@ -250,24 +250,45 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 static bool CommitFixedHostRange(uint64_t start, uint64_t size, VirtualMemory::Mode mode);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static bool UnmapHostMappedView(void* view) {
+	if (view == nullptr) {
+		return false;
+	}
+	if (UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) != 0) {
+		return true;
+	}
+	if (UnmapViewOfFile2(GetCurrentProcess(), view, 0) != 0 || UnmapViewOfFile(view) != 0) {
+		return true;
+	}
+	return false;
+}
+
 static bool ClearHostCommittedSpan(uint64_t release_start, uint64_t release_size,
                                    const MEMORY_BASIC_INFORMATION& info) {
 	if (release_size == 0 || info.State != MEM_COMMIT) {
 		return true;
 	}
 
-	const auto region_base = reinterpret_cast<uint64_t>(info.BaseAddress);
+	// Section views (Direct MapViewOfFile3): NEVER VirtualFree(MEM_DECOMMIT*). That leaves an
+	// irreparable MEM_MAPPED|MEM_RESERVE hole (COMMIT/Unmap/PRESERVE all return 87).
+	// Unmap at BaseAddress first — for placeholder-backed MapViewOfFile3, AllocationBase is the
+	// placeholder root (not a file view) and UnmapViewOfFile2(AllocationBase) returns 87.
+	if (info.Type == MEM_MAPPED || info.Type == MEM_IMAGE) {
+		if (UnmapHostMappedView(info.BaseAddress)) {
+			return true;
+		}
+		if (info.AllocationBase != nullptr && info.AllocationBase != info.BaseAddress &&
+		    UnmapHostMappedView(info.AllocationBase)) {
+			return true;
+		}
+		return false;
+	}
+
 	if (VirtualFree(reinterpret_cast<void*>(release_start), release_size,
 	                MEM_DECOMMIT | MEM_PRESERVE_PLACEHOLDER) != 0) {
 		return true;
 	}
-	if (info.Type == MEM_MAPPED || info.Type == MEM_IMAGE) {
-		void* const unmap_ptr = reinterpret_cast<void*>(region_base);
-		if (UnmapViewOfFile2(GetCurrentProcess(), unmap_ptr, 0) == 0 &&
-		    UnmapViewOfFile(unmap_ptr) == 0) {
-			return false;
-		}
-	} else if (!VirtualMemory::Decommit(release_start, release_size)) {
+	if (!VirtualMemory::Decommit(release_start, release_size)) {
 		if (VirtualFree(reinterpret_cast<void*>(info.AllocationBase), 0, MEM_RELEASE) == 0) {
 			return false;
 		}
@@ -288,6 +309,20 @@ static bool ClearHostReserveSpan(uint64_t clear_start, uint64_t clear_end,
                                  const MEMORY_BASIC_INFORMATION& info) {
 	if (info.State != MEM_RESERVE) {
 		return true;
+	}
+
+	// Corrupted Direct view hole (MEM_MAPPED|MEM_RESERVE after illegal DECOMMIT): unmap at the
+	// region BaseAddress (real MapViewOfFile3 return). AllocationBase is often only the
+	// placeholder root and rejects UnmapViewOfFile2 with ERROR_INVALID_PARAMETER.
+	if (info.Type == MEM_MAPPED || info.Type == MEM_IMAGE) {
+		if (UnmapHostMappedView(info.BaseAddress)) {
+			return true;
+		}
+		if (info.AllocationBase != nullptr && info.AllocationBase != info.BaseAddress &&
+		    UnmapHostMappedView(info.AllocationBase)) {
+			return true;
+		}
+		return false;
 	}
 
 	const auto allocation_base = reinterpret_cast<uint64_t>(info.AllocationBase);
@@ -460,10 +495,7 @@ static bool EnsureHostPlaceholderRange(uint64_t start, uint64_t size) {
 	}
 
 	if (info.State == MEM_COMMIT) {
-		if (VirtualFree(reinterpret_cast<void*>(start), size,
-		                MEM_DECOMMIT | MEM_PRESERVE_PLACEHOLDER) != 0) {
-			return true;
-		}
+		// Never bare MEM_DECOMMIT here — ClearHostCommittedSpan unmaps section views properly.
 		if (!ClearHostCommittedSpan(start, size, info)) {
 			return false;
 		}
@@ -1258,6 +1290,9 @@ static bool CommitMidReservedPlaceholder(uint64_t start, uint64_t size,
 
 static bool CommitFixedHostRange(uint64_t start, uint64_t size, VirtualMemory::Mode mode) {
 	constexpr uint64_t PAGE_SIZE = 0x4000;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	constexpr uint64_t kHostPage = 0x1000;
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	MEMORY_BASIC_INFORMATION info {};
@@ -1276,6 +1311,39 @@ static bool CommitFixedHostRange(uint64_t start, uint64_t size, VirtualMemory::M
 				return true;
 			}
 			if (CommitMidReservedPlaceholder(start, size, mode)) {
+				return true;
+			}
+			// VirtualAlloc(COMMIT) of 16 KiB often returns ERROR_INVALID_PARAMETER (0x57) on
+			// mid-span / placeholder leftovers — fall back to host 4 KiB pages.
+			bool host4k_ok = true;
+			for (uint64_t addr = start; addr < start + size; addr += kHostPage) {
+				MEMORY_BASIC_INFORMATION page_info {};
+				if (VirtualQuery(reinterpret_cast<const void*>(addr), &page_info,
+				                 sizeof(page_info)) == 0) {
+					host4k_ok = false;
+					break;
+				}
+				if (page_info.State == MEM_COMMIT) {
+					if (!VirtualMemory::Protect(addr, kHostPage, mode)) {
+						host4k_ok = false;
+						break;
+					}
+					continue;
+				}
+				if (page_info.State != MEM_RESERVE) {
+					host4k_ok = false;
+					break;
+				}
+				if (VirtualMemory::Commit(addr, kHostPage, mode)) {
+					continue;
+				}
+				if (CommitMidReservedPlaceholder(addr, kHostPage, mode)) {
+					continue;
+				}
+				host4k_ok = false;
+				break;
+			}
+			if (host4k_ok) {
 				return true;
 			}
 		} else if (info.State == MEM_COMMIT) {
@@ -1313,6 +1381,30 @@ static bool CommitFixedHostRange(uint64_t start, uint64_t size, VirtualMemory::M
 					continue;
 				}
 				if (CommitMidReservedPlaceholder(addr, PAGE_SIZE, mode)) {
+					continue;
+				}
+				// Last resort: host 4 KiB within this 16 KiB guest page.
+				bool ok4 = true;
+				for (uint64_t h = addr; h < addr + PAGE_SIZE; h += kHostPage) {
+					MEMORY_BASIC_INFORMATION hi {};
+					if (VirtualQuery(reinterpret_cast<const void*>(h), &hi, sizeof(hi)) == 0) {
+						ok4 = false;
+						break;
+					}
+					if (hi.State == MEM_COMMIT) {
+						continue;
+					}
+					if (hi.State != MEM_RESERVE) {
+						ok4 = false;
+						break;
+					}
+					if (!VirtualMemory::Commit(h, kHostPage, mode) &&
+					    !CommitMidReservedPlaceholder(h, kHostPage, mode)) {
+						ok4 = false;
+						break;
+					}
+				}
+				if (ok4) {
 					continue;
 				}
 				return false;
@@ -3770,6 +3862,20 @@ static bool ReserveFixedHostRange(uint64_t start, uint64_t size, bool* placehold
 		MEMORY_BASIC_INFORMATION info {};
 		if (VirtualQuery(reinterpret_cast<const void*>(addr), &info, sizeof(info)) != 0) {
 			if (info.State == MEM_COMMIT) {
+				if (info.Type == MEM_MAPPED || info.Type == MEM_IMAGE) {
+					if (!ClearHostCommittedSpan(addr, PAGE_SIZE, info)) {
+						if (host_mutated) {
+							EXIT("reserve-fixed partial mapped-view clear cannot be rolled back\n");
+						}
+						LOGF_COLOR(Log::Color::Red,
+						           "\t reserve-fixed replace: mapped clear failed at 0x%016" PRIx64
+						           "\n",
+						           addr);
+						return false;
+					}
+					host_mutated = true;
+					continue;
+				}
 				if (!VirtualMemory::Decommit(addr, PAGE_SIZE)) {
 					if (host_mutated) {
 						EXIT("reserve-fixed partial host decommit cannot be rolled back safely\n");
@@ -4254,6 +4360,12 @@ bool KernelHandleReservedRangeAccessViolation(uint64_t vaddr) {
 
 	constexpr uint64_t kPageSize = 0x4000;
 	const uint64_t     page      = vaddr & ~(kPageSize - 1);
+	// Must match pthread.cpp PTHREAD_STACK_TOP (guest stacks grow downward from here).
+	// Floor must be BELOW top: 0x7000000000 was a digit-count bug (floor > top → never matched).
+	constexpr uint64_t kGuestStackTop   = 0x00000007efff8000ull;
+	constexpr uint64_t kGuestStackFloor = 0x0000000100000000ull;
+	const bool         in_guest_stack_arena =
+	    vaddr >= kGuestStackFloor && vaddr < kGuestStackTop;
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	MEMORY_BASIC_INFORMATION mbi {};
@@ -4287,8 +4399,784 @@ bool KernelHandleReservedRangeAccessViolation(uint64_t vaddr) {
 	        have_range ? range.name : "-");
 	std::fflush(stderr);
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Windows CFG bitmap: kernel-managed sparse MEM_MAPPED section at high user VA
+	// (ntdll!LdrpValidateUserCallTarget). Must run before host_needs_commit gating —
+	// pages may already be COMMIT+PAGE_NOACCESS. Prefer VirtualProtect RO; else defer OS.
+	if (!have_range && have_mbi && mbi.Type == MEM_MAPPED && mbi.AllocationBase != nullptr) {
+		const uint64_t alloc_base = reinterpret_cast<uint64_t>(mbi.AllocationBase);
+		const bool     cfg_like =
+		    alloc_base >= 0x0000700000000000ull &&
+		    (mbi.AllocationProtect == PAGE_NOACCESS || mbi.AllocationProtect == PAGE_READONLY ||
+		     mbi.AllocationProtect == 0);
+		if (cfg_like) {
+			constexpr uint64_t kHostPage = 0x1000;
+			const uint64_t     host_page = vaddr & ~(kHostPage - 1);
+			if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_NOACCESS) != 0) {
+				DWORD old_prot = 0;
+				if (VirtualProtect(reinterpret_cast<void*>(host_page), kHostPage, PAGE_READONLY,
+				                   &old_prot) != 0) {
+					static std::atomic<uint32_t> cfg_ro_n {0};
+					const uint32_t n = cfg_ro_n.fetch_add(1, std::memory_order_relaxed) + 1;
+					if (n <= 16 || (n % 64) == 0) {
+						LOGF("MemoryTrace: demand-commit CFG-bitmap VirtualProtect RO "
+						     "addr=0x%016" PRIx64 " n=%u\n",
+						     vaddr, n);
+						fprintf(stderr,
+						        "MemoryTrace: demand-commit CFG-bitmap VirtualProtect RO "
+						        "addr=0x%016" PRIx64 " n=%u\n",
+						        vaddr, n);
+					}
+					return true;
+				}
+			}
+			if (mbi.State == MEM_RESERVE ||
+			    (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_NOACCESS) != 0)) {
+				static std::atomic<uint32_t> cfg_n {0};
+				const uint32_t               n = cfg_n.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (n <= 16 || (n % 64) == 0) {
+					LOGF("MemoryTrace: demand-commit skip CFG-bitmap state=%s addr=0x%016" PRIx64
+					     " alloc=0x%016" PRIx64 " n=%u (defer to OS)\n",
+					     mbi.State == MEM_RESERVE ? "RESERVE" : "COMMIT-NOACCESS", vaddr,
+					     alloc_base, n);
+					fprintf(stderr,
+					        "MemoryTrace: demand-commit skip CFG-bitmap state=%s addr=0x%016" PRIx64
+					        " n=%u\n",
+					        mbi.State == MEM_RESERVE ? "RESERVE" : "COMMIT-NOACCESS", vaddr, n);
+				}
+				return false;
+			}
+		}
+	}
+#endif
+
 	const bool range_is_reserved =
 	    have_range && (IsReservedRangeType(range.type) || range.placeholder_backed);
+
+	// Guest pthread stack arena (under PTHREAD_STACK_TOP): untracked pages are orphaned guest
+	// stacks — Windows cannot demand-commit them. Commit/alloc/protect ourselves.
+	// Outside the arena, untracked MEM_RESERVE is Windows stack growth → defer to OS.
+	if (!have_range && in_guest_stack_arena) {
+		static std::atomic<uint32_t> orphan_n {0};
+		const uint32_t               on = orphan_n.fetch_add(1, std::memory_order_relaxed) + 1;
+		bool                         ok = false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (have_mbi && mbi.State == MEM_RESERVE) {
+			ok = CommitFixedHostRange(page, kPageSize, VirtualMemory::Mode::ReadWrite);
+		} else if (have_mbi && mbi.State == MEM_COMMIT) {
+			ok = VirtualMemory::Protect(page, kPageSize, VirtualMemory::Mode::ReadWrite);
+			if (!ok) {
+				// Partial / odd protect — try host 4 KiB.
+				ok = true;
+				for (uint64_t a = page; a < page + kPageSize; a += 0x1000) {
+					if (!VirtualMemory::Protect(a, 0x1000, VirtualMemory::Mode::ReadWrite)) {
+						ok = false;
+						break;
+					}
+				}
+			}
+		} else if (have_mbi && mbi.State == MEM_FREE) {
+			ok = VirtualMemory::AllocFixed(page, kPageSize, VirtualMemory::Mode::ReadWrite);
+		} else {
+			ok = CommitFixedHostRange(page, kPageSize, VirtualMemory::Mode::ReadWrite);
+		}
+#else
+		ok = CommitFixedHostRange(page, kPageSize, VirtualMemory::Mode::ReadWrite);
+#endif
+		if (!ok) {
+			if (on <= 32 || (on % 64) == 0) {
+				LOGF("MemoryTrace: demand-commit orphan-stack FAIL page=0x%016" PRIx64
+				     " state=%s n=%u\n",
+				     page, host_state, on);
+				fprintf(stderr,
+				        "MemoryTrace: demand-commit orphan-stack FAIL page=0x%016" PRIx64
+				        " state=%s n=%u\n",
+				        page, host_state, on);
+			}
+			return false;
+		}
+		constexpr int kStackProt =
+		    PROT_CPU_READ | PROT_CPU_WRITE | PROT_GPU_READ | PROT_GPU_WRITE;
+		if (g_virtual_ranges != nullptr) {
+			(void)g_virtual_ranges->Add(page, kPageSize, 0, kStackProt, 0,
+			                            VirtualRangeType::Stack, "stack-orphan", true, false);
+		}
+		if (on <= 32 || (on % 64) == 0) {
+			LOGF("MemoryTrace: demand-commit orphan-stack OK page=0x%016" PRIx64 " state=%s n=%u\n",
+			     page, host_state, on);
+			fprintf(stderr,
+			        "MemoryTrace: demand-commit orphan-stack OK page=0x%016" PRIx64 " state=%s n=%u\n",
+			        page, host_state, on);
+			std::fflush(stderr);
+		}
+		return true;
+	}
+
+	if (host_needs_commit && !have_range) {
+		// Untracked MEM_RESERVE: Windows thread-stack growth stays deferred to the OS.
+		// Everything else (guest maps / orphans) we demand-commit ourselves.
+		bool host_stack_growth = false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		ULONG_PTR stack_low  = 0;
+		ULONG_PTR stack_high = 0;
+		GetCurrentThreadStackLimits(&stack_low, &stack_high);
+		MEMORY_BASIC_INFORMATION stack_mbi {};
+		if (have_mbi && VirtualQuery(reinterpret_cast<const void*>(stack_low), &stack_mbi,
+		                             sizeof(stack_mbi)) != 0 &&
+		    mbi.AllocationBase != nullptr && mbi.AllocationBase == stack_mbi.AllocationBase) {
+			host_stack_growth = true;
+		}
+#endif
+		if (host_stack_growth) {
+			static std::atomic<uint32_t> skip_n {0};
+			const uint32_t               n = skip_n.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (n <= 16 || (n % 256) == 0) {
+				LOGF("MemoryTrace: demand-commit skip host-stack RESERVE page=0x%016" PRIx64
+				     " n=%u (defer to OS)\n",
+				     page, n);
+				fprintf(stderr,
+				        "MemoryTrace: demand-commit skip host-stack RESERVE page=0x%016" PRIx64
+				        " n=%u\n",
+				        page, n);
+			}
+			return false;
+		}
+
+		static std::atomic<uint32_t> orphan_res_n {0};
+		const uint32_t               on = orphan_res_n.fetch_add(1, std::memory_order_relaxed) + 1;
+		// Prefer host 4 KiB covering the fault EA — a 16 KiB guest page often spans past the
+		// end of a mid-reserve MBI region (VirtualAlloc COMMIT → ERROR_INVALID_PARAMETER).
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		constexpr uint64_t kHostPage = 0x1000;
+		const uint64_t     host_page = vaddr & ~(kHostPage - 1);
+		uint64_t           commit_start = host_page;
+		uint64_t           commit_size  = kHostPage;
+		if (have_mbi && mbi.State == MEM_RESERVE) {
+			const uint64_t region_base = reinterpret_cast<uint64_t>(mbi.BaseAddress);
+			const uint64_t region_end  = region_base + mbi.RegionSize;
+			if (host_page >= region_base && host_page < region_end) {
+				commit_start = host_page;
+				commit_size  = std::min(kHostPage, region_end - host_page);
+			}
+		}
+		bool ok = CommitFixedHostRange(commit_start, commit_size, VirtualMemory::Mode::ReadWrite);
+		if (!ok) {
+			ok = CommitFixedHostRange(page, kPageSize, VirtualMemory::Mode::ReadWrite);
+		}
+		// SEC_RESERVE mapped views often require committing from the region base, not a
+		// mid-page slice — try the whole MBI region once before unmap/replace.
+		if (!ok && have_mbi && mbi.Type == MEM_MAPPED && mbi.State == MEM_RESERVE &&
+		    mbi.BaseAddress != nullptr && mbi.RegionSize != 0) {
+			auto* committed =
+			    VirtualAlloc(mbi.BaseAddress, mbi.RegionSize, MEM_COMMIT, PAGE_READWRITE);
+			if (committed != nullptr) {
+				ok = true;
+				if (on <= 32 || (on % 64) == 0) {
+					LOGF("MemoryTrace: demand-commit orphan-mapped region OK base=0x%016" PRIx64
+					     " size=0x%016" PRIx64 " n=%u\n",
+					     reinterpret_cast<uint64_t>(mbi.BaseAddress),
+					     static_cast<uint64_t>(mbi.RegionSize), on);
+					fprintf(stderr,
+					        "MemoryTrace: demand-commit orphan-mapped region OK base=0x%016" PRIx64
+					        " size=0x%016" PRIx64 " n=%u\n",
+					        reinterpret_cast<uint64_t>(mbi.BaseAddress),
+					        static_cast<uint64_t>(mbi.RegionSize), on);
+				}
+			}
+		}
+		// SEC_RESERVE / PAGE_NOACCESS views sometimes reject PAGE_READWRITE commit first.
+		if (!ok && have_mbi && mbi.Type == MEM_MAPPED && mbi.State == MEM_RESERVE &&
+		    mbi.BaseAddress != nullptr && mbi.RegionSize != 0) {
+			auto* committed = VirtualAlloc(mbi.BaseAddress, mbi.RegionSize, MEM_COMMIT,
+			                               PAGE_NOACCESS);
+			if (committed != nullptr) {
+				DWORD old_prot = 0;
+				if (VirtualProtect(mbi.BaseAddress, mbi.RegionSize, PAGE_READWRITE, &old_prot) !=
+				    0) {
+					ok = true;
+				} else {
+					ok = VirtualProtect(reinterpret_cast<void*>(commit_start), commit_size,
+					                    PAGE_READWRITE, &old_prot) != 0;
+				}
+				if (ok && (on <= 32 || (on % 64) == 0)) {
+					LOGF("MemoryTrace: demand-commit orphan-mapped noaccess-commit OK "
+					     "base=0x%016" PRIx64 " n=%u\n",
+					     reinterpret_cast<uint64_t>(mbi.BaseAddress), on);
+					fprintf(stderr,
+					        "MemoryTrace: demand-commit orphan-mapped noaccess-commit OK "
+					        "base=0x%016" PRIx64 " n=%u\n",
+					        reinterpret_cast<uint64_t>(mbi.BaseAddress), on);
+				}
+			}
+		}
+		// MEM_MAPPED + MEM_RESERVE: usually a Direct view corrupted by MEM_DECOMMIT. Prefer
+		// rematerializing via DirectMemoryBacking (unmap real view base + MapViewOfFile3).
+		if (!ok && have_mbi && mbi.Type == MEM_MAPPED && mbi.State == MEM_RESERVE &&
+		    g_direct_memory_backing != nullptr) {
+			const uint64_t backing_base = g_direct_memory_backing->GetBackingBase();
+			const uint64_t backing_size = g_direct_memory_backing->GetBackingSize();
+			if (on <= 8) {
+				LOGF("MemoryTrace: demand-commit orphan-mapped-diag addr=0x%016" PRIx64
+				     " alloc=0x%016" PRIx64 " backing=0x%016" PRIx64 "/0x%016" PRIx64
+				     " covers=%d shares=%d contains=%d n=%u\n",
+				     vaddr,
+				     mbi.AllocationBase != nullptr ? reinterpret_cast<uint64_t>(mbi.AllocationBase)
+				                                   : 0ull,
+				     backing_base, backing_size,
+				     g_direct_memory_backing->CoversBackingAlias(vaddr) ? 1 : 0,
+				     g_direct_memory_backing->SharesBackingAllocation(vaddr) ? 1 : 0,
+				     g_direct_memory_backing->Contains(vaddr, 1) ? 1 : 0, on);
+				fprintf(stderr,
+				        "MemoryTrace: demand-commit orphan-mapped-diag addr=0x%016" PRIx64
+				        " backing=0x%016" PRIx64 " covers=%d shares=%d n=%u\n",
+				        vaddr, backing_base,
+				        g_direct_memory_backing->CoversBackingAlias(vaddr) ? 1 : 0,
+				        g_direct_memory_backing->SharesBackingAllocation(vaddr) ? 1 : 0, on);
+			}
+			if (g_direct_memory_backing->Contains(vaddr, 1)) {
+				if (g_direct_memory_backing->RematerializeContainingView(vaddr)) {
+					ok = true;
+					if (on <= 32 || (on % 64) == 0) {
+						LOGF("MemoryTrace: demand-commit orphan-remap OK addr=0x%016" PRIx64
+						     " n=%u\n",
+						     vaddr, on);
+						fprintf(stderr,
+						        "MemoryTrace: demand-commit orphan-remap OK addr=0x%016" PRIx64
+						        " n=%u\n",
+						        vaddr, on);
+					}
+				} else if (on <= 32 || (on % 64) == 0) {
+					LOGF("MemoryTrace: demand-commit orphan-remap FAIL addr=0x%016" PRIx64
+					     " n=%u\n",
+					     vaddr, on);
+					fprintf(stderr,
+					        "MemoryTrace: demand-commit orphan-remap FAIL addr=0x%016" PRIx64
+					        " n=%u\n",
+					        vaddr, on);
+				}
+			} else if (g_direct_memory_backing->CoversBackingAlias(vaddr) ||
+			           g_direct_memory_backing->SharesBackingAllocation(vaddr) ||
+			           (mbi.AllocationBase != nullptr &&
+			            g_direct_memory_backing->CoversBackingAlias(
+			                reinterpret_cast<uint64_t>(mbi.AllocationBase)))) {
+				if (g_direct_memory_backing->RematerializeBackingAlias()) {
+					ok = true;
+					if (on <= 32 || (on % 64) == 0) {
+						LOGF("MemoryTrace: demand-commit orphan-backing OK addr=0x%016" PRIx64
+						     " new_backing=0x%016" PRIx64 " n=%u\n",
+						     vaddr, g_direct_memory_backing->GetBackingBase(), on);
+						fprintf(stderr,
+						        "MemoryTrace: demand-commit orphan-backing OK addr=0x%016" PRIx64
+						        " new_backing=0x%016" PRIx64 " n=%u\n",
+						        vaddr, g_direct_memory_backing->GetBackingBase(), on);
+					}
+				} else if (on <= 32 || (on % 64) == 0) {
+					LOGF("MemoryTrace: demand-commit orphan-backing FAIL addr=0x%016" PRIx64
+					     " n=%u\n",
+					     vaddr, on);
+					fprintf(stderr,
+					        "MemoryTrace: demand-commit orphan-backing FAIL addr=0x%016" PRIx64
+					        " n=%u\n",
+					        vaddr, on);
+				}
+			}
+		}
+		if (!ok && have_mbi && mbi.Type == MEM_MAPPED && mbi.State == MEM_RESERVE &&
+		    mbi.AllocationBase != nullptr) {
+			// AllocationBase is often the placeholder root. Prefer unmapping MEM_MAPPED
+			// fragments near the fault at their BaseAddress (MapViewOfFile3 return).
+			void*    alloc_base = mbi.AllocationBase;
+			bool     unmapped   = false;
+			int      unmap_hits = 0;
+			DWORD    last_unmap_err = 0;
+			void*    mapped_bases[256] {};
+			int      mapped_n = 0;
+
+			auto push_mapped = [&](void* base) {
+				if (base == nullptr || mapped_n >= 256) {
+					return;
+				}
+				for (int i = 0; i < mapped_n; ++i) {
+					if (mapped_bases[i] == base) {
+						return;
+					}
+				}
+				mapped_bases[mapped_n++] = base;
+			};
+
+			// Fault region first, then nearest siblings within ±32 MiB, then AllocationBase.
+			push_mapped(mbi.BaseAddress);
+			push_mapped(alloc_base);
+			{
+				const uint64_t fault_page = commit_start;
+				const uint64_t window     = 32ull * 1024ull * 1024ull;
+				const uint64_t win_lo =
+				    fault_page > window ? fault_page - window : reinterpret_cast<uint64_t>(alloc_base);
+				uint64_t walk = reinterpret_cast<uint64_t>(alloc_base);
+				for (int step = 0; step < 16384 && walk != 0; ++step) {
+					MEMORY_BASIC_INFORMATION sib {};
+					if (VirtualQuery(reinterpret_cast<const void*>(walk), &sib, sizeof(sib)) == 0 ||
+					    sib.AllocationBase != alloc_base) {
+						break;
+					}
+					const uint64_t b = reinterpret_cast<uint64_t>(sib.BaseAddress);
+					const uint64_t e = b + sib.RegionSize;
+					if ((sib.Type == MEM_MAPPED || sib.Type == MEM_IMAGE) &&
+					    e >= win_lo && b <= fault_page + window) {
+						push_mapped(sib.BaseAddress);
+					}
+					if (e <= walk) {
+						break;
+					}
+					walk = e;
+					if (walk > fault_page + window && mapped_n >= 8) {
+						break;
+					}
+				}
+			}
+
+			for (int i = 0; i < mapped_n; ++i) {
+				SetLastError(0);
+				if (UnmapHostMappedView(mapped_bases[i])) {
+					unmapped = true;
+					++unmap_hits;
+				} else {
+					last_unmap_err = GetLastError();
+				}
+			}
+			if (!unmapped && alloc_base != nullptr) {
+				using NtUnmapViewOfSection_t = LONG(NTAPI*)(HANDLE, PVOID);
+				static NtUnmapViewOfSection_t nt_unmap = nullptr;
+				if (nt_unmap == nullptr) {
+					nt_unmap = reinterpret_cast<NtUnmapViewOfSection_t>(
+					    GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtUnmapViewOfSection"));
+				}
+				if (nt_unmap != nullptr) {
+					for (int i = 0; i < mapped_n; ++i) {
+						if (nt_unmap(GetCurrentProcess(), mapped_bases[i]) >= 0) {
+							unmapped = true;
+							++unmap_hits;
+						}
+					}
+				}
+			}
+
+			// NtFreeVirtualMemory can release some section views / sparse regions that Win32
+			// UnmapViewOfFile rejects with ERROR_INVALID_PARAMETER.
+			if (!ok) {
+				using NtFreeVirtualMemory_t =
+				    LONG(NTAPI*)(HANDLE, PVOID*, PSIZE_T, ULONG);
+				static NtFreeVirtualMemory_t nt_free = nullptr;
+				if (nt_free == nullptr) {
+					nt_free = reinterpret_cast<NtFreeVirtualMemory_t>(
+					    GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtFreeVirtualMemory"));
+				}
+				LONG free_st = static_cast<LONG>(0xC0000001L);
+				if (nt_free != nullptr && mbi.BaseAddress != nullptr) {
+					PVOID  free_base = mbi.BaseAddress;
+					SIZE_T free_sz   = static_cast<SIZE_T>(mbi.RegionSize);
+					free_st          = nt_free(GetCurrentProcess(), &free_base, &free_sz,
+					                           /*MEM_DECOMMIT*/ 0x4000);
+					if (free_st < 0) {
+						free_base = mbi.BaseAddress;
+						free_sz   = static_cast<SIZE_T>(mbi.RegionSize);
+						free_st   = nt_free(GetCurrentProcess(), &free_base, &free_sz,
+						                    /*MEM_RELEASE*/ 0x8000);
+					}
+					if (free_st < 0) {
+						free_base = alloc_base;
+						free_sz   = 0;
+						free_st   = nt_free(GetCurrentProcess(), &free_base, &free_sz,
+						                    /*MEM_RELEASE*/ 0x8000);
+					}
+					if (on <= 4) {
+						LOGF("MemoryTrace: demand-commit orphan-ntfree status=0x%08lX "
+						     "prot=0x%08lX alloc_prot=0x%08lX n=%u\n",
+						     static_cast<unsigned long>(free_st),
+						     static_cast<unsigned long>(mbi.Protect),
+						     static_cast<unsigned long>(mbi.AllocationProtect), on);
+						fprintf(stderr,
+						        "MemoryTrace: demand-commit orphan-ntfree status=0x%08lX "
+						        "prot=0x%08lX alloc_prot=0x%08lX n=%u\n",
+						        static_cast<unsigned long>(free_st),
+						        static_cast<unsigned long>(mbi.Protect),
+						        static_cast<unsigned long>(mbi.AllocationProtect), on);
+					}
+					if (free_st >= 0) {
+						unmapped = true;
+						ok = VirtualMemory::AllocFixed(commit_start, commit_size,
+						                               VirtualMemory::Mode::ReadWrite);
+						if (!ok) {
+							ok = VirtualMemory::AllocFixed(host_page, kHostPage,
+							                               VirtualMemory::Mode::ReadWrite);
+						}
+						if (!ok) {
+							auto* replaced = VirtualAlloc2(
+							    GetCurrentProcess(), reinterpret_cast<void*>(commit_start),
+							    commit_size,
+							    MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+							    PAGE_READWRITE, nullptr, 0);
+							if (replaced != nullptr &&
+							    reinterpret_cast<uint64_t>(replaced) == commit_start) {
+								ok = true;
+							} else if (replaced != nullptr) {
+								VirtualFree(replaced, 0, MEM_RELEASE);
+							}
+						}
+					}
+				}
+			}
+
+			// Query mapped filename once for diagnosis (driver section vs pagefile).
+			if (on <= 4) {
+				using NtQueryVirtualMemory_t = LONG(NTAPI*)(HANDLE, PVOID, int, PVOID, SIZE_T,
+				                                            SIZE_T*);
+				static NtQueryVirtualMemory_t nt_qvm = nullptr;
+				if (nt_qvm == nullptr) {
+					nt_qvm = reinterpret_cast<NtQueryVirtualMemory_t>(
+					    GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryVirtualMemory"));
+				}
+				char name_buf[1024];
+				name_buf[0] = '?';
+				name_buf[1] = '\0';
+				if (nt_qvm != nullptr) {
+					struct {
+						USHORT Length;
+						USHORT MaximumLength;
+						PWSTR  Buffer;
+						WCHAR  Data[240];
+					} mfn {};
+					mfn.Buffer        = mfn.Data;
+					mfn.MaximumLength = sizeof(mfn.Data);
+					SIZE_T ret_len    = 0;
+					// MemoryMappedFilenameInformation = 2
+					if (nt_qvm(GetCurrentProcess(), alloc_base, 2, &mfn, sizeof(mfn), &ret_len) >=
+					        0 &&
+					    mfn.Length >= sizeof(WCHAR)) {
+						const int nchars = mfn.Length / static_cast<int>(sizeof(WCHAR));
+						WideCharToMultiByte(CP_UTF8, 0, mfn.Data, nchars, name_buf,
+						                    static_cast<int>(sizeof(name_buf) - 1), nullptr,
+						                    nullptr);
+						name_buf[sizeof(name_buf) - 1] = '\0';
+					} else {
+						std::snprintf(name_buf, sizeof(name_buf), "(none/ntstatus)");
+					}
+				}
+				LOGF("MemoryTrace: demand-commit orphan-section name=%s alloc=0x%016" PRIx64
+				     " mapped_n=%d unmap_hits=%d unmap_err=%lu n=%u\n",
+				     name_buf, reinterpret_cast<uint64_t>(alloc_base), mapped_n, unmap_hits,
+				     static_cast<unsigned long>(last_unmap_err), on);
+				fprintf(stderr,
+				        "MemoryTrace: demand-commit orphan-section name=%s mapped_n=%d "
+				        "unmap_hits=%d unmap_err=%lu n=%u\n",
+				        name_buf, mapped_n, unmap_hits,
+				        static_cast<unsigned long>(last_unmap_err), on);
+			}
+
+			{
+				using NtAllocateVirtualMemory_t =
+				    LONG(NTAPI*)(HANDLE, PVOID*, ULONG_PTR, SIZE_T*, ULONG, ULONG);
+				static NtAllocateVirtualMemory_t nt_alloc = nullptr;
+				if (nt_alloc == nullptr) {
+					nt_alloc = reinterpret_cast<NtAllocateVirtualMemory_t>(GetProcAddress(
+					    GetModuleHandleA("ntdll.dll"), "NtAllocateVirtualMemory"));
+				}
+				if (nt_alloc != nullptr) {
+					PVOID  base = reinterpret_cast<PVOID>(commit_start);
+					SIZE_T sz   = static_cast<SIZE_T>(commit_size);
+					if (nt_alloc(GetCurrentProcess(), &base, 0, &sz, MEM_COMMIT,
+					             PAGE_READWRITE) >= 0 &&
+					    reinterpret_cast<uint64_t>(base) == commit_start) {
+						ok = true;
+					}
+					if (!ok && mbi.BaseAddress != nullptr && mbi.RegionSize != 0) {
+						base = mbi.BaseAddress;
+						sz   = static_cast<SIZE_T>(mbi.RegionSize);
+						if (nt_alloc(GetCurrentProcess(), &base, 0, &sz, MEM_COMMIT,
+						             PAGE_READWRITE) >= 0) {
+							ok = true;
+						}
+					}
+				}
+			}
+			if (!ok && unmapped) {
+				auto* replaced = VirtualAlloc2(GetCurrentProcess(),
+				                               reinterpret_cast<void*>(commit_start), commit_size,
+				                               MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+				                               PAGE_READWRITE, nullptr, 0);
+				if (replaced != nullptr &&
+				    reinterpret_cast<uint64_t>(replaced) == commit_start) {
+					ok = true;
+				} else if (replaced != nullptr) {
+					VirtualFree(replaced, 0, MEM_RELEASE);
+				}
+			}
+			if (!ok) {
+				ok = VirtualMemory::AllocFixed(commit_start, commit_size,
+				                               VirtualMemory::Mode::ReadWrite);
+			}
+			if (!ok) {
+				ok = VirtualMemory::AllocFixed(host_page, kHostPage,
+				                               VirtualMemory::Mode::ReadWrite);
+			}
+			if (!ok && g_direct_memory_backing != nullptr) {
+				ok = g_direct_memory_backing->TryReplaceMappedHole(commit_start, commit_size);
+			}
+			if (ok && (on <= 32 || (on % 64) == 0)) {
+				LOGF("MemoryTrace: demand-commit orphan-sibling OK host=0x%016" PRIx64
+				     " hits=%d unmapped=%d mapped_n=%d n=%u\n",
+				     commit_start, unmap_hits, unmapped ? 1 : 0, mapped_n, on);
+				fprintf(stderr,
+				        "MemoryTrace: demand-commit orphan-sibling OK host=0x%016" PRIx64
+				        " hits=%d unmapped=%d mapped_n=%d n=%u\n",
+				        commit_start, unmap_hits, unmapped ? 1 : 0, mapped_n, on);
+			} else if (!ok && (on <= 32 || (on % 64) == 0)) {
+				uint64_t dump = reinterpret_cast<uint64_t>(alloc_base);
+				char     regions[640];
+				size_t   pos = 0;
+				regions[0]   = '\0';
+				for (int step = 0; step < 20 && dump != 0; ++step) {
+					MEMORY_BASIC_INFORMATION sib {};
+					if (VirtualQuery(reinterpret_cast<const void*>(dump), &sib, sizeof(sib)) ==
+					        0 ||
+					    sib.AllocationBase != alloc_base) {
+						break;
+					}
+					const char* st = sib.State == MEM_COMMIT    ? "C"
+					                 : sib.State == MEM_RESERVE ? "R"
+					                                           : "F";
+					const char* ty = sib.Type == MEM_MAPPED    ? "M"
+					                 : sib.Type == MEM_PRIVATE ? "P"
+					                 : sib.Type == MEM_IMAGE   ? "I"
+					                                          : "?";
+					const int n = std::snprintf(
+					    regions + pos, sizeof(regions) - pos, " [0x%llx/0x%llx:%s%s]",
+					    static_cast<unsigned long long>(reinterpret_cast<uint64_t>(sib.BaseAddress)),
+					    static_cast<unsigned long long>(sib.RegionSize), st, ty);
+					if (n > 0) {
+						pos += static_cast<size_t>(n);
+					}
+					const uint64_t next =
+					    reinterpret_cast<uint64_t>(sib.BaseAddress) + sib.RegionSize;
+					if (next <= dump) {
+						break;
+					}
+					dump = next;
+				}
+				LOGF("MemoryTrace: demand-commit orphan-sibling no-live alloc=0x%016" PRIx64
+				     " mapped_n=%d hits=%d unmap_err=%lu n=%u%s\n",
+				     reinterpret_cast<uint64_t>(alloc_base), mapped_n, unmap_hits,
+				     static_cast<unsigned long>(last_unmap_err), on, regions);
+				fprintf(stderr,
+				        "MemoryTrace: demand-commit orphan-sibling no-live alloc=0x%016" PRIx64
+				        " mapped_n=%d hits=%d unmap_err=%lu n=%u%s\n",
+				        reinterpret_cast<uint64_t>(alloc_base), mapped_n, unmap_hits,
+				        static_cast<unsigned long>(last_unmap_err), on, regions);
+
+				if (g_direct_memory_backing != nullptr &&
+				    g_direct_memory_backing->TryReplaceMappedHole(commit_start, commit_size)) {
+					ok = true;
+					LOGF("MemoryTrace: demand-commit orphan-force-map OK host=0x%016" PRIx64
+					     " n=%u\n",
+					     commit_start, on);
+					fprintf(stderr,
+					        "MemoryTrace: demand-commit orphan-force-map OK host=0x%016" PRIx64
+					        " n=%u\n",
+					        commit_start, on);
+				}
+			}
+		}
+		if (!ok && have_mbi && mbi.Type == MEM_MAPPED && mbi.State == MEM_RESERVE) {
+			DWORD vf_err = 0;
+			if (VirtualFree(reinterpret_cast<void*>(commit_start), commit_size,
+			                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0 ||
+			    (have_mbi && mbi.BaseAddress != nullptr &&
+			     VirtualFree(mbi.BaseAddress, mbi.RegionSize,
+			                 MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0)) {
+				auto* replaced = VirtualAlloc2(GetCurrentProcess(),
+				                               reinterpret_cast<void*>(commit_start), commit_size,
+				                               MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+				                               PAGE_READWRITE, nullptr, 0);
+				if (replaced != nullptr &&
+				    reinterpret_cast<uint64_t>(replaced) == commit_start) {
+					ok = true;
+				} else if (replaced != nullptr) {
+					VirtualFree(replaced, 0, MEM_RELEASE);
+				}
+				if (!ok) {
+					replaced = VirtualAlloc2(GetCurrentProcess(),
+					                         reinterpret_cast<void*>(host_page), kHostPage,
+					                         MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+					                         PAGE_READWRITE, nullptr, 0);
+					if (replaced != nullptr &&
+					    reinterpret_cast<uint64_t>(replaced) == host_page) {
+						ok = true;
+					} else if (replaced != nullptr) {
+						VirtualFree(replaced, 0, MEM_RELEASE);
+					}
+				}
+				if (ok && (on <= 32 || (on % 64) == 0)) {
+					LOGF("MemoryTrace: demand-commit orphan-placeholder OK host=0x%016" PRIx64
+					     " n=%u\n",
+					     commit_start, on);
+					fprintf(stderr,
+					        "MemoryTrace: demand-commit orphan-placeholder OK host=0x%016" PRIx64
+					        " n=%u\n",
+					        commit_start, on);
+				}
+			} else {
+				vf_err = GetLastError();
+				if (on <= 32 || (on % 64) == 0) {
+					LOGF("MemoryTrace: demand-commit orphan-placeholder VirtualFree err=%lu "
+					     "host=0x%016" PRIx64 " n=%u\n",
+					     static_cast<unsigned long>(vf_err), commit_start, on);
+					fprintf(stderr,
+					        "MemoryTrace: demand-commit orphan-placeholder VirtualFree err=%lu "
+					        "host=0x%016" PRIx64 " n=%u\n",
+					        static_cast<unsigned long>(vf_err), commit_start, on);
+				}
+			}
+		}
+		if (!ok && have_mbi && mbi.Type == MEM_MAPPED && mbi.AllocationBase != nullptr) {
+			void*       unmapped_base = nullptr;
+			DWORD       unmap_err     = 0;
+			bool        unmapped      = false;
+			void* const bases[]       = {mbi.AllocationBase, mbi.BaseAddress,
+			                             reinterpret_cast<void*>(commit_start)};
+			for (void* candidate: bases) {
+				if (candidate == nullptr) {
+					continue;
+				}
+				if (UnmapViewOfFile2(GetCurrentProcess(), candidate, MEM_PRESERVE_PLACEHOLDER) !=
+				        0 ||
+				    UnmapViewOfFile2(GetCurrentProcess(), candidate, 0) != 0 ||
+				    UnmapViewOfFile(candidate) != 0) {
+					unmapped      = true;
+					unmapped_base = candidate;
+					break;
+				}
+				unmap_err = GetLastError();
+			}
+			if (unmapped) {
+				auto* replaced = VirtualAlloc2(GetCurrentProcess(),
+				                               reinterpret_cast<void*>(commit_start), commit_size,
+				                               MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+				                               PAGE_READWRITE, nullptr, 0);
+				if (replaced != nullptr &&
+				    reinterpret_cast<uint64_t>(replaced) == commit_start) {
+					ok = true;
+				} else if (replaced != nullptr) {
+					VirtualFree(replaced, 0, MEM_RELEASE);
+				}
+				if (!ok) {
+					ok = VirtualMemory::AllocFixed(commit_start, commit_size,
+					                               VirtualMemory::Mode::ReadWrite);
+				}
+				if (!ok) {
+					ok = VirtualMemory::AllocFixed(host_page, kHostPage,
+					                               VirtualMemory::Mode::ReadWrite);
+				}
+			}
+			if (ok && (on <= 32 || (on % 64) == 0)) {
+				LOGF("MemoryTrace: demand-commit orphan-mapped replaced view=0x%016" PRIx64
+				     " host=0x%016" PRIx64 " n=%u\n",
+				     reinterpret_cast<uint64_t>(unmapped_base), commit_start, on);
+				fprintf(stderr,
+				        "MemoryTrace: demand-commit orphan-mapped replaced view=0x%016" PRIx64
+				        " host=0x%016" PRIx64 " n=%u\n",
+				        reinterpret_cast<uint64_t>(unmapped_base), commit_start, on);
+			} else if (!ok && (on <= 32 || (on % 64) == 0)) {
+				SetLastError(0);
+				void* try_commit =
+				    VirtualAlloc(reinterpret_cast<void*>(commit_start), commit_size, MEM_COMMIT,
+				                 PAGE_READWRITE);
+				const DWORD commit_err = GetLastError();
+				LOGF("MemoryTrace: demand-commit orphan-mapped FAIL view=0x%016" PRIx64
+				     " unmapped=%d unmap_err=%lu commit_err=%lu n=%u\n",
+				     reinterpret_cast<uint64_t>(mbi.AllocationBase), unmapped ? 1 : 0,
+				     static_cast<unsigned long>(unmap_err),
+				     static_cast<unsigned long>(commit_err), on);
+				fprintf(stderr,
+				        "MemoryTrace: demand-commit orphan-mapped FAIL view=0x%016" PRIx64
+				        " unmapped=%d unmap_err=%lu commit_err=%lu n=%u\n",
+				        reinterpret_cast<uint64_t>(mbi.AllocationBase), unmapped ? 1 : 0,
+				        static_cast<unsigned long>(unmap_err),
+				        static_cast<unsigned long>(commit_err), on);
+				if (try_commit != nullptr) {
+					ok = true;
+				} else if (commit_err == ERROR_INVALID_PARAMETER) {
+					// VirtualQuery said RESERVE/MAPPED but COMMIT/Unmap reject it — try private
+					// AllocFixed as if the VA were free (seen with stale MBI / holes).
+					ok = VirtualMemory::AllocFixed(host_page, kHostPage,
+					                               VirtualMemory::Mode::ReadWrite);
+					if (!ok) {
+						const uint64_t a64 = host_page & ~uint64_t {0xffff};
+						ok = VirtualMemory::AllocFixed(a64, 0x10000,
+						                               VirtualMemory::Mode::ReadWrite);
+					}
+					if (ok && (on <= 32 || (on % 64) == 0)) {
+						LOGF("MemoryTrace: demand-commit orphan-allocfixed OK host=0x%016" PRIx64
+						     " n=%u\n",
+						     host_page, on);
+						fprintf(stderr,
+						        "MemoryTrace: demand-commit orphan-allocfixed OK host=0x%016" PRIx64
+						        " n=%u\n",
+						        host_page, on);
+					}
+				}
+			}
+		}
+#else
+		bool ok = CommitFixedHostRange(page, kPageSize, VirtualMemory::Mode::ReadWrite);
+		const uint64_t commit_start = page;
+		const uint64_t commit_size  = kPageSize;
+#endif
+		if (!ok) {
+			if (on <= 32 || (on % 64) == 0) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				const uint64_t alloc_base =
+				    have_mbi ? reinterpret_cast<uint64_t>(mbi.AllocationBase) : 0;
+				const uint64_t region_size = have_mbi ? static_cast<uint64_t>(mbi.RegionSize) : 0;
+				const uint32_t mem_type    = have_mbi ? static_cast<uint32_t>(mbi.Type) : 0;
+				LOGF("MemoryTrace: demand-commit orphan-reserve FAIL page=0x%016" PRIx64
+				     " host=0x%016" PRIx64 " size=0x%016" PRIx64 " alloc=0x%016" PRIx64
+				     " rgn=0x%016" PRIx64 " type=0x%08" PRIx32 " n=%u\n",
+				     page, commit_start, commit_size, alloc_base, region_size, mem_type, on);
+				fprintf(stderr,
+				        "MemoryTrace: demand-commit orphan-reserve FAIL page=0x%016" PRIx64
+				        " host=0x%016" PRIx64 " rgn=0x%016" PRIx64 " type=0x%08" PRIx32 " n=%u\n",
+				        page, commit_start, region_size, mem_type, on);
+#else
+				LOGF("MemoryTrace: demand-commit orphan-reserve FAIL page=0x%016" PRIx64 " n=%u\n",
+				     page, on);
+				fprintf(stderr,
+				        "MemoryTrace: demand-commit orphan-reserve FAIL page=0x%016" PRIx64
+				        " n=%u\n",
+				        page, on);
+#endif
+			}
+			return false;
+		}
+		constexpr int kOrphanProt =
+		    PROT_CPU_READ | PROT_CPU_WRITE | PROT_GPU_READ | PROT_GPU_WRITE;
+		if (g_virtual_ranges != nullptr) {
+			(void)g_virtual_ranges->Add(
+			    page, kPageSize, 0, kOrphanProt, 0,
+			    in_guest_stack_arena ? VirtualRangeType::Stack : VirtualRangeType::Flexible,
+			    in_guest_stack_arena ? "stack-orphan" : "reserve-orphan", true, false);
+		}
+		if (on <= 32 || (on % 64) == 0) {
+			LOGF("MemoryTrace: demand-commit orphan-reserve OK page=0x%016" PRIx64
+			     " host=0x%016" PRIx64 " n=%u\n",
+			     page, commit_start, on);
+			fprintf(stderr,
+			        "MemoryTrace: demand-commit orphan-reserve OK page=0x%016" PRIx64
+			        " host=0x%016" PRIx64 " n=%u\n",
+			        page, commit_start, on);
+			std::fflush(stderr);
+		}
+		return true;
+	}
 
 	if (!host_needs_commit && !range_is_reserved) {
 		return false;

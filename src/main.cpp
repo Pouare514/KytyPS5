@@ -15,10 +15,252 @@
 #include "kytyGitVersion.h"
 
 #include <cstdio>
+#include <cstring>
+#include <cstdint>
+#include <string>
 #include <fmt/format.h>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <intrin.h>
+#include <windows.h>
+#endif
 
 using namespace Common;
 using namespace Emulator;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// CFG stubs sanitize RCX so allow-all never calls null / guest-stack / non-X memory.
+// Replace PE guard slots only — never patch ntdll bodies (caused RIP=0 crashes).
+
+extern "C" void KytyCfgSafeCallTarget() {}
+
+static bool KytyHostCodeIsExecutable(uint64_t addr) {
+	if (addr < 0x10000ull) {
+		return false;
+	}
+	MEMORY_BASIC_INFORMATION mbi {};
+	if (VirtualQuery(reinterpret_cast<const void*>(addr), &mbi, sizeof(mbi)) == 0 ||
+	    mbi.State != MEM_COMMIT) {
+		return false;
+	}
+	const DWORD prot = mbi.Protect & 0xffu;
+	return prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE ||
+	       prot == PAGE_EXECUTE_WRITECOPY;
+}
+
+static bool KytyCfgCallerWillInvokeRcx(uint64_t return_addr) {
+	if (return_addr < 0x10000ull || !KytyHostCodeIsExecutable(return_addr)) {
+		return false;
+	}
+	const auto* p = reinterpret_cast<const uint8_t*>(return_addr);
+	// call rcx (FF D1) / jmp rcx (FF E1) — CFG check-then-invoke sites.
+	if (p[0] == 0xff && (p[1] == 0xd1 || p[1] == 0xe1)) {
+		return true;
+	}
+	return false;
+}
+
+// target in RCX, CFG caller's resume address in RDX (passed by naked stubs).
+extern "C" uint64_t KytyCfgSanitizeTarget(uint64_t target, uint64_t caller_ret) {
+	// Stack walkers validate RAs via CFG without calling them — never clobber RCX for those.
+	// Only retarget when the caller is about to call/jmp rcx into non-executable memory.
+	if (caller_ret != 0 && !KytyCfgCallerWillInvokeRcx(caller_ret)) {
+		return target;
+	}
+	if (!KytyHostCodeIsExecutable(target)) {
+		return reinterpret_cast<uint64_t>(&KytyCfgSafeCallTarget);
+	}
+	return target;
+}
+
+#if defined(__clang__)
+__attribute__((naked)) extern "C" void KytyCfgAllowAll() {
+	__asm__ volatile(
+	    "subq $0x28, %rsp\n"
+	    "movq 0x28(%rsp), %rdx\n" // CFG caller's return address
+	    "callq KytyCfgSanitizeTarget\n"
+	    "movq %rax, %rcx\n"
+	    "addq $0x28, %rsp\n"
+	    "ret\n");
+}
+
+__attribute__((naked)) extern "C" void KytyCfgDispatchAll() {
+	__asm__ volatile(
+	    "subq $0x28, %rsp\n"
+	    // Force invoke path: rdx=0 → Sanitize always retargets non-exec.
+	    "xorl %edx, %edx\n"
+	    "callq KytyCfgSanitizeTarget\n"
+	    "addq $0x28, %rsp\n"
+	    "jmpq *%rax\n");
+}
+#else
+extern "C" void KytyCfgAllowAll() {}
+extern "C" void KytyCfgDispatchAll() {}
+#endif
+
+static void DisableHostControlFlowGuard() {
+	// PE load-config dir.Size is often 0x140 while current SDK sizeof(...) is larger
+	// (GuardMemcpy/Uma). Requiring full sizeof caused a silent early-return — CFG stayed on.
+	constexpr DWORD kMinLoadConfigForCfg = 0x80; // through GuardCFDispatchFunctionPointer
+	auto* const     module = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+	int             patched_slots = 0;
+	ULONGLONG       check_slot    = 0;
+	ULONGLONG       dispatch_slot = 0;
+	DWORD           guard_flags   = 0;
+	const char*     status        = "ok";
+
+	auto write_log = [&]() {
+		wchar_t exe_path[MAX_PATH] = {};
+		GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+		std::wstring log_path(exe_path);
+		const auto   slash = log_path.find_last_of(L"\\/");
+		if (slash != std::wstring::npos) {
+			log_path.resize(slash + 1);
+		}
+		log_path += L"_kyty_cfg_disable.txt";
+		FILE* f = nullptr;
+		_wfopen_s(&f, log_path.c_str(), L"w");
+		if (f == nullptr) {
+			fopen_s(&f, "_kyty_cfg_disable.txt", "w");
+		}
+		if (f != nullptr) {
+			std::fprintf(f,
+			             "status=%s slots=%d check_slot=0x%llx dispatch_slot=0x%llx flags=0x%lx "
+			             "expect_check=%p expect_dispatch=%p\n",
+			             status, patched_slots, static_cast<unsigned long long>(check_slot),
+			             static_cast<unsigned long long>(dispatch_slot),
+			             static_cast<unsigned long>(guard_flags),
+			             reinterpret_cast<void*>(&KytyCfgAllowAll),
+			             reinterpret_cast<void*>(&KytyCfgDispatchAll));
+			if (check_slot != 0) {
+				auto** slot = reinterpret_cast<void**>(static_cast<uintptr_t>(check_slot));
+				std::fprintf(f, "check_fn_now=%p\n", slot != nullptr ? *slot : nullptr);
+			}
+			std::fclose(f);
+		}
+	};
+
+	if (module == nullptr) {
+		status = "no_module";
+		write_log();
+		return;
+	}
+	const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+		status = "bad_dos";
+		write_log();
+		return;
+	}
+	const auto* nt =
+	    reinterpret_cast<const IMAGE_NT_HEADERS64*>(module + static_cast<uint32_t>(dos->e_lfanew));
+	if (nt->Signature != IMAGE_NT_SIGNATURE) {
+		status = "bad_nt";
+		write_log();
+		return;
+	}
+	const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+	if (dir.VirtualAddress == 0 || dir.Size < kMinLoadConfigForCfg) {
+		status = "no_load_config";
+		write_log();
+		return;
+	}
+
+	// Read only fields present in dir.Size — do not require full SDK struct.
+	auto*       lc_bytes = module + dir.VirtualAddress;
+	const DWORD lc_size  = dir.Size;
+	auto read_u64 = [&](DWORD off) -> ULONGLONG {
+		if (off + sizeof(ULONGLONG) > lc_size) {
+			return 0;
+		}
+		ULONGLONG v = 0;
+		std::memcpy(&v, lc_bytes + off, sizeof(v));
+		return v;
+	};
+	auto read_u32 = [&](DWORD off) -> DWORD {
+		if (off + sizeof(DWORD) > lc_size) {
+			return 0;
+		}
+		DWORD v = 0;
+		std::memcpy(&v, lc_bytes + off, sizeof(v));
+		return v;
+	};
+	auto write_u32 = [&](DWORD off, DWORD v) {
+		if (off + sizeof(DWORD) > lc_size) {
+			return;
+		}
+		DWORD old = 0;
+		if (VirtualProtect(lc_bytes + off, sizeof(DWORD), PAGE_READWRITE, &old) != 0) {
+			std::memcpy(lc_bytes + off, &v, sizeof(v));
+			VirtualProtect(lc_bytes + off, sizeof(DWORD), old, &old);
+		}
+	};
+
+	check_slot                   = read_u64(0x70);
+	dispatch_slot                = read_u64(0x78);
+	guard_flags                  = read_u32(0x90);
+	const ULONGLONG xfg_check    = read_u64(0x118);
+	const ULONGLONG xfg_dispatch = read_u64(0x120);
+
+	auto patch_ntdll_check_to_stub = [&](ULONGLONG slot_va) {
+		if (slot_va == 0) {
+			return;
+		}
+		auto** slot = reinterpret_cast<void**>(static_cast<uintptr_t>(slot_va));
+		if (slot == nullptr || *slot == nullptr) {
+			return;
+		}
+		HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+		HMODULE owner = nullptr;
+		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+		                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                       reinterpret_cast<LPCSTR>(*slot), &owner) == 0 ||
+		    owner == nullptr || owner != ntdll) {
+			return;
+		}
+		// Absolute jmp: FF 25 00 00 00 00 + imm64 (rel32 cannot reach our image from ntdll).
+		auto*             start = reinterpret_cast<uint8_t*>(*slot);
+		constexpr size_t  kLen  = 14;
+		uint8_t           buf[kLen] = {0xff, 0x25, 0x00, 0x00, 0x00, 0x00};
+		const uint64_t    dest      = reinterpret_cast<uint64_t>(&KytyCfgAllowAll);
+		std::memcpy(buf + 6, &dest, sizeof(dest));
+		DWORD old = 0;
+		if (VirtualProtect(start, kLen, PAGE_EXECUTE_READWRITE, &old) != 0) {
+			std::memcpy(start, buf, kLen);
+			FlushInstructionCache(GetCurrentProcess(), start, kLen);
+			VirtualProtect(start, kLen, old, &old);
+		}
+	};
+	// Redirect ntdll check through our sanitizer (other modules still call ntdll).
+	patch_ntdll_check_to_stub(check_slot);
+	patch_ntdll_check_to_stub(xfg_check);
+
+	auto patch_slot = [&](ULONGLONG slot_va, void* stub) {
+		if (slot_va == 0) {
+			return;
+		}
+		auto** slot = reinterpret_cast<void**>(static_cast<uintptr_t>(slot_va));
+		DWORD  old  = 0;
+		if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old) != 0) {
+			*slot = stub;
+			VirtualProtect(slot, sizeof(void*), old, &old);
+			++patched_slots;
+		}
+	};
+	patch_slot(check_slot, reinterpret_cast<void*>(&KytyCfgAllowAll));
+	patch_slot(dispatch_slot, reinterpret_cast<void*>(&KytyCfgDispatchAll));
+	patch_slot(xfg_check, reinterpret_cast<void*>(&KytyCfgAllowAll));
+	patch_slot(xfg_dispatch, reinterpret_cast<void*>(&KytyCfgDispatchAll));
+
+	guard_flags &=
+	    ~(0x100u | 0x200u | 0x400u | 0x4000u | 0x8000u | 0x10000u | 0x20000u | 0x40000u);
+	write_u32(0x90, guard_flags);
+	write_log();
+	::printf("Kyty: host CFG disabled (slots=%d)\n", patched_slots);
+}
+#endif
 
 static std::string GetBuildString() {
 	Date date = Date::FromMacros(std::string(__DATE__));
@@ -229,6 +471,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 int main(int argc, char* argv[]) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	DisableHostControlFlowGuard();
 	if (Common::RunExitWatcherIfRequested(argc, argv)) {
 		return 0;
 	}

@@ -293,6 +293,16 @@ bool SysVirtualReserveFixed(uint64_t address, uint64_t size) {
 }
 
 bool SysVirtualDecommit(uint64_t address, uint64_t size) {
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(reinterpret_cast<const void*>(static_cast<uintptr_t>(address)), &info,
+	                 sizeof(info)) != 0 &&
+	    (info.Type == MEM_MAPPED || info.Type == MEM_IMAGE)) {
+		// Decommitting section views creates irreparable MEM_MAPPED|MEM_RESERVE holes.
+		printf("VirtualFree(MEM_DECOMMIT) refused on MEM_MAPPED/IMAGE addr=0x%016" PRIx64
+		       " type=0x%08" PRIx32 "\n",
+		       address, static_cast<uint32_t>(info.Type));
+		return false;
+	}
 	if (VirtualFree(reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)), size,
 	                MEM_DECOMMIT) == 0) {
 		printf("VirtualFree(MEM_DECOMMIT) failed: 0x%08" PRIx32 "\n",
