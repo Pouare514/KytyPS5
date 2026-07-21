@@ -93,12 +93,20 @@ static KYTY_SYSV_ABI int UserServiceGetLoginUserIdList(UserServiceLoginUserIdLis
 }
 
 static KYTY_SYSV_ABI int UserServiceGetUserName(int user_id, char* name, size_t size) {
-	EXIT_NOT_IMPLEMENTED(user_id != 1000);
-	EXIT_NOT_IMPLEMENTED(size < 5);
+	PRINT_NAME();
 
-	int s = snprintf(name, size, "%s", "Kyty");
+	// Primary profile is 1000; some titles also query user_id 1 for the same slot.
+	if (user_id != 1000 && user_id != 1) {
+		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
+	}
+	if (name == nullptr || size < 5) {
+		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
+	}
 
-	EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= size);
+	const int s = snprintf(name, size, "%s", "Kyty");
+	if (s < 0 || static_cast<size_t>(s) >= size) {
+		return USER_SERVICE_ERROR_BUFFER_TOO_SHORT;
+	}
 
 	return OK;
 }
@@ -263,6 +271,7 @@ LIB_DEFINE(InitUserService_1) {
 	LIB_FUNC("yH17Q6NWtVg", UserService::UserServiceGetEvent);
 	LIB_FUNC("fPhymKNvK-A", UserService::UserServiceGetLoginUserIdList);
 	LIB_FUNC("1xxcMiGu2fo", UserService::UserServiceGetUserName);
+	LIB_FUNC("znaWI0gpuo8", UserService::UserServiceGetUserName);
 	LIB_FUNC("bwFjS+bX9mA", UserService::UserServiceGetUserNumber);
 	LIB_FUNC("qbwy0Ub8b3M", UserService::UserServiceGetUserNumber);
 	LIB_FUNC("-sD02mFDBh4", UserService::UserServiceGetGamePresets);

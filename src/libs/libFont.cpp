@@ -1441,9 +1441,23 @@ int KYTY_SYSV_ABI FontGetVerticalLayout(FontHandle font_handle, FontVerticalLayo
 		return -1;
 	}
 
-	layout->base_line_x  = 0.0f;
-	layout->line_width   = 16.0f;
-	layout->effect_width = 16.0f;
+	auto* font = static_cast<FontState*>(font_handle);
+	if (ensure_stb_font(font)) {
+		const float scale    = stb_font_scale(font);
+		int         ascent   = 0;
+		int         descent  = 0;
+		int         line_gap = 0;
+		stbtt_GetFontVMetrics(&font->font_info, &ascent, &descent, &line_gap);
+		// Same STB metrics as horizontal layout, remapped for vertical writing
+		// (baseline X offset, column advance, decoration extent).
+		layout->base_line_x  = static_cast<float>(ascent) * scale;
+		layout->line_width   = static_cast<float>(ascent - descent + line_gap) * scale;
+		layout->effect_width = layout->line_width;
+	} else {
+		layout->base_line_x  = static_cast<float>(scaled_font_height(font)) * 0.75f;
+		layout->line_width   = static_cast<float>(scaled_font_height(font));
+		layout->effect_width = layout->line_width;
+	}
 
 	LOGF("\t handle = 0x%016" PRIx64 ", layout = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(font_handle), reinterpret_cast<uint64_t>(layout));
