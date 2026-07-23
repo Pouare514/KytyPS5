@@ -26,6 +26,12 @@ namespace Loader::X64InstructionEmulator {
 // retarget RCX to a safe stub when the call target is not host-executable (e.g. guest stack).
 [[nodiscard]] bool TrySoftContinueCfgBitmap(void* native_context, uint64_t fault_vaddr);
 
+// ntdll!RtlEnterCriticalSection(NULL): AV Write[8] (lock bts [rdi+8],0). Skip-one-insn is
+// insufficient (next [rdi+10] faults). Unwind one frame so the caller resumes as if Enter
+// returned without locking. Logs ret=mod+off for root-cause tracking.
+[[nodiscard]] bool TrySoftContinueNullCriticalSection(void* native_context,
+                                                      uint64_t fault_vaddr);
+
 } // namespace Loader::X64InstructionEmulator
 
 #endif /* KYTY_LOADER_X64_INSTRUCTION_EMULATOR_H_ */

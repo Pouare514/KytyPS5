@@ -894,6 +894,104 @@ bool TrySoftContinueCfgBitmap(void* native_context, uint64_t fault_vaddr) {
 	return true;
 }
 
+bool TrySoftContinueNullCriticalSection(void* native_context, uint64_t fault_vaddr) {
+	auto* context = static_cast<PCONTEXT>(native_context);
+	if (context == nullptr || fault_vaddr >= 0x10000ull) {
+		return false;
+	}
+
+	HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+	if (ntdll == nullptr) {
+		return false;
+	}
+	const auto enter_cs = reinterpret_cast<uint64_t>(
+	    GetProcAddress(ntdll, "RtlEnterCriticalSection"));
+	const auto leave_cs = reinterpret_cast<uint64_t>(
+	    GetProcAddress(ntdll, "RtlLeaveCriticalSection"));
+	if (enter_cs == 0 || leave_cs == 0 || leave_cs <= enter_cs) {
+		return false;
+	}
+
+	const uint64_t rip = context->Rip;
+	if (rip < enter_cs || rip >= leave_cs) {
+		return false;
+	}
+
+	// Post-prologue RtlEnterCriticalSection keeps CS* in RDI; also accept RCX still-null
+	// near the entry if the fault happens before the mov rdi,rcx.
+	const bool cs_null = context->Rdi == 0 || (rip < enter_cs + 0x20ull && context->Rcx == 0);
+	if (!cs_null) {
+		return false;
+	}
+
+	// Prefer signature lock bts [reg+disp8], imm8(0) — F0 0F BA /7 with disp==8.
+	const auto* ip = reinterpret_cast<const uint8_t*>(rip);
+	MEMORY_BASIC_INFORMATION rip_mbi {};
+	if (VirtualQuery(ip, &rip_mbi, sizeof(rip_mbi)) == 0 || rip_mbi.State != MEM_COMMIT) {
+		return false;
+	}
+	const bool looks_like_bts =
+	    ip[0] == 0xf0 && ip[1] == 0x0f && ip[2] == 0xba && (ip[3] & 0x38) == 0x38 && ip[4] == 0x08 &&
+	    ip[5] == 0x00;
+	// Allow any null-page AV inside EnterCS (version skew on exact insn), but require BTS
+	// signature when fault is not exactly at +8 (avoid swallowing unrelated ntdll faults).
+	if (!looks_like_bts && fault_vaddr != 0x8ull) {
+		return false;
+	}
+
+	CONTEXT unwind = *context;
+	DWORD64 image_base = 0;
+	PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(unwind.Rip, &image_base, nullptr);
+	if (rf == nullptr || image_base == 0) {
+		return false;
+	}
+	PVOID   handler_data     = nullptr;
+	ULONG64 establisher_frame = 0;
+	RtlVirtualUnwind(0, image_base, unwind.Rip, rf, &unwind, &handler_data, &establisher_frame,
+	                 nullptr);
+	if (unwind.Rip == 0 || unwind.Rip == rip) {
+		return false;
+	}
+
+	*context = unwind;
+
+	static std::atomic<uint32_t> null_cs_n {0};
+	const uint32_t               n = null_cs_n.fetch_add(1, std::memory_order_relaxed) + 1;
+	const char*                  ret_mod = "?";
+	char                         ret_mod_buf[260] = {};
+	uint64_t                     ret_off          = 0;
+	HMODULE                      ret_owner        = nullptr;
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       reinterpret_cast<LPCSTR>(context->Rip), &ret_owner) != 0 &&
+	    ret_owner != nullptr &&
+	    GetModuleFileNameA(ret_owner, ret_mod_buf, static_cast<DWORD>(sizeof(ret_mod_buf))) != 0) {
+		ret_mod = ret_mod_buf;
+		for (char* p = ret_mod_buf; *p != '\0'; ++p) {
+			if (*p == '\\' || *p == '/') {
+				ret_mod = p + 1;
+			}
+		}
+		ret_off = context->Rip - reinterpret_cast<uint64_t>(ret_owner);
+	}
+	if (n <= 32 || (n % 64) == 0) {
+		char line[384];
+		std::snprintf(line, sizeof(line),
+		              "MemoryTrace: null-CS soft-continue n=%u fault=0x%016" PRIx64
+		              " enter_off=0x%llX ret=%s+0x%llX",
+		              n, fault_vaddr,
+		              static_cast<unsigned long long>(rip - enter_cs), ret_mod,
+		              static_cast<unsigned long long>(ret_off));
+		Common::LogFatalToFile(line);
+		std::fprintf(stderr, "%s\n", line);
+		std::fflush(stderr);
+		if (n == 1) {
+			Common::NoteHaltReason("null_cs", "unwound RtlEnterCriticalSection(NULL)");
+		}
+	}
+	return true;
+}
+
 #endif
 
 bool TryEmulate(void* native_context) {
@@ -924,6 +1022,12 @@ bool TryFixMisalignedSseAccess(void* native_context, uint64_t fault_vaddr) {
 }
 
 bool TrySoftContinueCfgBitmap(void* native_context, uint64_t fault_vaddr) {
+	(void)native_context;
+	(void)fault_vaddr;
+	return false;
+}
+
+bool TrySoftContinueNullCriticalSection(void* native_context, uint64_t fault_vaddr) {
 	(void)native_context;
 	(void)fault_vaddr;
 	return false;

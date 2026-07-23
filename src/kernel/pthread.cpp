@@ -525,13 +525,41 @@ static bool IsComputeName(const std::string& name) {
 	return name.find("Compute") != std::string::npos;
 }
 
+static bool NameContainsInsensitive(const std::string& name, const char* needle) {
+	if (needle == nullptr || needle[0] == '\0') {
+		return false;
+	}
+	const auto nlen = std::strlen(needle);
+	if (name.size() < nlen) {
+		return false;
+	}
+	auto fold = [](unsigned char c) -> unsigned char {
+		return (c >= 'A' && c <= 'Z') ? static_cast<unsigned char>(c - 'A' + 'a') : c;
+	};
+	for (size_t i = 0; i + nlen <= name.size(); ++i) {
+		bool match = true;
+		for (size_t j = 0; j < nlen; ++j) {
+			if (fold(static_cast<unsigned char>(name[i + j])) !=
+			    fold(static_cast<unsigned char>(needle[j]))) {
+				match = false;
+				break;
+			}
+		}
+		if (match) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static bool IsMainRelatedThread(const PthreadPrivate* thread) {
 	if (thread == nullptr) {
 		return false;
 	}
+	// Case-insensitive: Minecraft uses "MINECRAFT MAIN THREAD" (MAIN not Main).
 	return thread->unique_id == 8 || thread->name == "MainThread" ||
-	       thread->name.find("Main") != std::string::npos ||
-	       thread->name.find("BootCards") != std::string::npos;
+	       NameContainsInsensitive(thread->name, "main") ||
+	       NameContainsInsensitive(thread->name, "bootcards");
 }
 
 static const char* Phase54RoleOf(const PthreadPrivate* thread) {
@@ -2131,14 +2159,7 @@ bool PthreadCurrentIsSubmissionRelated() {
 }
 
 bool PthreadCurrentIsMainRelated() {
-	auto* self = g_pthread_self;
-	if (self == nullptr) {
-		return false;
-	}
-	// MainThread or unique_id==8 (BootCards / producer in TLOU traces).
-	return self->unique_id == 8 || self->name == "MainThread" ||
-	       self->name.find("Main") != std::string::npos ||
-	       self->name.find("BootCards") != std::string::npos;
+	return IsMainRelatedThread(g_pthread_self);
 }
 
 bool PthreadCurrentIsProducerPipeline() {

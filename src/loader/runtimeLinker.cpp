@@ -640,6 +640,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 							}
 						}
 						gpu_umd = std::strstr(module_name, "nvwgf2um") != nullptr ||
+						          std::strstr(module_name, "nvd3dum") != nullptr ||
+						          std::strstr(module_name, "nvgpucomp") != nullptr ||
 						          std::strstr(module_name, "nvoglv") != nullptr ||
 						          std::strstr(module_name, "amdvlk") != nullptr ||
 						          std::strstr(module_name, "amdxc64") != nullptr ||
@@ -760,6 +762,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 							              info->exception_address, fault_va, module_name);
 							Common::LogFatalToFile(line);
 							std::fprintf(stderr, "%s\n", line);
+							// RtlEnterCriticalSection(NULL) → Write[8]; unwind one frame instead
+							// of soft-halt (blanket ntdll soft-continue still unsafe).
+							if (Loader::X64InstructionEmulator::TrySoftContinueNullCriticalSection(
+							        info->native_context, fault_va)) {
+								return true;
+							}
 							// Fall through to soft-halt — OS cannot commit this MEM_MAPPED RESERVE
 							// (VirtualAlloc/Unmap/VirtualFree all return ERROR_INVALID_PARAMETER).
 							// Soft-continuing ntdll here corrupts unwind and dies with 0xC0000005.
@@ -769,12 +777,41 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 #endif
 
-			char line[320];
+			if (Loader::X64InstructionEmulator::TrySoftContinueNullCriticalSection(
+			        info->native_context, info->access_violation_vaddr)) {
+				return true;
+			}
+
+			char        line[448];
+			const char* rip_mod = "?";
+			char        rip_mod_buf[260] = {};
+			uint64_t    rip_mod_off     = 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			{
+				HMODULE owner = nullptr;
+				if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				                       reinterpret_cast<LPCSTR>(info->exception_address),
+				                       &owner) != 0 &&
+				    owner != nullptr &&
+				    GetModuleFileNameA(owner, rip_mod_buf, static_cast<DWORD>(sizeof(rip_mod_buf))) !=
+				        0) {
+					rip_mod = rip_mod_buf;
+					for (char* p = rip_mod_buf; *p != '\0'; ++p) {
+						if (*p == '\\' || *p == '/') {
+							rip_mod = p + 1;
+						}
+					}
+					rip_mod_off = info->exception_address - reinterpret_cast<uint64_t>(owner);
+				}
+			}
+#endif
 			std::snprintf(line, sizeof(line),
 			              "MemoryTrace: AV unhandled canonical addr=0x%016" PRIx64
-			              " rip=0x%016" PRIx64 " av=%u — soft-halt 321",
+			              " rip=0x%016" PRIx64 " av=%u mod=%s+0x%llX — soft-halt 321",
 			              info->access_violation_vaddr, info->exception_address,
-			              static_cast<unsigned>(info->access_violation_type));
+			              static_cast<unsigned>(info->access_violation_type), rip_mod,
+			              static_cast<unsigned long long>(rip_mod_off));
 			Common::LogFatalToFile(line);
 			std::fprintf(stderr, "%s\n", line);
 			{
@@ -795,19 +832,6 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				              info->r14, info->r15);
 				Common::LogFatalToFile(regs);
 				std::fprintf(stderr, "%s\n", regs);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-				HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-				if (ntdll != nullptr) {
-					std::snprintf(regs, sizeof(regs),
-					              "MemoryTrace: AV soft-halt ntdll_base=%p rip_off=0x%llX",
-					              static_cast<void*>(ntdll),
-					              static_cast<unsigned long long>(
-					                  info->exception_address -
-					                  reinterpret_cast<uint64_t>(ntdll)));
-					Common::LogFatalToFile(regs);
-					std::fprintf(stderr, "%s\n", regs);
-				}
-#endif
 			}
 			Common::FlushHleRingToFatal("av_unhandled_canonical");
 			Common::NoteHaltReason("av_unhandled", line);
@@ -988,6 +1012,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 							}
 							lower[n] = '\0';
 							gpu_umd = std::strstr(lower, "nvwgf2um") != nullptr ||
+							          std::strstr(lower, "nvd3dum") != nullptr ||
+							          std::strstr(lower, "nvgpucomp") != nullptr ||
 							          std::strstr(lower, "nvoglv") != nullptr ||
 							          std::strstr(lower, "amdvlk") != nullptr ||
 							          std::strstr(lower, "amdxc64") != nullptr ||

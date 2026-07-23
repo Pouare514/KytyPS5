@@ -2,11 +2,13 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/fatalLog.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>             // IWYU pragma: keep
 #include <condition_variable> // IWYU pragma: keep
+#include <cstdio>
 #include <mutex>
 #include <vector>
 
@@ -288,7 +290,23 @@ Mutex::~Mutex() {
 	m_mutex.reset();
 }
 
+static void LogNullMutexOnce(const char* op) {
+	static std::atomic<uint32_t> n {0};
+	const uint32_t               c = n.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (c <= 16 || (c % 64) == 0) {
+		char line[128];
+		std::snprintf(line, sizeof(line), "Mutex: %s on null m_mutex n=%u", op, c);
+		Common::LogFatalToFile(line);
+		std::fprintf(stderr, "%s\n", line);
+		std::fflush(stderr);
+	}
+}
+
 void Mutex::Lock() {
+	if (!m_mutex) {
+		LogNullMutexOnce("Lock");
+		return;
+	}
 #ifdef KYTY_WIN_CS
 	EnterCriticalSection(&m_mutex->m_cs);
 #else
@@ -297,6 +315,10 @@ void Mutex::Lock() {
 }
 
 void Mutex::Unlock() {
+	if (!m_mutex) {
+		LogNullMutexOnce("Unlock");
+		return;
+	}
 #ifdef KYTY_WIN_CS
 	LeaveCriticalSection(&m_mutex->m_cs);
 #else
@@ -305,6 +327,10 @@ void Mutex::Unlock() {
 }
 
 bool Mutex::TryLock() {
+	if (!m_mutex) {
+		LogNullMutexOnce("TryLock");
+		return false;
+	}
 #ifdef KYTY_WIN_CS
 	return (TryEnterCriticalSection(&m_mutex->m_cs) != 0);
 #else
@@ -319,6 +345,10 @@ CondVar::~CondVar() {
 }
 
 void CondVar::Wait(Mutex* mutex) {
+	if (mutex == nullptr || !mutex->m_mutex || !m_cond_var) {
+		LogNullMutexOnce("CondVar::Wait");
+		return;
+	}
 	RegisterCondWaiter(m_cond_var.get());
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
@@ -369,6 +399,10 @@ void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
 
 bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 	bool ok = false;
+	if (mutex == nullptr || !mutex->m_mutex || !m_cond_var) {
+		LogNullMutexOnce("CondVar::WaitFor");
+		return false;
+	}
 	RegisterCondWaiter(m_cond_var.get());
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
