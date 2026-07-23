@@ -1653,6 +1653,12 @@ struct GuestWaveformBlock {
 static_assert(sizeof(GuestWaveformFormat) == 24);
 static_assert(sizeof(GuestWaveformBlock) == 32);
 
+struct Ngs2VoiceParamHeader {
+	uint16_t size;
+	int16_t  next;
+	uint32_t id;
+};
+
 constexpr uint32_t kWaveformTypePcmI16    = 0x01u;
 constexpr uint32_t kWaveformTypePcmF32    = 0x02u;
 constexpr uint32_t kWaveformTypeVag       = 0x03u;
@@ -2329,12 +2335,6 @@ static void Ngs2MixVoiceIntoGrain(float* accum, uint32_t frames, uint32_t channe
 	}
 	voice->pcm_cursor = static_cast<uint32_t>(cursor);
 }
-
-struct Ngs2VoiceParamHeader {
-	uint16_t size;
-	int16_t  next;
-	uint32_t id;
-};
 
 struct Ngs2VoiceEventParam {
 	Ngs2VoiceParamHeader header;

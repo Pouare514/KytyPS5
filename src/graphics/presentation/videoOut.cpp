@@ -1457,7 +1457,7 @@ void Phase51TryBypassFlipL0(const char* why) {
 	if (Graphics::HasRenderContext()) {
 		// One-shot proof: heap CB intentionally retained until process exit (Prepare
 		// records into it; Complete may run later on GPU timeline).
-		auto*    host_cb    = new Graphics::CommandBuffer(0);
+		auto*    host_cb    = new Graphics::CommandBuffer();
 		uint64_t request_id = 0;
 		result = Presentation::DisplayBufferSubmitFlipFromGpu(*host_cb, handle, 0,
 		                                                     /*VIDEO_OUT_FLIP_MODE_VSYNC*/ 1, 0,
