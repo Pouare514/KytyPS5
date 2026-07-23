@@ -832,30 +832,66 @@ bool TrySoftContinueCfgBitmap(void* native_context, uint64_t fault_vaddr) {
 		}
 		// Fall through to AllowAll / fake-ret below.
 	} else if (main_producer) {
-		// Dreaming Sarah: stack-pointer "call targets" make load-ones walk forever; AllowAll
-		// spins; CONTINUE_SEARCH Fatal. Treat the bit as invalid so GuardRestore takes the
-		// failure path instead of validating the whole guest stack.
+		// Dreaming Sarah / Minecraft: guest-stack "call targets" walk forever.
+		// Single fake-ret lands on ntdll walker (same ret=…15bb4) which re-enters for the
+		// next frame — RtlVirtualUnwind until RIP leaves ntdll.
 		static std::atomic<uint32_t> producer_walker_n {0};
 		const uint32_t               pwn =
 		    producer_walker_n.fetch_add(1, std::memory_order_relaxed) + 1;
 
-		const char* mode = "bitmap-load-zero-abort";
+		const char* mode = "fake-ret-main-abort";
 		const auto* ip   = reinterpret_cast<const uint8_t*>(context->Rip);
-		if (ip[0] == 0x48 && ip[1] == 0x8b && ip[2] == 0x14 && ip[3] == 0xc2) {
+		const bool  host_x_target = IsHostExecutableCode(call_target);
+		uint32_t    unwind_frames = 0;
+		if (host_x_target && ip[0] == 0x48 && ip[1] == 0x8b && ip[2] == 0x14 && ip[3] == 0xc2) {
 			context->Rdx = 0;
 			context->Rip += 4;
+			mode = "bitmap-load-zero-abort";
 		} else {
-			context->Rip = stacked_ret;
-			context->Rsp += 8;
-			mode = "fake-ret-main-abort";
+			CONTEXT unwind     = *context;
+			HMODULE ntdll_mod  = GetModuleHandleA("ntdll.dll");
+			bool    left_ntdll = false;
+			for (uint32_t i = 0; i < 32; ++i) {
+				DWORD64 image_base = 0;
+				PRUNTIME_FUNCTION rf =
+				    RtlLookupFunctionEntry(unwind.Rip, &image_base, nullptr);
+				if (rf == nullptr || image_base == 0) {
+					break;
+				}
+				PVOID   handler_data      = nullptr;
+				ULONG64 establisher_frame = 0;
+				const uint64_t rip_before = unwind.Rip;
+				RtlVirtualUnwind(0, image_base, unwind.Rip, rf, &unwind, &handler_data,
+				                 &establisher_frame, nullptr);
+				++unwind_frames;
+				if (unwind.Rip == 0 || unwind.Rip == rip_before) {
+					break;
+				}
+				HMODULE owner = nullptr;
+				if (ntdll_mod != nullptr &&
+				    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				                       reinterpret_cast<LPCSTR>(unwind.Rip), &owner) != 0 &&
+				    owner != nullptr && owner != ntdll_mod) {
+					left_ntdll = true;
+					break;
+				}
+			}
+			if (unwind_frames == 0) {
+				context->Rip = stacked_ret;
+				context->Rsp += 8;
+			} else {
+				*context = unwind;
+				mode     = left_ntdll ? "unwind-exit-ntdll" : "unwind-main-abort";
+			}
 		}
 		if (pwn <= 16 || (pwn % 64u) == 0u) {
-			char line[320];
+			char line[360];
 			std::snprintf(line, sizeof(line),
 			              "MemoryTrace: CFG-bitmap soft-continue n=%u mode=%s "
-			              "pwn=%u fault=0x%016" PRIx64 " target=0x%016" PRIx64
+			              "pwn=%u frames=%u fault=0x%016" PRIx64 " target=0x%016" PRIx64
 			              " out_rip=0x%016" PRIx64,
-			              n, mode, pwn, fault_vaddr, call_target,
+			              n, mode, pwn, unwind_frames, fault_vaddr, call_target,
 			              static_cast<uint64_t>(context->Rip));
 			Common::LogFatalToFile(line);
 			std::fprintf(stderr, "%s\n", line);
