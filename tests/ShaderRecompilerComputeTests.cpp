@@ -3,9 +3,12 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/gpuTiler.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -880,7 +883,11 @@ public:
   [[nodiscard]] vk::Device Device() const { return m_device; }
 
   [[nodiscard]] GraphicContext *GetGraphicContext() {
-    return m_gctx_ready ? &m_gctx : nullptr;
+    if (!IsReady()) {
+      return nullptr;
+    }
+    EnsureRuntimeContext();
+    return &m_runtime_context;
   }
 
   bool PopulateGraphicContext(GraphicContext *ctx) const {
@@ -890,21 +897,33 @@ public:
     ctx->instance = m_instance;
     ctx->physical_device = m_physical_device;
     ctx->device = m_device;
-    vkGetPhysicalDeviceProperties(m_physical_device,
-                                  &ctx->physical_device_properties);
-    for (const int queue :
-         {GraphicContext::QUEUE_GFX, GraphicContext::QUEUE_UTIL}) {
-      ctx->queues[queue].family = m_queue_family;
-      ctx->queues[queue].index = 0;
-      ctx->queues[queue].vk_queue = m_queue;
-    }
-    return VulkanCreateAllocator(ctx);
+    m_physical_device.getProperties(&ctx->physical_device_properties);
+    ctx->physical_device_memory_properties = m_memory_properties;
+    ctx->queue_family = m_queue_family;
+    ctx->queue = m_queue;
+    return ctx->CreateAllocator();
   }
 
   void ReleaseGraphicContext(GraphicContext *ctx) const {
     if (ctx != nullptr && ctx->allocator != nullptr) {
-      VulkanDestroyAllocator(ctx);
+      ctx->DestroyAllocator();
     }
+  }
+
+  void CheckCommandPoolGrowth() {
+    EnsureRuntimeContext();
+    std::array<CommandBuffer, 12> commands;
+    for (auto &command : commands) {
+      Require("CommandPoolGrowth", "allocation", !command.IsInvalid(),
+              "unified command pool failed to grow");
+      command.Begin();
+      command.End();
+      command.Execute();
+    }
+    for (auto &command : commands) {
+      command.WaitForFence();
+    }
+    std::printf("[host]    %-32s ok\n", "CommandPoolGrowth");
   }
 
   void CheckMutableStorageSrgbView() {
@@ -1402,7 +1421,7 @@ public:
     target_info.tile_mode = linear;
 
     {
-      CommandBuffer command(GraphicContext::QUEUE_GFX);
+      CommandBuffer command;
       (void)texture_cache.FindTexture(command, sampled_info, false);
       auto& target = texture_cache.FindRenderTarget(command, target_info);
 
@@ -3101,12 +3120,8 @@ private:
     m_physical_device.getProperties(
         &m_runtime_context.physical_device_properties);
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
-    for (auto &queue : m_runtime_context.queues) {
-      queue.mutex = &m_runtime_queue_mutex;
-      queue.family = m_queue_family;
-      queue.index = 0;
-      queue.vk_queue = m_queue;
-    }
+    m_runtime_context.queue_family = m_queue_family;
+    m_runtime_context.queue = m_queue;
 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr =
@@ -3227,7 +3242,7 @@ private:
     if (m_device != nullptr) {
       RequireVulkanSuccess(m_device.waitIdle(), "vkDeviceWaitIdle");
       if (m_runtime_context.allocator != nullptr) {
-        GraphicsRenderReleaseThreadCommandPools();
+        GraphicsRenderReleaseThreadCommandPool();
         Transfer::ReleaseCachedResources();
         vmaDestroyAllocator(m_runtime_context.allocator);
         m_runtime_context.allocator = nullptr;
@@ -3468,7 +3483,6 @@ private:
   vk::CommandPool m_command_pool = nullptr;
   u32 m_queue_family = 0;
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
-  Common::Mutex m_runtime_queue_mutex;
   GraphicContext m_runtime_context{};
 };
 
@@ -10972,13 +10986,6 @@ void CheckBufferCacheRangeMerge() {
           MergeOverlappingBufferCacheRange(merged, {0x10000, 0x1000}) &&
               merged.address == 0xc000 && merged.size == 0xe000,
           "contained range changed the cache union");
-  Require("BufferCacheRangeMerge", "queue ownership",
-          CanMergeBufferCacheQueueMask(0, 3) &&
-              CanMergeBufferCacheQueueMask(uint64_t{1} << 3u, 3) &&
-              !CanMergeBufferCacheQueueMask(
-                  (uint64_t{1} << 2u) | (uint64_t{1} << 3u), 3) &&
-              !CanMergeBufferCacheQueueMask(0, 64),
-          "cross-queue or invalid queue ownership was accepted");
   std::printf("[host]    %-32s ok\n", "BufferCacheRangeMerge");
 }
 
@@ -14077,7 +14084,7 @@ void CheckStencilFirstBindWithoutClear(VulkanHarness *vulkan) {
   info.stencil_access = true;
 
   {
-    CommandBuffer command(GraphicContext::QUEUE_GFX);
+    CommandBuffer command;
     auto *image = texture_cache.FindDepthTarget(&command, ctx, info);
     Require(name, "bind",
             image != nullptr && image->format == VK_FORMAT_D32_SFLOAT_S8_UINT &&
@@ -14446,26 +14453,27 @@ struct FenceLifetimeProbe {
   bool *destroyed = nullptr;
 };
 
-void CheckCrossQueueImageLifetime() {
+void CheckSharedFenceResourceLifetime() {
   bool destroyed = false;
   auto image = std::make_shared<FenceLifetimeProbe>(&destroyed);
-  FenceResourceRetainer graphics;
-  FenceResourceRetainer compute;
-  graphics.Retain(image);
-  compute.Retain(image);
-  graphics.Retain(image);
+  FenceResourceRetainer first;
+  FenceResourceRetainer second;
+  first.Retain(image);
+  second.Retain(image);
+  first.Retain(image);
   image.reset();
-  Require("CrossQueueImageLifetime", "retained",
-          !destroyed && !graphics.Empty() && !compute.Empty(),
+  Require("SharedFenceResourceLifetime", "retained",
+          !destroyed && !first.Empty() && !second.Empty(),
           "cache removal destroyed an image retained by command buffers");
-  graphics.ReleaseAfterFence();
-  Require("CrossQueueImageLifetime", "first fence",
-          !destroyed && graphics.Empty() && !compute.Empty(),
-          "first command-buffer fence destroyed another queue's image");
-  compute.ReleaseAfterFence();
-  Require("CrossQueueImageLifetime", "last fence", destroyed && compute.Empty(),
+  first.ReleaseAfterFence();
+  Require("SharedFenceResourceLifetime", "first fence",
+          !destroyed && first.Empty() && !second.Empty(),
+          "first command-buffer fence destroyed another buffer's image");
+  second.ReleaseAfterFence();
+  Require("SharedFenceResourceLifetime", "last fence",
+          destroyed && second.Empty(),
           "last referencing command-buffer fence did not destroy the image");
-  std::printf("[host]    %-32s ok\n", "CrossQueueImageLifetime");
+  std::printf("[host]    %-32s ok\n", "SharedFenceResourceLifetime");
 }
 
 void CheckHostDmaMetadataReuse() {
@@ -14617,6 +14625,102 @@ void CheckClipControlDepthClipState() {
   std::printf("[host]    %-32s ok\n", "ClipControlDepthClipState");
 }
 
+void CheckPm4WaitResume() {
+  GraphicsInitJmpTables();
+  CommandProcessor processor;
+
+  uint32_t label = 0;
+  uint32_t prefix = 0;
+  uint32_t child_observation = UINT32_MAX;
+  uint32_t suffix = 0;
+  const auto address = [](const void *value) {
+    return reinterpret_cast<uint64_t>(value);
+  };
+
+  std::array<uint32_t, 12> child{};
+  child[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+  child[1] = 0;
+  child[2] = static_cast<uint32_t>(address(&child_observation));
+  child[3] = static_cast<uint32_t>(address(&child_observation) >> 32u);
+  child[4] = 0;
+  child[5] = KYTY_PM4(7, Pm4::IT_NOP, Pm4::R_WAIT_MEM_32);
+  child[6] = static_cast<uint32_t>(address(&label));
+  child[7] = static_cast<uint32_t>(address(&label) >> 32u);
+  child[8] = UINT32_MAX;
+  child[9] = 1;
+  child[10] = 0x10u | 3u;
+
+  std::array<uint32_t, 4> nested{};
+  nested[0] = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0);
+  nested[1] = static_cast<uint32_t>(address(child.data()));
+  nested[2] = static_cast<uint32_t>(address(child.data()) >> 32u);
+  nested[3] = 0x0f200000u | static_cast<uint32_t>(child.size());
+
+  std::array<uint32_t, 14> commands{};
+  commands[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+  commands[1] = 0;
+  commands[2] = static_cast<uint32_t>(address(&prefix));
+  commands[3] = static_cast<uint32_t>(address(&prefix) >> 32u);
+  commands[4] = 11;
+  commands[5] = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0);
+  commands[6] = static_cast<uint32_t>(address(nested.data()));
+  commands[7] = static_cast<uint32_t>(address(nested.data()) >> 32u);
+  commands[8] = 0x0f200000u | static_cast<uint32_t>(nested.size());
+  commands[9] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+  commands[10] = 0;
+  commands[11] = static_cast<uint32_t>(address(&suffix));
+  commands[12] = static_cast<uint32_t>(address(&suffix) >> 32u);
+  commands[13] = 22;
+
+  Pm4Execution execution;
+  Require("Pm4WaitResume", "suspend",
+          processor.Process(execution, commands.data(), commands.size()) ==
+                  Pm4ProcessResult::Blocked &&
+              prefix == 11 && child_observation == 0 && suffix == 0,
+          "blocked indirect wait did not preserve its command position");
+
+  label = 1;
+  child[4] = 1;
+  Require("Pm4WaitResume", "resume",
+          processor.Process(execution, commands.data(), commands.size()) ==
+                  Pm4ProcessResult::Complete &&
+              prefix == 11 && child_observation == 0 && suffix == 22,
+          "resumed indirect wait replayed a child or did not finish its parent");
+  std::printf("[host]    %-32s ok\n", "Pm4WaitResume");
+}
+
+void CheckPm4CeCompletion() {
+  GraphicsInitJmpTables();
+  CommandProcessor processor;
+  uint32_t suffix = 0;
+  const auto address = reinterpret_cast<uint64_t>(&suffix);
+
+  std::array<uint32_t, 7> commands{};
+  commands[0] = 0xc0008600u;
+  commands[1] = 1;
+  commands[2] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+  commands[3] = 0;
+  commands[4] = static_cast<uint32_t>(address);
+  commands[5] = static_cast<uint32_t>(address >> 32u);
+  commands[6] = 33;
+
+  processor.ResetDeCe();
+  Pm4Execution execution;
+  Require("Pm4CeCompletion", "wait",
+          processor.Process(execution, commands.data(), commands.size()) ==
+                  Pm4ProcessResult::Blocked &&
+              suffix == 0,
+          "DE did not wait for an active CE stream");
+
+  processor.SetCeComplete(true);
+  Require("Pm4CeCompletion", "complete",
+          processor.Process(execution, commands.data(), commands.size()) ==
+                  Pm4ProcessResult::Complete &&
+              suffix == 33,
+          "DE remained blocked after the CE stream completed");
+  std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -14766,7 +14870,7 @@ int main(int argc, char **argv) {
   CheckStencilAttachmentAccess();
   CheckDepthTargetFootprints();
   CheckHtileClearTargetResolution();
-  CheckCrossQueueImageLifetime();
+  CheckSharedFenceResourceLifetime();
   CheckHostDmaMetadataReuse();
 #else
   (void)argc;
@@ -14774,10 +14878,13 @@ int main(int argc, char **argv) {
 #endif
   CheckClipControlDepthClipState();
   CheckReferenceClockScale();
+  CheckPm4WaitResume();
+  CheckPm4CeCompletion();
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
   CheckPs5GameExampleImageClearRuntimeShape();
   VulkanHarness vulkan;
+  vulkan.CheckCommandPoolGrowth();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckQueryRegionImageClassification();
   vulkan.CheckMutableStorageSrgbView();
