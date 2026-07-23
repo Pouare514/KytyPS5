@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 
 namespace Libs {
 
@@ -240,40 +241,52 @@ static int KYTY_SYSV_ABI PsmlContextFinalize(void* context) {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlGetWorkAreaSize(const void* object, uint32_t* out_size) {
+// Astro logo / PSSR path: SizeInDwords then GetDispatchMfsrPacket900.
+// Guest asserts ret == 0 before calling Packet900 with rdi = SoftPacketSizeInDwords.
+constexpr uint32_t SoftPacketSizeInDwords = 0x80u;
+constexpr uint64_t SoftPacketSizeBytes    = SoftPacketSizeInDwords * 4ull;
+
+static int KYTY_SYSV_ABI PsmlMfsrGetDispatchMfsrPacketSizeInDwords(uint64_t /*arg0*/) {
+	PRINT_NAME();
+	return OK;
+}
+
+static int SoftGetDispatchMfsrPacket(uint64_t size_dwords, uint64_t arg1, uint64_t arg2,
+                                     uint64_t arg3) {
 	PRINT_NAME();
 
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
-	}
-	if (!HasKnownObjectMagic(object)) {
-		return PSML_ERROR_INVALID_OBJECT;
-	}
-	if (out_size == nullptr) {
-		return PSML_ERROR_INVALID_POINTER;
+	(void)size_dwords;
+
+	// Logo call shape: rdi=size_dwords (0x80), rsi/rdx = guest packet/param buffers.
+	uint64_t packet_address = 0;
+	for (const auto candidate: {arg1, arg2, arg3}) {
+		if (candidate >= 0x10000ull) {
+			packet_address = candidate;
+			break;
+		}
 	}
 
-	*out_size = 0x600;
+	if (packet_address != 0) {
+		std::memset(reinterpret_cast<void*>(static_cast<uintptr_t>(packet_address)), 0,
+		            static_cast<size_t>(SoftPacketSizeBytes));
+	}
 
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PsmlDispatch(void* context, uint64_t command, uint64_t params) {
-	PRINT_NAME();
+static int KYTY_SYSV_ABI PsmlMfsrGetDispatchMfsrPacket900(uint64_t size_dwords, uint64_t arg1,
+                                                         uint64_t arg2, uint64_t arg3) {
+	return SoftGetDispatchMfsrPacket(size_dwords, arg1, arg2, arg3);
+}
 
-	const auto init_error = CheckInitialized();
-	if (init_error != OK) {
-		return init_error;
-	}
-	if (!HasKnownObjectMagic(context)) {
-		return PSML_ERROR_INVALID_OBJECT;
-	}
-	if (command == 0 || params == 0) {
-		return PSML_ERROR_INVALID_POINTER;
-	}
+static int KYTY_SYSV_ABI PsmlMfsrGetDispatchMfsrPacket1000(uint64_t size_dwords, uint64_t arg1,
+                                                          uint64_t arg2, uint64_t arg3) {
+	return SoftGetDispatchMfsrPacket(size_dwords, arg1, arg2, arg3);
+}
 
-	return OK;
+static int KYTY_SYSV_ABI PsmlMfsrGetDispatchMfsrPacket1100(uint64_t size_dwords, uint64_t arg1,
+                                                          uint64_t arg2, uint64_t arg3) {
+	return SoftGetDispatchMfsrPacket(size_dwords, arg1, arg2, arg3);
 }
 
 static int KYTY_SYSV_ABI PsmlGetProgress(const void* object, float* out_progress,
@@ -340,8 +353,10 @@ LIB_DEFINE(InitPsml_1) {
 	LIB_FUNC("vUk2pWMx3KQ", Psml::PsmlContextInitialize);
 	LIB_FUNC("gxv3i+MTEzU", Psml::PsmlContextInitialize);
 	LIB_FUNC("JaLBe0P3jSU", Psml::PsmlContextFinalize);
-	LIB_FUNC("AHalTX9wFZY", Psml::PsmlGetWorkAreaSize);
-	LIB_FUNC("RUNLFro+qok", Psml::PsmlDispatch);
+	LIB_FUNC("AHalTX9wFZY", Psml::PsmlMfsrGetDispatchMfsrPacketSizeInDwords);
+	LIB_FUNC("RUNLFro+qok", Psml::PsmlMfsrGetDispatchMfsrPacket900);
+	LIB_FUNC("s2psNHUIdjk", Psml::PsmlMfsrGetDispatchMfsrPacket1000);
+	LIB_FUNC("94iBp3KvIuI", Psml::PsmlMfsrGetDispatchMfsrPacket1100);
 	LIB_FUNC("GHna9-DvnUk", Psml::PsmlGetProgress);
 	LIB_FUNC("GJY0MvuTcs8", Psml::PsmlRequestCapture);
 	LIB_FUNC("LXq+6mIxpCw", Psml::PsmlValidateObject);

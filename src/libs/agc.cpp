@@ -636,6 +636,25 @@ static void dbg_dump_shader(const Shader* h) {
 static constexpr int GRAPHICS5_ERROR_INVALID_SHADER_PROGRAM = static_cast<int>(0x8a6c0005u);
 static constexpr int GRAPHICS5_ERROR_INVALID_SHADER_HALVES  = static_cast<int>(0x8a6c0008u);
 
+static bool IsHullShaderBinaryType(uint8_t type) {
+	switch (static_cast<Prospero::ShaderBinaryType>(type)) {
+		case Prospero::ShaderBinaryType::kHs:
+		case Prospero::ShaderBinaryType::kHsFront:
+		case Prospero::ShaderBinaryType::kHsBack: return true;
+		default: return false;
+	}
+}
+
+static bool CanSkipHullProgramPatch(const ShaderRegister* regs, uint32_t num_regs) {
+	// GTA V Enhanced hull headers put RSRC1/RSRC2 (0x10A/0x10B) first and omit
+	// PGM_LO/HI from the default SH table. Code VA already lives at Shader::code.
+	if (regs == nullptr || num_regs == 0) {
+		return false;
+	}
+	const auto first = regs[0].offset;
+	return first == Pm4::SPI_SHADER_PGM_RSRC1_HS || first == Pm4::SPI_SHADER_PGM_LO_HS;
+}
+
 static bool get_shader_program_address_register(uint8_t type, uint32_t* lo_offset) {
 	if (lo_offset == nullptr) {
 		return false;
@@ -649,11 +668,11 @@ static bool get_shader_program_address_register(uint8_t type, uint32_t* lo_offse
 		case Prospero::ShaderBinaryType::kGsBack:
 			*lo_offset = Pm4::SPI_SHADER_PGM_LO_GS;
 			return true;
+		case Prospero::ShaderBinaryType::kHsFront:
 		case Prospero::ShaderBinaryType::kHsBack:
 			*lo_offset = Pm4::SPI_SHADER_PGM_LO_HS;
 			return true;
 		case Prospero::ShaderBinaryType::kGsFront:
-		case Prospero::ShaderBinaryType::kHsFront:
 		case Prospero::ShaderBinaryType::kFs: return false;
 	}
 
@@ -689,6 +708,12 @@ static int patch_program_address_register(ShaderRegister* regs, uint32_t num_reg
 		regs[lo_index].value = static_cast<uint32_t>((addr >> 8u) & 0xffffffffu);
 		regs[hi_index].value &= 0xffffff00u;
 		regs[hi_index].value |= static_cast<uint32_t>((addr >> 40u) & 0xffu);
+		return OK;
+	}
+
+	// Hull type-5 (HsFront) and related HS headers may omit PGM_LO/HI when the
+	// SH default table starts at RSRC1/RSRC2. Succeed without patching.
+	if (IsHullShaderBinaryType(type) && CanSkipHullProgramPatch(regs, num_regs)) {
 		return OK;
 	}
 

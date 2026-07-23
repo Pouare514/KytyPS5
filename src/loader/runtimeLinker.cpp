@@ -718,8 +718,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 								return false;
 							}
 							// CFG bitmap (ntdll!LdrpValidateUserCallTarget): high MEM_MAPPED
-							// sparse section. Prefer soft-continue (ret from check + retarget
-							// non-executable RCX). CONTINUE_SEARCH → Fatal 0xC0000005.
+							// sparse section. Soft-continue via TrySoftContinueCfgBitmap.
+							// Main may return false → CONTINUE_SEARCH for the OS pager
+							// (SharpEmu contract). Do not Sleep-park — that freezes producers.
 							MEMORY_BASIC_INFORMATION cfg_mbi {};
 							if (VirtualQuery(reinterpret_cast<const void*>(fault_va), &cfg_mbi,
 							                 sizeof(cfg_mbi)) != 0 &&
@@ -742,11 +743,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 									std::fprintf(stderr, "%s\n", line);
 									return true;
 								}
-								// Soft-continue failed: park THIS thread only. Never
-								// TerminateProcess(321) — that soft-idles the whole process and
-								// kills further GPU submits.
 								std::snprintf(line, sizeof(line),
-								              "MemoryTrace: AV CFG-bitmap park-thread "
+								              "MemoryTrace: AV CFG-bitmap defer-OS "
 								              "rip=0x%016" PRIx64 " addr=0x%016" PRIx64
 								              " alloc=0x%016" PRIx64 " rcx=0x%016" PRIx64,
 								              info->exception_address, fault_va,
@@ -754,10 +752,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 								              info->rcx);
 								Common::LogFatalToFile(line);
 								std::fprintf(stderr, "%s\n", line);
-								Common::NoteHaltReason("cfg_bitmap_park_thread", line);
-								for (;;) {
-									Sleep(1000);
-								}
+								return false;
 							}
 							std::snprintf(line, sizeof(line),
 							              "MemoryTrace: AV system-dll non-host-stack "

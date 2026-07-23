@@ -2930,9 +2930,14 @@ void TextureCache::MarkGpuWritten(VulkanImage& image) {
 				}
 			}
 			if (m_memory_tracker.IsRegionCpuModified(cached->Address(i), cached->Size(i))) {
-				EXIT("TextureCache: GPU-write begins while image range is CPU-modified, "
-				     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-				     cached->Address(i), cached->Size(i));
+				// VideoOut: UploadVideoOut is intentionally a UMD-safe no-op (no guest→GPU
+				// upload), so CPU-modified sticks. Display flips still mark the image
+				// GPU-written; do not EXIT — same exemption as buffer_cache gpu_modified.
+				if (cached->kind != CachedImage::Kind::VideoOut) {
+					EXIT("TextureCache: GPU-write begins while image range is CPU-modified, "
+					     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+					     cached->Address(i), cached->Size(i));
+				}
 			}
 		}
 		if (cached->kind == CachedImage::Kind::DepthTarget) {
@@ -2958,8 +2963,13 @@ void TextureCache::MarkGpuWritten(VulkanImage& image) {
 			}
 		}
 		if (!cached->gpu_modified) {
-			for (uint32_t i = 0; i < cached->RangeCount(); i++) {
-				m_memory_tracker.MarkRegionAsGpuModified(cached->Address(i), cached->Size(i));
+			// VideoOut: UploadVideoOut is a UMD-safe no-op, so CPU dirty remains set. Do not
+			// MarkRegionAsGpuModified (conflicts with CPU dirty / breaks fault tracking).
+			// Local gpu_modified is enough for present/skip paths.
+			if (cached->kind != CachedImage::Kind::VideoOut) {
+				for (uint32_t i = 0; i < cached->RangeCount(); i++) {
+					m_memory_tracker.MarkRegionAsGpuModified(cached->Address(i), cached->Size(i));
+				}
 			}
 			cached->gpu_modified = true;
 			if (cached->kind == CachedImage::Kind::VideoOut && boot_trace_log()) {
