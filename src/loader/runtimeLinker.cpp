@@ -283,16 +283,26 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		register entry_func_t func_reg asm("rbx")     = func;
 		register uintptr_t    guest_rsp_reg asm("r8") = guest_rsp;
 		register uintptr_t    guest_rbp_reg asm("r9") = guest_rbp;
+		uintptr_t host_stack_base  = 0;
+		uintptr_t host_stack_limit = 0;
+		asm volatile("movq %%gs:0x08, %0\n\t"
+		             "movq %%gs:0x10, %1\n\t"
+		             : "=r"(host_stack_base), "=r"(host_stack_limit)
+		             :
+		             : "memory");
+		asm volatile("movq %0, %%gs:0x08\n\t"
+		             "movq %1, %%gs:0x10\n\t"
+		             :
+		             : "r"(guest_stack_base), "r"(guest_stack_limit)
+		             : "memory");
+		// The template restores the host bounds from r14/r15 (kept out of the clobber
+		// list: pushes preserve them and SysV guest code preserves them).
+		register uintptr_t host_base_reg asm("r14")  = host_stack_base;
+		register uintptr_t host_limit_reg asm("r15") = host_stack_limit;
 		asm volatile("pushq %%r12\n\t"
 		             "pushq %%r13\n\t"
 		             "pushq %%r14\n\t"
 		             "pushq %%r15\n\t"
-		             "movq %%gs:0x08, %%r14\n\t"
-		             "movq %%gs:0x10, %%r15\n\t"
-		             "movq %[guest_stack_base], %%rax\n\t"
-		             "movq %%rax, %%gs:0x08\n\t"
-		             "movq %[guest_stack_limit], %%rax\n\t"
-		             "movq %%rax, %%gs:0x10\n\t"
 		             "movq %%rsp, %%r12\n\t"
 		             "movq %%rbp, %%r13\n\t"
 		             "movq %[guest_rsp], %%rsp\n\t"
@@ -308,8 +318,8 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		             "popq %%r12\n\t"
 		             : [guest_rsp] "+r"(guest_rsp_reg), [guest_rbp] "+r"(guest_rbp_reg)
 		             : [func] "r"(func_reg), "D"(params), "S"(atexit_func),
-		               [guest_stack_base] "m"(guest_stack_base),
-		               [guest_stack_limit] "m"(guest_stack_limit)
+		               [host_stack_base] "r"(host_base_reg),
+		               [host_stack_limit] "r"(host_limit_reg)
 		             : "cc", "memory", "rax", "rcx", "rdx", "r10", "r11", "xmm0", "xmm1", "xmm2",
 		               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 		               "xmm12", "xmm13", "xmm14", "xmm15");

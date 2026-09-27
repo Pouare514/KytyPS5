@@ -902,19 +902,33 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	    g_pthread_self->attr->stack_addr != nullptr) {
 		guest_stack_limit = reinterpret_cast<uintptr_t>(g_pthread_self->attr->stack_addr);
 	}
+	// Switch the TEB bounds in dedicated statements, never with inline scratch inside
+	// the switch template: any compiler-chosen scratch risks aliasing the "r" inputs,
+	// which silently destroys the guest stack pointer (observed as RSP collapsing to
+	// the stack bottom and an immediate guard-page fault on thread entry).
+	uintptr_t host_stack_base  = 0;
+	uintptr_t host_stack_limit = 0;
+	asm volatile("movq %%gs:0x08, %0\n\t"
+	             "movq %%gs:0x10, %1\n\t"
+	             : "=r"(host_stack_base), "=r"(host_stack_limit)
+	             :
+	             : "memory");
+	asm volatile("movq %0, %%gs:0x08\n\t"
+	             "movq %1, %%gs:0x10\n\t"
+	             :
+	             : "r"(guest_stack_base), "r"(guest_stack_limit)
+	             : "memory");
+	// PthreadExit re-enters the template below with the host bounds preloaded in
+	// r14/r15, so the template restores from those registers (like the Apple branch,
+	// they stay out of the clobber list: pushes preserve them and SysV guest code
+	// preserves them).
+	register uintptr_t host_base_reg asm("r14")  = host_stack_base;
+	register uintptr_t host_limit_reg asm("r15") = host_stack_limit;
 #endif
 	asm volatile("pushq %%r12\n\t"
 	             "pushq %%r13\n\t"
 	             "pushq %%r14\n\t"
 	             "pushq %%r15\n\t"
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	             "movq %%gs:0x08, %%r14\n\t"
-	             "movq %%gs:0x10, %%r15\n\t"
-	             "movq %[guest_stack_base], %%rax\n\t"
-	             "movq %%rax, %%gs:0x08\n\t"
-	             "movq %[guest_stack_limit], %%rax\n\t"
-	             "movq %%rax, %%gs:0x10\n\t"
-#endif
 	             "movq %%rsp, %%r12\n\t"
 	             "movq %%rbp, %%r13\n\t"
 	             "movq %[guest_rsp], %%rsp\n\t"
@@ -933,8 +947,8 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             : "=a"(ret), "+D"(arg), "+S"(func)
 	             : [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	             , [guest_stack_base] "m"(guest_stack_base),
-	               [guest_stack_limit] "m"(guest_stack_limit)
+	             , [host_stack_base] "r"(host_base_reg),
+	               [host_stack_limit] "r"(host_limit_reg)
 #endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
