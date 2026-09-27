@@ -149,6 +149,9 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 		// it and the violation becomes fatal. Retrying is always safe: the guard bit
 		// is consumed by the first touch, so a genuine overflow surfaces on retry as
 		// a plain access violation instead of looping here.
+		// Widen the TEB first for the same reason as the handled-fault path below:
+		// RtlGuardRestoreContext validates RSP against the TEB before resuming.
+		ExpandTebStackToInclude(exception->ContextRecord->Rsp);
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
 
