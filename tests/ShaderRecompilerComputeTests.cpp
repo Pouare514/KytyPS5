@@ -1208,6 +1208,7 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_storage_mip_descriptors = 0;
+  std::optional<std::vector<u32>> expected_buffer_resources;
 };
 
 struct GraphicsCase {
@@ -1241,7 +1242,9 @@ struct CompiledShader {
 
 std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
   std::array<u32, 64> data{};
+  data[3] = 3u << 28u;
   data[50] = 1u << 20u;
+  data[51] = 3u << 28u;
   if (source != nullptr) {
     data = *source;
   }
@@ -1564,18 +1567,26 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
   CheckSpirvText(test, result.spirv);
+  const auto *buffer_binding = ShaderRecompiler::IR::FindBinding(
+      result.program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
+  if (test.expected_buffer_resources) {
+    Require(test.name, "live buffer bindings",
+            buffer_binding != nullptr &&
+                buffer_binding->resources == *test.expected_buffer_resources,
+            "dead buffer changed the surviving descriptor order");
+  }
   std::vector<u32> packed_user_data;
   for (const auto reg : result.program.bindings.user_data_registers) {
     packed_user_data.push_back(
         resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
-  const auto buffer_count =
-      static_cast<u32>(result.program.info.buffers.size());
+  const auto buffer_count = result.program.bindings.memory_offset_count;
   for (u32 i = 0; i < buffer_count; i++) {
     u32 offset = 0;
-    if (i < test.storage_buffer_offsets.size()) {
-      offset = test.storage_buffer_offsets[i];
+    const auto resource = buffer_binding->resources[i];
+    if (resource < test.storage_buffer_offsets.size()) {
+      offset = test.storage_buffer_offsets[resource];
     }
     Require(test.name, "shader data", offset % sizeof(u32) == 0 && offset < 256,
             "storage buffer offset is not representable");
@@ -1593,7 +1604,8 @@ std::array<u32, 64> MakeStructuredStorageBufferData(u32 stride_bytes,
   std::array<u32, 64> data{};
   data[1] = (stride_bytes & 0x3fffu) << 16u;
   data[2] = num_records;
-  data[3] = DstSel(4, 5, 6, 7) | (1u << 24u);
+  data[3] = DstSel(4, 5, 6, 7) | (1u << 24u) |
+            (stride_bytes == 0 ? 3u << 28u : 0u);
   if (add_tid) {
     data[3] |= 1u << 23u;
   }
@@ -13233,8 +13245,9 @@ public:
         info.offset = 0;
         info.range = buffer.size;
         if (test.storage_buffer_range_dwords != 0) {
-          const auto offset = i < test.storage_buffer_offsets.size()
-                                  ? test.storage_buffer_offsets[i]
+          const auto resource = buffers->resources[i];
+          const auto offset = resource < test.storage_buffer_offsets.size()
+                                  ? test.storage_buffer_offsets[resource]
                                   : 0u;
           info.range = static_cast<vk::DeviceSize>(
               test.storage_buffer_range_dwords * sizeof(u32) + offset);
@@ -18876,6 +18889,31 @@ TestCase VectorFfbhI32NativeAndVop3OnGpu() {
   return test;
 }
 
+TestCase Vop1SdwaFfbhCapturedScalarLowWordSource() {
+  using O = ShaderOpcode;
+
+  constexpr std::array inputs = {0xdead0000u, 0xffff0001u, 0x00008000u,
+                                 0x00010008u, 0xffff4000u, 0x0000ffffu};
+  std::vector<u32> code;
+  for (u32 i = 0; i < inputs.size(); i++) {
+    AppendSmemLoadOpcode(&code, 0x08, 39, i * 4u);
+    code.insert(code.end(), {0x7e0072f9u, 0x00840627u}); // v_ffbh_u32 v0, s39.word0
+    AppendStoreVgpr(&code, 0, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaFfbhCapturedScalarLowWordSource";
+  test.code = std::move(code);
+  test.initial.assign(inputs.begin(), inputs.end());
+  test.expected = {0xffffffffu, 31u, 16u, 28u, 17u, 16u};
+  test.opcodes = {O::S_BUFFER_LOAD_DWORD, O::V_FFBH_U32, O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_FFBH_U32 v0, s39.sdwa(sel=4,sext=0)", inputs.size()}};
+  test.required_spirv = {"OpBitFieldUExtract", "FindUMsb"};
+  return test;
+}
+
 TestCase Vop1SdwaFfblCapturedHighWordSource() {
   using O = ShaderOpcode;
 
@@ -21189,6 +21227,37 @@ TestCase Vop1MoveRelDestination() {
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
+  return test;
+}
+
+TestCase CubeIdCapturedNegationAndOutputScale() {
+  using O = ShaderOpcode;
+
+  constexpr std::array directions = {
+      std::array{4.0f, 2.0f, 1.0f}, std::array{-4.0f, 2.0f, 1.0f},
+      std::array{1.0f, -4.0f, 2.0f}, std::array{1.0f, 4.0f, 2.0f},
+      std::array{1.0f, 2.0f, -4.0f}, std::array{1.0f, 2.0f, 4.0f}};
+  constexpr std::array registers = {47u, 49u, 48u};
+  TestCase test;
+  test.name = "CubeIdCapturedNegationAndOutputScale";
+  for (u32 i = 0; i < directions.size(); i++) {
+    for (u32 component = 0; component < registers.size(); component++) {
+      test.initial.push_back(std::bit_cast<u32>(directions[i][component]));
+      AppendVMovU32(&test.code, 30, (i * 3u + component) * 4u);
+      AppendBufferLoadDword(&test.code, registers[component], 30);
+    }
+    // The captured instruction negates Y/Z and divides the floating face ID by two.
+    test.code.insert(test.code.end(), {0xd544000bu, 0xdcc2632fu});
+    AppendStoreVgpr(&test.code, 11, i);
+  }
+  AppendEnd(&test.code);
+  test.expected = {0x00000000u, 0x3f000000u, 0x3f800000u,
+                   0x3fc00000u, 0x40000000u, 0x40200000u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_CUBEID_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {
+      {"V_CUBEID_F32 v11.omod(3), v47, v49.neg, v48.neg", directions.size()}};
+  test.required_spirv = {"OpFNegate", "OpFMul"};
   return test;
 }
 
@@ -23770,7 +23839,7 @@ TestCase BufferLoadFormatXChecksOnlyTransferredComponent() {
   return test;
 }
 
-TestCase BufferStoreFormatXChecksOnlyTransferredComponent() {
+TestCase BufferStoreFormatXRejectsPartialRecord() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
@@ -23781,10 +23850,10 @@ TestCase BufferStoreFormatXChecksOnlyTransferredComponent() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "BufferStoreFormatXChecksOnlyTransferredComponent";
+  test.name = "BufferStoreFormatXRejectsPartialRecord";
   test.code = std::move(code);
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
-  test.expected = {0x11111111u, 0x22222222u, 0x33333333u, 0xaaaaaaaau};
+  test.expected = test.initial;
   test.storage_buffer_range_dwords = 4;
   test.user_data = MakeStructuredStorageBufferData(
       0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
@@ -23817,7 +23886,7 @@ TestCase BufferLoadFormatXyChecksOnlyTransferredComponents() {
   return test;
 }
 
-TestCase BufferStoreFormatXyChecksOnlyTransferredComponents() {
+TestCase BufferStoreFormatXyRejectsPartialRecord() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
@@ -23829,10 +23898,10 @@ TestCase BufferStoreFormatXyChecksOnlyTransferredComponents() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "BufferStoreFormatXyChecksOnlyTransferredComponents";
+  test.name = "BufferStoreFormatXyRejectsPartialRecord";
   test.code = std::move(code);
   test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
-  test.expected = {0x11111111u, 0x22222222u, 0xaaaaaaaau, 0xbbbbbbbbu};
+  test.expected = test.initial;
   test.storage_buffer_range_dwords = 4;
   test.user_data = MakeStructuredStorageBufferData(
       0, 4, false, BufferFormat(Prospero::BufferFormat::k32_32_32_32Float));
@@ -24147,6 +24216,60 @@ TestCase BufferStoreFormatXResource16UintPreservesAdjacentLanes() {
   return test;
 }
 
+TestCase BufferStoreFormatXyzwPackedUnormSkinningVectors() {
+  using O = ShaderOpcode;
+
+  // The captured skinning dispatch stores a compressed quaternion with W = 1.
+  constexpr std::array<float, 12> values = {
+      0.25f, 0.5f, 0.75f, 1.0f,
+      -1.0f, 0.0f, 2.0f, 1.0f,
+      0.5f, 0.5f, 0.5f, 0.5f};
+  std::vector<u32> code;
+  for (u32 record = 0; record < 3; record++) {
+    for (u32 component = 0; component < 4; component++) {
+      AppendVMovLiteral(&code, component,
+                        std::bit_cast<u32>(values[record * 4 + component]));
+    }
+    AppendVMovU32(&code, 20, record);
+    code.push_back(EncodeMubuf0(0x07u, 0, true, false));
+    code.push_back(EncodeMubuf1(0, 0, 20));
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzwPackedUnormSkinningVectors";
+  test.code = std::move(code);
+  test.initial = std::vector<u32>(4, 0xdeadbeefu);
+  test.expected = {0xeff80100u, 0xfff00000u, 0xa0080200u, 0xdeadbeefu};
+  test.user_data = MakeStructuredStorageBufferData(
+      4, 3, false, BufferFormat(Prospero::BufferFormat::k10_10_10_2UNorm));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferStoreFormatXZeroFillsPackedRecord() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, std::bit_cast<u32>(0.5f));
+  AppendVMovU32(&code, 20, 4);
+  code.push_back(EncodeMubuf0(0x04u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXZeroFillsPackedRecord";
+  test.code = std::move(code);
+  test.initial = {0x11111111u, 0xffffffffu, 0x33333333u};
+  test.expected = {0x11111111u, 0x00000200u, 0x33333333u};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 12, false, BufferFormat(Prospero::BufferFormat::k10_10_10_2UNorm));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
+  return test;
+}
+
 TestCase BufferStoreFormatXyzwFloat16ConvertsComponents() {
   using O = ShaderOpcode;
 
@@ -24446,6 +24569,113 @@ TestCase BufferStoreFormatXDropsOutOfRangeRecord() {
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
   test.user_data = MakeStructuredStorageBufferData(4, 1, false, 20);
   test.has_user_data = true;
+  return test;
+}
+
+TestCase TBufferCapturedZeroStrideOob(bool raw_bounds = false, bool scalar = false) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = scalar ? "TBufferZeroStrideOobPreservesScalarRead"
+                    : raw_bounds ? "TBufferZeroStrideRawBoundsStillLoads"
+                                 : "TBufferCapturedZeroStrideOob";
+  test.initial = {0x11223344u, 0x55667788u, 0x99aabbccu, 0xddeeff00u,
+                  0x12345678u, 0xdeadbeefu, 0xdeadbeefu};
+  test.expected = test.initial;
+  for (u32 i = 0; i < 4; i++) {
+    test.expected[1 + i] = raw_bounds ? test.initial[i] : 0u;
+  }
+  test.expected[5] = test.initial[4];
+  if (scalar) test.expected[6] = test.initial[0];
+  test.user_data = MakeStructuredStorageBufferData(4, test.initial.size());
+  std::copy_n(test.user_data.begin(), 4, test.user_data.begin() + 4);
+  test.user_data[4] = 0x2000u;
+  // Captured HITMAN descriptor in s[32:35]: mode 0, zero stride, arbitrary base.
+  test.user_data[32] = 0x4a398620u;
+  test.user_data[33] = 0;
+  test.user_data[34] = 0x2b5u;
+  test.user_data[35] = 0x0004d000u | (raw_bounds ? 3u << 28u : 0u);
+  test.has_user_data = true;
+  test.storage_buffer_offsets = {0, 0, 16};
+  test.expected_buffer_resources = raw_bounds || scalar
+                                       ? std::vector<u32>{0, 1, 2}
+                                       : std::vector<u32>{0, 2};
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 0, test.initial[0]);
+  AppendStoreVgpr(&code, 0, 0); // Keep resource zero before the removed middle slot.
+  AppendVMovU32(&code, 30, 0);
+  code.push_back(0xea6b2000u);
+  code.push_back(0x8008191eu); // Exact pc 0x47c: typed float4, s[32:35], v30.
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeMubuf0(0x0cu));
+  code.push_back(EncodeMubuf1(33, 1, 20));
+  if (scalar) {
+    code.push_back(EncodeSmem0(0x08u, 40, 16));
+    code.push_back(EncodeSmem1(0));
+    code.push_back(EncodeVop1(0x01u, 32, 40));
+  }
+  for (u32 i = 0; i < 4; i++) AppendStoreVgpr(&code, 25 + i, 1 + i);
+  AppendStoreVgpr(&code, 33, 5);
+  if (scalar) AppendStoreVgpr(&code, 32, 6);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW,
+                  O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  if (scalar) test.opcodes.push_back(O::S_BUFFER_LOAD_DWORD);
+  test.ir_counts = {{"LoadBufferU32x4", raw_bounds ? 1u : 0u}};
+  return test;
+}
+
+TestCase BufferZeroStrideOobFormatsAndWidths() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "BufferZeroStrideOobFormatsAndWidths";
+  test.initial = std::vector<u32>(20, 0xdeadbeefu);
+  test.expected = std::vector<u32>(20, 0);
+  test.expected[10] = 0x3f800000u;
+  test.expected[12] = 0x3f800000u;
+  test.expected[14] = 1;
+  test.expected[16] = 1;
+  test.expected[18] = 0xabcdef01u;
+  test.expected[19] = 0xdeadbeefu;
+  test.user_data = MakeStructuredStorageBufferData(4, 20);
+  for (u32 base : {4u, 8u}) {
+    test.user_data[base] = 0x4a398620u;
+    test.user_data[base + 2] = 0x2b5u;
+    const u32 format = base == 4 ? 77u : 75u; // Four 32-bit float or unsigned integer components.
+    test.user_data[base + 3] = (format << 12u) | DstSel(1, 4, 1, 0);
+  }
+  test.has_user_data = true;
+  test.expected_buffer_resources = std::vector<u32>{0};
+  auto &code = test.code;
+  AppendVMovU32(&code, 0, 0);
+  AppendStoreVgpr(&code, 0, 0);
+  AppendVMovU32(&code, 20, 0);
+  u32 destination = 0;
+  for (const auto [opcode, width] :
+       {std::pair{0x08u, 1u}, {0x0au, 1u}, {0x0cu, 1u}, {0x0du, 2u}, {0x0fu, 3u}}) {
+    code.push_back(EncodeMubuf0(opcode));
+    code.push_back(EncodeMubuf1(destination, 1, 20));
+    destination += width;
+  }
+  AppendVMovU32(&code, 8, 0);
+  AppendVMovU32(&code, 9, 0);
+  for (u32 base : {1u, 2u}) {
+    code.push_back(EncodeMubuf0(0x03u));
+    code.push_back(EncodeMubuf1(base == 1 ? 10 : 14, base, 20));
+  }
+  AppendVMovLiteral(&code, 18, 0xabcdef01u);
+  code.push_back(EncodeSop1(0x04u, 60, 126u)); // Preserve the partial wave's active lanes.
+  code.push_back(EncodeSop1(0x04u, 126, InlineU32(0)));
+  code.push_back(EncodeMubuf0(0x00u));
+  code.push_back(EncodeMubuf1(18, 1, 20));
+  code.push_back(EncodeSop1(0x04u, 126, 60u));
+  for (u32 i = 0; i < 19; i++) AppendStoreVgpr(&code, i, i);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B64, O::BUFFER_LOAD_UBYTE,
+                  O::BUFFER_LOAD_USHORT, O::BUFFER_LOAD_DWORD,
+                  O::BUFFER_LOAD_DWORDX2, O::BUFFER_LOAD_DWORDX3,
+                  O::BUFFER_LOAD_FORMAT_X, O::BUFFER_LOAD_FORMAT_XYZW,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.ir_counts = {{"LoadBuffer", 0}};
   return test;
 }
 
@@ -28947,6 +29177,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
   AddCase(VectorIntegerOps);
   AddCase(VectorFfbhI32NativeAndVop3OnGpu);
+  AddCase(Vop1SdwaFfbhCapturedScalarLowWordSource);
   AddCase(Vop1SdwaFfblCapturedHighWordSource);
   AddCase(Vop1SdwaNotCapturedByte0Source);
   AddCase(Vop1SdwaNotPreservesHighWordDestination);
@@ -29018,6 +29249,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelDestination);
   AddCase(VectorFloatSpecialOps);
+  AddCase(CubeIdCapturedNegationAndOutputScale);
   AddCase(MadMixF16LiteralHalfSourceUsesOpsel);
   AddCase(MadMixF16NegHiIsAbsAndNegIsIndependent);
   AddCase(VectorVop3FmaF16UsesRdna2Opcode34b);
@@ -29090,9 +29322,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
   AddCase(BufferLoadFormatXChecksOnlyTransferredComponent);
-  AddCase(BufferStoreFormatXChecksOnlyTransferredComponent);
+  AddCase(BufferStoreFormatXRejectsPartialRecord);
   AddCase(BufferLoadFormatXyChecksOnlyTransferredComponents);
-  AddCase(BufferStoreFormatXyChecksOnlyTransferredComponents);
+  AddCase(BufferStoreFormatXyRejectsPartialRecord);
   AddCase(BufferStoreVariants);
   AddCase(BufferFormatVariants);
   AddCase(BufferLoadFormatXyzwSnapshotsOverlappingAddress);
@@ -29103,6 +29335,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferFormatStoreVariants);
   AddCase(BufferStoreFormatXResource16UintWritesHalfword);
   AddCase(BufferStoreFormatXResource16UintPreservesAdjacentLanes);
+  AddCase(BufferStoreFormatXyzwPackedUnormSkinningVectors);
+  AddCase(BufferStoreFormatXZeroFillsPackedRecord);
   AddCase(BufferStoreFormatXyzwFloat16ConvertsComponents);
   AddCase(BufferStoreFormatXyzwSnorm16CapturedSkinningVectors);
   AddCase(BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords);
@@ -29117,6 +29351,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreFormatXAddTidUsesLaneIndex);
   AddCase(BufferStoreFormatXDropsOutOfRangeRecord);
   AddCase(TBufferLoadVariants);
+  AddCase([] { return TBufferCapturedZeroStrideOob(); });
+  AddCase([] { return TBufferCapturedZeroStrideOob(true); });
+  AddCase([] { return TBufferCapturedZeroStrideOob(false, true); });
+  AddCase(BufferZeroStrideOobFormatsAndWidths);
   AddCase(TBufferLoadFormatXyzwSnapshotsOverlappingAddress);
   AddCase(TBufferLoadFormatXyzwPackedSnapshotsOverlappingAddress);
   AddCase(TBufferLoadFormatX8UintZeroExtendsByte);
@@ -33836,15 +34074,19 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorVopcCmpxOrderedCapturedExecMask());
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--buffer-snorm-store-only") == 0) {
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-format-store-only") == 0) {
     VulkanHarness vulkan;
+    RunCase(&vulkan, BufferStoreFormatXyzwPackedUnormSkinningVectors());
+    RunCase(&vulkan, BufferStoreFormatXZeroFillsPackedRecord());
+    RunCase(&vulkan, BufferStoreFormatXyzwFloat16ConvertsComponents());
     RunCase(&vulkan, BufferStoreFormatXyzwSnorm16CapturedSkinningVectors());
     RunCase(&vulkan, BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords());
     RunCase(&vulkan, BufferStoreFormatXResource16UintWritesHalfword());
     RunCase(&vulkan, BufferStoreFormatXResource16UintPreservesAdjacentLanes());
     RunCase(&vulkan, BufferStoreFormatXyResource88UintWritesBytes());
     RunCase(&vulkan, BufferStoreFormatXyzwDropsPartialRecord());
-    RunCase(&vulkan, BufferStoreFormatXChecksOnlyTransferredComponent());
+    RunCase(&vulkan, BufferStoreFormatXRejectsPartialRecord());
+    RunCase(&vulkan, BufferStoreFormatXyRejectsPartialRecord());
     RunCase(&vulkan, BufferFormatStoreVariants());
     return 0;
   }
@@ -34098,6 +34340,28 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-mov-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop1SdwaMovByteDestinations());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sdwa-ffbh-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop1SdwaFfbhCapturedScalarLowWordSource());
+    RunCase(&vulkan, VectorFfbhI32NativeAndVop3OnGpu());
+    RunCase(&vulkan, Vop1SdwaFfblCapturedHighWordSource());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cubeid-omod-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, CubeIdCapturedNegationAndOutputScale());
+    RunCase(&vulkan, VectorFloatSpecialOps());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--zero-stride-oob-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, TBufferCapturedZeroStrideOob());
+    RunCase(&vulkan, TBufferCapturedZeroStrideOob(true));
+    RunCase(&vulkan, TBufferCapturedZeroStrideOob(false, true));
+    RunCase(&vulkan, BufferZeroStrideOobFormatsAndWidths());
+    RunCase(&vulkan, TBufferLoadFormatXIdxenUsesDescriptorStride());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-ashr-only") == 0) {
