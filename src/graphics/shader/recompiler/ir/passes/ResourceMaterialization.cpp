@@ -461,6 +461,14 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    .zero_stride_oob = descriptor.OutOfBounds() == 0u && stride == 0u,
 		});
 	}
+	specialization.samplers.clear();
+	specialization.samplers.reserve(program.info.samplers.size());
+	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+		// Bit 15 of the first dword forces unnormalized coordinates.
+		const bool unnormalized =
+		    i < snapshot.samplers.size() && ((snapshot.samplers[i].dwords[0] >> 15u) & 1u) != 0u;
+		specialization.samplers.push_back({.unnormalized = unnormalized});
+	}
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = specialization.images[i];
@@ -1118,6 +1126,10 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	EXIT_IF(!BuildSamplerPlan(program.info, images, sampler_plan));
 	auto samplers      = program.info.samplers;
 	auto sampled_pairs = program.info.sampled_pairs;
+	for (size_t index = 0; index < samplers.size() && index < specialization.samplers.size();
+	     index++) {
+		samplers[index].unnormalized = specialization.samplers[index].unnormalized;
+	}
 	samplers.reserve(sampler_plan.sampler_count);
 	for (uint32_t index = 0; index < program.info.samplers.size(); index++) {
 		const auto target = sampler_plan.point_sampler[index];

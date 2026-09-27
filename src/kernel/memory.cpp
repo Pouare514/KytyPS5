@@ -2557,12 +2557,43 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	if (len == 0 || UINT64_MAX - vaddr < len) {
 		return KERNEL_ERROR_EINVAL;
 	}
-	std::vector<VirtualRanges::Range> ranges;
-	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges)) {
+	// A reserved span can contain pages that were unmapped earlier. Validate those holes
+	// against the host address space, then release each remaining tracked mapping.
+	// Do not treat an arbitrary untracked address as a successful unmap.
+	const auto end = vaddr + len;
+	std::vector<std::pair<uint64_t, uint64_t>> mapped_chunks;
+	auto current = vaddr;
+	while (current < end) {
+		VirtualRanges::Range range {};
+		if (!g_virtual_ranges->Query(current, 1, &range) || range.start >= end) {
+			if (!g_guest_address_space->ReleaseFree(current, end - current)) {
+				return KERNEL_ERROR_EACCES;
+			}
+			break;
+		}
+		if (current < range.start) {
+			const auto gap_size = range.start - current;
+			if (!g_guest_address_space->ReleaseFree(current, gap_size)) {
+				return KERNEL_ERROR_EACCES;
+			}
+			current = range.start;
+			continue;
+		}
+		const auto chunk_size = std::min<uint64_t>(end - current, range.size - (current - range.start));
+		mapped_chunks.emplace_back(current, chunk_size);
+		current += chunk_size;
+	}
+	if (mapped_chunks.empty()) {
 		return KERNEL_ERROR_EACCES;
 	}
-	UnmapGpuRange(vaddr, len);
-	return UnmapMemoryRange(vaddr, len);
+	for (const auto& [chunk_addr, chunk_size]: mapped_chunks) {
+		UnmapGpuRange(chunk_addr, chunk_size);
+		const int result = UnmapMemoryRange(chunk_addr, chunk_size);
+		if (result != OK) {
+			return result;
+		}
+	}
+	return OK;
 }
 
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
@@ -2753,6 +2784,22 @@ int KYTY_SYSV_ABI KernelAllocateDirectMemory(int64_t search_start, int64_t searc
 
 	uint64_t addr = 0;
 	if (!g_physical_memory->Alloc(search_start, search_end, len, alignment, &addr, memory_type)) {
+		LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
+		return KERNEL_ERROR_EAGAIN;
+	}
+
+	// Unmap deliberately keeps the backing contents so that remapping the same range still
+	// sees them, so a range taken from the free list would otherwise expose the previous
+	// owner's bytes. Whether a fresh allocation comes back cleared on the console is not
+	// something a guest can rely on, and some middleware reads its buffers before writing
+	// them, so clear the range here instead of gambling on it. Doing it at allocation leaves
+	// the unmap/remap contents contract untouched.
+	if (!g_guest_address_space->ZeroBacking(addr, len)) {
+		uint64_t      released_vaddr    = 0;
+		uint64_t      released_map_size = 0;
+		GpuAccessMode released_gpu_mode = GpuAccessMode::NoAccess;
+		(void)g_physical_memory->Release(addr, len, &released_vaddr, &released_map_size,
+		                                 &released_gpu_mode);
 		LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
 		return KERNEL_ERROR_EAGAIN;
 	}
@@ -3897,6 +3944,14 @@ int KYTY_SYSV_ABI KernelMemoryPoolExpand(int64_t search_start, int64_t search_en
 	if (!g_physical_memory->Alloc(static_cast<uint64_t>(search_start),
 	                              static_cast<uint64_t>(search_end), len, effective_alignment,
 	                              &phys_addr, 0, true)) {
+		return KERNEL_ERROR_ENOMEM;
+	}
+
+	// Same reasoning as KernelAllocateDirectMemory: an expansion can reuse a range whose
+	// backing still holds the previous owner's bytes, and the pool hands that memory out
+	// before anything writes it.
+	if (!g_guest_address_space->ZeroBacking(phys_addr, len)) {
+		(void)g_physical_memory->ReleasePoolExpansion(phys_addr, len);
 		return KERNEL_ERROR_ENOMEM;
 	}
 

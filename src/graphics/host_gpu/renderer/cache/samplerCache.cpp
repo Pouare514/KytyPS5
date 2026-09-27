@@ -3,7 +3,10 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+
+#include <algorithm>
 
 namespace Libs::Graphics {
 
@@ -56,10 +59,20 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 			case Prospero::SamplerAnisoRatio::kFour: aniso_ratio = 4.0f; break;
 			case Prospero::SamplerAnisoRatio::kEight: aniso_ratio = 8.0f; break;
 			case Prospero::SamplerAnisoRatio::kSixteen: aniso_ratio = 16.0f; break;
-			default:
-				EXIT("unknown ratio: %d dwords=%08x,%08x,%08x,%08x\n",
-				     static_cast<int>(r.MaxAnisoRatio()), r.fields[0], r.fields[1], r.fields[2],
-				     r.fields[3]);
+			default: {
+				// Encodings 5-7 are reserved. Descriptors like this show up in slots the shader
+				// never samples, so use the maximum instead of stopping the emulator.
+				static bool warned = false;
+				if (!warned) {
+					warned = true;
+					LOGF("SamplerCache: reserved anisotropy ratio %d, using 16x, "
+					     "dwords=%08x,%08x,%08x,%08x\n",
+					     static_cast<int>(r.MaxAnisoRatio()), r.fields[0], r.fields[1],
+					     r.fields[2], r.fields[3]);
+				}
+				aniso_ratio = 16.0f;
+				break;
+			}
 		}
 	}
 
@@ -69,6 +82,7 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	if (static_cast<Prospero::SamplerMipFilter>(mip_filter) != Prospero::SamplerMipFilter::kNone) {
 		min_lod = static_cast<float>(r.MinLod()) / 256.0f;
 		max_lod = static_cast<float>(r.MaxLod()) / 256.0f;
+		min_lod = std::min(min_lod, max_lod);
 	}
 
 	vk::SamplerCreateInfo sampler_info {};
@@ -125,8 +139,10 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	sampler_info.addressModeU = to_vk_address_mode(r.ClampX());
 	sampler_info.addressModeV = to_vk_address_mode(r.ClampY());
 	sampler_info.addressModeW = to_vk_address_mode(r.ClampZ());
-	sampler_info.mipLodBias =
-	    static_cast<float>(static_cast<int16_t>((r.LodBias() ^ 0x2000u) - 0x2000u)) / 256.0f;
+	const auto max_lod_bias = m_graphics.GetPhysicalDeviceProperties().limits.maxSamplerLodBias;
+	sampler_info.mipLodBias = std::clamp(
+	    static_cast<float>(static_cast<int16_t>((r.LodBias() ^ 0x2000u) - 0x2000u)) / 256.0f,
+	    -max_lod_bias, max_lod_bias);
 	sampler_info.anisotropyEnable        = (aniso ? VK_TRUE : VK_FALSE);
 	sampler_info.maxAnisotropy           = aniso_ratio;
 	sampler_info.compareEnable           = (r.DepthCompareFunc() != 0 ? VK_TRUE : VK_FALSE);
@@ -134,7 +150,9 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	sampler_info.minLod                  = min_lod;
 	sampler_info.maxLod                  = max_lod;
 	sampler_info.borderColor             = border;
-	sampler_info.unnormalizedCoordinates = (r.ForceUnormCoords() ? VK_TRUE : VK_FALSE);
+	// Unnormalized coordinates are emulated in the shader. Vulkan's own unnormalized samplers forbid
+	// implicit LOD, depth comparison and multi-level views, so the sampler stays normalized.
+	sampler_info.unnormalizedCoordinates = VK_FALSE;
 
 	if (r.ForceUnormCoords()) {
 		sampler_info.addressModeU     = vk::SamplerAddressMode::eClampToEdge;
@@ -145,7 +163,6 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		sampler_info.maxLod           = 0.0f;
 		sampler_info.anisotropyEnable = VK_FALSE;
 		sampler_info.maxAnisotropy    = 1.0f;
-		sampler_info.compareEnable    = VK_FALSE;
 		sampler_info.mipLodBias       = 0.0f;
 	}
 

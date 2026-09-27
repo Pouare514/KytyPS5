@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -1061,6 +1062,8 @@ void WindowContext::CreateVulkan() {
 		}
 	}
 
+	ShaderRecompiler::SetMaxLdsBytes(
+	    graphic_ctx.physical_device.getProperties().limits.maxComputeSharedMemorySize);
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
 	if (graphic_ctx.device == nullptr) {
 		EXIT("Could not create device");

@@ -26,6 +26,12 @@
 #include <unistd.h>
 #endif
 
+namespace Libs::LibKernel {
+// Live guest thread and fiber stacks registered by kernel/pthread.cpp. Forward-declared here
+// because kernel/pthread.h does not expose them.
+bool FindLiveGuestStack(uint64_t addr, uint64_t size, uint64_t* stack_start, uint64_t* stack_end);
+} // namespace Libs::LibKernel
+
 namespace Libs::Graphics {
 namespace {
 
@@ -191,6 +197,20 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		uint64_t stack_start = 0;
+		uint64_t stack_end   = 0;
+		if (mode != Common::VirtualMemory::Mode::ReadWrite &&
+		    Libs::LibKernel::FindLiveGuestStack(vaddr, size, &stack_start, &stack_end)) {
+			static std::atomic<uint32_t> reports {0};
+			if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::printf("PageManager: refusing to protect 0x%016" PRIx64 "+0x%" PRIx64
+				            " (mode 0x%x): overlaps live guest stack 0x%016" PRIx64
+				            "-0x%016" PRIx64 "\n",
+				            vaddr, size, static_cast<uint32_t>(mode), stack_start, stack_end);
+				std::fflush(stdout);
+			}
+			return;
+		}
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
@@ -377,7 +397,18 @@ void PageManager::ReapplyProtection(uint64_t vaddr, uint64_t size) {
 			}
 		};
 		for (size_t page_index = first; page_index < last; page_index++) {
-			const auto page_perms = region->pages[page_index].Perms();
+			auto page_perms = region->pages[page_index].Perms();
+			if (page_perms != Common::VirtualMemory::Mode::ReadWrite) {
+				// Live guest stacks are never write-protected (see Protect above); do not
+				// re-protect what Protect refuses.
+				uint64_t       stack_start = 0;
+				uint64_t       stack_end   = 0;
+				const uint64_t page_addr   = region_base + page_index * PAGE_SIZE;
+				if (Libs::LibKernel::FindLiveGuestStack(page_addr, PAGE_SIZE, &stack_start,
+				                                        &stack_end)) {
+					page_perms = Common::VirtualMemory::Mode::ReadWrite;
+				}
+			}
 			if (range_bytes == 0) {
 				perms       = page_perms;
 				range_begin = page_index;

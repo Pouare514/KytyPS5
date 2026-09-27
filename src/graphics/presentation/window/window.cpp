@@ -306,8 +306,17 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 
 	if (f.added) {
 		auto* pad = SDL_OpenGamepad(f.id);
-		EXIT_NOT_IMPLEMENTED(pad == nullptr);
-		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
+		if (pad == nullptr) {
+			LOGF("Gamepad open failed for id %d: %s\n", f.id, SDL_GetError());
+			return;
+		}
+		auto* joystick = SDL_GetGamepadJoystick(pad);
+		if (joystick == nullptr) {
+			LOGF("Gamepad has no joystick for id %d: %s\n", f.id, SDL_GetError());
+			SDL_CloseGamepad(pad);
+			return;
+		}
+		int id = SDL_GetJoystickID(joystick);
 		Controller::Connect(id);
 	}
 

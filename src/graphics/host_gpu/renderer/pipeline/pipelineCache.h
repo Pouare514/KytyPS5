@@ -10,6 +10,7 @@
 #include "graphics/shader/shader.h"
 
 #include <cstddef>
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -56,6 +57,8 @@ struct PipelineStaticParameters {
 	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
 	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+	// Target 0 blends with the logical source alpha, taken from the second (dual-source) output.
+	bool                       blend_alpha_source_remap                           = false;
 
 	bool operator==(const PipelineStaticParameters& other) const noexcept;
 };
@@ -65,7 +68,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 125);
+static_assert(sizeof(PipelineStaticParameters) == 126);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -215,8 +218,14 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
+	// Emulated games often end without a clean window close, so the driver cache is also written
+	// periodically while new pipelines are being compiled. Callers hold m_mutex.
+	std::chrono::steady_clock::time_point m_last_snapshot = std::chrono::steady_clock::now();
+	bool                                  m_snapshot_pending = false;
 
 	void InitializeDriverCache();
+	void WriteSnapshotLocked();
+	void MaybeSnapshotLocked();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

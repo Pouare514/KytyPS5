@@ -254,7 +254,10 @@ void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColor
 
 class Swapchain final {
 public:
-	enum class Status : uint8_t { Success, Recreate, SurfaceLost };
+	// `Minimized` is not an error: it means the surface currently has no drawable
+	// area (window minimized / iconified / zero-sized). Callers should skip
+	// presentation quietly instead of treating it like SurfaceLost or Recreate.
+	enum class Status : uint8_t { Success, Recreate, SurfaceLost, Minimized };
 
 	explicit Swapchain(WindowContext& window): m_window(window) {}
 	~Swapchain();
@@ -274,6 +277,9 @@ public:
 		return static_cast<uint32_t>(m_images.size());
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
+	// True while the surface has no drawable area (minimized/zero-sized).
+	// While true, no Vulkan swapchain handle, images, or semaphores exist.
+	[[nodiscard]] bool IsMinimized() const noexcept { return m_minimized; }
 
 private:
 	void Destroy();
@@ -283,6 +289,7 @@ private:
 	vk::SwapchainKHR m_handle = nullptr;
 	vk::Format       m_format = vk::Format::eUndefined;
 	vk::Extent2D     m_extent {};
+	bool             m_minimized = false;
 	// Drawable pixel size observed when this swapchain was created.
 	vk::Extent2D                   m_window_extent {};
 	std::vector<vk::Image>         m_images;
@@ -304,14 +311,25 @@ struct Presenter::Impl {
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
-		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
+		// If the window is already minimized/zero-sized at startup, the swapchain
+		// has no images yet (ImageCount() == 0). Fall back to a small pool size so
+		// the frame pool can still be used for off-swapchain frames before the
+		// window becomes visible and a real swapchain is created.
+		constexpr uint32_t kMinimizedFramePoolSize = 2;
+		frames.Initialize(swapchain.IsMinimized() ? kMinimizedFramePoolSize
+		                                          : swapchain.ImageCount(),
+		                  swapchain.Format());
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
-		frames.SetFormat(swapchain.Format());
+		// While minimized there is no live swapchain; the frame pool format gets
+		// refreshed once the window is drawable again and Recreate() succeeds.
+		if (!swapchain.IsMinimized()) {
+			frames.SetFormat(swapchain.Format());
+		}
 	}
 
 	Image& ResolveSurface(const ImageInfo& info) {
@@ -353,38 +371,22 @@ void Swapchain::Create() {
 
 	// Capture the size before querying surface capabilities. If the window changes
 	// during creation, the next presentation will detect the newer size.
+	uint32_t screen_width  = 0;
+	uint32_t screen_height = 0;
 	{
 		Common::LockGuard lock(m_window.mutex);
-		m_window_extent = {graphics.screen_width, graphics.screen_height};
+		screen_width  = graphics.screen_width;
+		screen_height = graphics.screen_height;
+		m_window_extent = {screen_width, screen_height};
 	}
-	EXIT_IF(m_window_extent.width == 0);
-	EXIT_IF(m_window_extent.height == 0);
 	m_window.RefreshSurfaceCapabilities();
 	const auto& surface = m_window.surface_capabilities;
 	EXIT_NOT_IMPLEMENTED(surface.formats.empty());
 
-	m_extent = surface.capabilities.currentExtent;
-	if (m_extent.width == std::numeric_limits<uint32_t>::max()) {
-		m_extent.width =
-		    std::clamp(m_window_extent.width, surface.capabilities.minImageExtent.width,
-		               surface.capabilities.maxImageExtent.width);
-		m_extent.height =
-		    std::clamp(m_window_extent.height, surface.capabilities.minImageExtent.height,
-		               surface.capabilities.maxImageExtent.height);
-	}
-	uint32_t image_count = surface.capabilities.minImageCount + 1;
-	if (surface.capabilities.maxImageCount != 0) {
-		image_count = std::min(image_count, surface.capabilities.maxImageCount);
-	}
-	const auto transform =
-	    surface.capabilities.supportedTransforms & vk::SurfaceTransformFlagBitsKHR::eIdentity
-	        ? vk::SurfaceTransformFlagBitsKHR::eIdentity
-	        : surface.capabilities.currentTransform;
-	const auto composite =
-	    surface.capabilities.supportedCompositeAlpha & vk::CompositeAlphaFlagBitsKHR::eOpaque
-	        ? vk::CompositeAlphaFlagBitsKHR::eOpaque
-	        : vk::CompositeAlphaFlagBitsKHR::eInherit;
-
+	// Negotiate the swapchain format up front, independent of the surface size.
+	// This lets Format() stay valid even in the zero-extent/minimized branch
+	// below, so the frame pool always has a real format to initialize/report,
+	// instead of vk::Format::eUndefined.
 	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
 	if (surface.formats.size() != 1 || surface.formats.front().format != vk::Format::eUndefined) {
 		const auto it = std::find_if(surface.formats.begin(), surface.formats.end(),
@@ -403,6 +405,45 @@ void Swapchain::Create() {
 		EXIT("swapchain format cannot be a blit destination: format=%d\n",
 		     static_cast<int>(m_format));
 	}
+
+	// A zero-sized drawable area (minimized/iconified/hidden window, or a
+	// platform reporting {0,0}) means "no drawable surface right now", not a
+	// fatal error. Mark minimized and return before vkCreateSwapchainKHR, which
+	// would reject a zero imageExtent per spec.
+	if (screen_width == 0 || screen_height == 0) {
+		m_minimized = true;
+		return;
+	}
+
+	m_extent = surface.capabilities.currentExtent;
+	if (m_extent.width == std::numeric_limits<uint32_t>::max()) {
+		m_extent.width =
+		    std::clamp(m_window_extent.width, surface.capabilities.minImageExtent.width,
+		               surface.capabilities.maxImageExtent.width);
+		m_extent.height =
+		    std::clamp(m_window_extent.height, surface.capabilities.minImageExtent.height,
+		               surface.capabilities.maxImageExtent.height);
+	}
+	// Catches a direct {0,0} currentExtent as well as a clamp above collapsing
+	// to zero because min/maxImageExtent were themselves {0,0}.
+	if (m_extent.width == 0 || m_extent.height == 0) {
+		m_minimized = true;
+		return;
+	}
+	m_minimized = false;
+
+	uint32_t image_count = surface.capabilities.minImageCount + 1;
+	if (surface.capabilities.maxImageCount != 0) {
+		image_count = std::min(image_count, surface.capabilities.maxImageCount);
+	}
+	const auto transform =
+	    surface.capabilities.supportedTransforms & vk::SurfaceTransformFlagBitsKHR::eIdentity
+	        ? vk::SurfaceTransformFlagBitsKHR::eIdentity
+	        : surface.capabilities.currentTransform;
+	const auto composite =
+	    surface.capabilities.supportedCompositeAlpha & vk::CompositeAlphaFlagBitsKHR::eOpaque
+	        ? vk::CompositeAlphaFlagBitsKHR::eOpaque
+	        : vk::CompositeAlphaFlagBitsKHR::eInherit;
 
 	vk::SwapchainCreateInfoKHR create_info {};
 	create_info.sType            = vk::StructureType::eSwapchainCreateInfoKHR;
@@ -526,6 +567,7 @@ void Swapchain::Destroy() {
 	m_handle        = nullptr;
 	m_format        = vk::Format::eUndefined;
 	m_extent        = {};
+	m_minimized     = false;
 	m_window_extent = {};
 	m_image_index   = static_cast<uint32_t>(-1);
 	m_frame_index   = 0;
@@ -558,7 +600,13 @@ bool Swapchain::NeedsResize() const {
 }
 
 Swapchain::Status Swapchain::AcquireNextImage() {
-	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
+	// No swapchain handle exists while minimized (Create() bails out before
+	// calling vkCreateSwapchainKHR); never call into Vulkan with a null/invalid
+	// handle here, just report the state so the caller can skip the frame.
+	if (m_minimized || m_handle == nullptr) {
+		return Status::Minimized;
+	}
+	EXIT_IF(m_frame_index >= m_image_acquired.size());
 	m_image_index     = static_cast<uint32_t>(-1);
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
@@ -832,6 +880,9 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 }
 
 Swapchain::Status Swapchain::Present() {
+	if (m_minimized || m_handle == nullptr) {
+		return Status::Minimized;
+	}
 	EXIT_IF(m_image_index >= m_render_complete.size());
 	const auto         ready = m_render_complete[m_image_index];
 	vk::PresentInfoKHR present {};
@@ -975,6 +1026,11 @@ void Presenter::Impl::Present() {
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
+			if (swapchain.IsMinimized()) {
+				// No drawable surface right now (window minimized / zero-sized).
+				// Quietly skip this frame instead of retrying against Vulkan.
+				return;
+			}
 			continue;
 		}
 		{
@@ -994,6 +1050,9 @@ void Presenter::Impl::Present() {
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
+			if (swapchain.IsMinimized()) {
+				return;
+			}
 			continue;
 		}
 
