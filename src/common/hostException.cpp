@@ -141,6 +141,17 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
 
+	if (exception_record->ExceptionCode == EXCEPTION_GUARD_PAGE) {
+		// One-shot stack-growth / watch notification: the OS clears the guard bit
+		// during dispatch, so retrying the faulting instruction succeeds. Crucially,
+		// this must not go through CONTINUE_SEARCH: when RSP lives on a stack the
+		// TEB does not describe (game fibers, APC/signal stacks), the OS cannot grow
+		// it and the violation becomes fatal. Retrying is always safe: the guard bit
+		// is consumed by the first touch, so a genuine overflow surfaces on retry as
+		// a plain access violation instead of looping here.
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+
 	ExceptionInfo info {};
 	info.exception_address = reinterpret_cast<uint64_t>(exception_record->ExceptionAddress);
 	info.native_code       = exception_record->ExceptionCode;
