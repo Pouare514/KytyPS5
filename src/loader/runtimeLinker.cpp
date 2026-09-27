@@ -231,7 +231,7 @@ static thread_local Program* g_tls_cached_main_program = nullptr;
 static thread_local uint8_t* g_tls_cached_main_tcb     = nullptr;
 
 static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_func_t atexit_func,
-                                   void* stack_top) {
+                                   void* stack_top, void* stack_bottom) {
 #if defined(__x86_64__) || defined(_M_X64)
 	auto* func = reinterpret_cast<entry_func_t>(addr);
 
@@ -274,8 +274,12 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		      "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",
 		      "xmm13", "xmm14", "xmm15");
 #elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		// Windows stack probes use the TEB stack limits during the guest stack switch.
-		// bounds, which describe the host stack and are invalid while RSP is in guest memory.
+		// Windows stack probes and RtlGuardIsValidStackPointer use the TEB stack limits.
+		// Publish the guest stack bounds, which are valid while RSP is in guest memory;
+		// stale host bounds break stack probes and zeroed bounds make any continued host
+		// exception terminate the process with FAST_FAIL_INVALID_SET_OF_CONTEXT.
+		const auto guest_stack_base  = aligned_stack_top;
+		const auto guest_stack_limit = reinterpret_cast<uintptr_t>(stack_bottom);
 		register entry_func_t func_reg asm("rbx")     = func;
 		register uintptr_t    guest_rsp_reg asm("r8") = guest_rsp;
 		register uintptr_t    guest_rbp_reg asm("r9") = guest_rbp;
@@ -285,9 +289,10 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		             "pushq %%r15\n\t"
 		             "movq %%gs:0x08, %%r14\n\t"
 		             "movq %%gs:0x10, %%r15\n\t"
-		             "xorq %%rcx, %%rcx\n\t"
-		             "movq %%rcx, %%gs:0x08\n\t"
-		             "movq %%rcx, %%gs:0x10\n\t"
+		             "movq %[guest_stack_base], %%rax\n\t"
+		             "movq %%rax, %%gs:0x08\n\t"
+		             "movq %[guest_stack_limit], %%rax\n\t"
+		             "movq %%rax, %%gs:0x10\n\t"
 		             "movq %%rsp, %%r12\n\t"
 		             "movq %%rbp, %%r13\n\t"
 		             "movq %[guest_rsp], %%rsp\n\t"
@@ -302,7 +307,9 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		             "popq %%r13\n\t"
 		             "popq %%r12\n\t"
 		             : [guest_rsp] "+r"(guest_rsp_reg), [guest_rbp] "+r"(guest_rbp_reg)
-		             : [func] "r"(func_reg), "D"(params), "S"(atexit_func)
+		             : [func] "r"(func_reg), "D"(params), "S"(atexit_func),
+		               [guest_stack_base] "m"(guest_stack_base),
+		               [guest_stack_limit] "m"(guest_stack_limit)
 		             : "cc", "memory", "rax", "rcx", "rdx", "r10", "r11", "xmm0", "xmm1", "xmm2",
 		               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 		               "xmm12", "xmm13", "xmm14", "xmm15");
@@ -367,6 +374,7 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 #endif
 #else
 	(void)stack_top;
+	(void)stack_bottom;
 	reinterpret_cast<entry_func_t>(addr)(params, atexit_func);
 #endif
 }
@@ -427,7 +435,8 @@ bool TestMainEntryUsesGuestStack() {
 #endif
 
 	RunEntry(reinterpret_cast<uint64_t>(TestMainEntryStackCallback), &params, nullptr,
-	         reinterpret_cast<void*>(stack_base + stack_size));
+	         reinterpret_cast<void*>(stack_base + stack_size),
+	         reinterpret_cast<void*>(stack_base));
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t restored_teb_stack_base  = 0;
@@ -437,7 +446,8 @@ bool TestMainEntryUsesGuestStack() {
 	             : "=r"(restored_teb_stack_base), "=r"(restored_teb_stack_limit)
 	             :
 	             : "memory");
-	const bool teb_ok = state.teb_stack_base == 0 && state.teb_stack_limit == 0 &&
+	const bool teb_ok = state.teb_stack_base == stack_base + stack_size &&
+	                    state.teb_stack_limit == stack_base &&
 	                    restored_teb_stack_base == original_teb_stack_base &&
 	                    restored_teb_stack_limit == original_teb_stack_limit;
 #else
@@ -1298,8 +1308,19 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 
 		LOGF("stack_addr = %" PRIx64 "\n", reinterpret_cast<uint64_t>(params));
 
+		uint64_t guest_stack_bottom = 0;
+		{
+			uint64_t guest_stack_addr = 0;
+			uint64_t guest_stack_size = 0;
+			if (Libs::LibKernel::PthreadGetGuestStack(Libs::LibKernel::PthreadSelfOrNull(),
+			                                          &guest_stack_addr, &guest_stack_size) &&
+			    guest_stack_addr != 0) {
+				guest_stack_bottom = guest_stack_addr;
+			}
+		}
 		RunEntry(entry, params, ProgramExitHandler,
-		         reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(params) - 0x1000u));
+		         reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(params) - 0x1000u),
+		         reinterpret_cast<void*>(guest_stack_bottom));
 	}
 }
 

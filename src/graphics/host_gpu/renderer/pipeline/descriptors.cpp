@@ -706,9 +706,9 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
                                  uint32_t index,
                                  const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
-	if (!program.info.samplers[index].depth_compare) {
-		descriptor.fields[0] &= ~(0x7u << 12u);
-	}
+	// SAMPLE_C is lowered to a regular sample plus an ALU compare. A comparison sampler is
+	// illegal with non-Dref SPIR-V, and host sampled views are color formats anyway.
+	descriptor.fields[0] &= ~(0x7u << 12u);
 	if (program.info.samplers[index].force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}

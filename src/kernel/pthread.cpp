@@ -889,6 +889,20 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	               "xmm12", "xmm13", "xmm14", "xmm15");
 #else
 	// PthreadExit resumes at this frame, so all four saved registers stay on the host stack.
+	//
+	// While guest code runs, describe the guest stack in the TEB instead of the host
+	// stack (stale: RSP is not on it) or zeroes. Zero TEB fields make
+	// RtlGuardIsValidStackPointer reject the guest RSP, so any continued host
+	// exception (handled GPU-tracking faults, emulated instructions, ...) terminates
+	// the process with FAST_FAIL_INVALID_SET_OF_CONTEXT in RtlGuardRestoreContext.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	uintptr_t guest_stack_base  = aligned_stack_top;
+	uintptr_t guest_stack_limit = 0;
+	if (g_pthread_self != nullptr && g_pthread_self->attr != nullptr &&
+	    g_pthread_self->attr->stack_addr != nullptr) {
+		guest_stack_limit = reinterpret_cast<uintptr_t>(g_pthread_self->attr->stack_addr);
+	}
+#endif
 	asm volatile("pushq %%r12\n\t"
 	             "pushq %%r13\n\t"
 	             "pushq %%r14\n\t"
@@ -896,9 +910,10 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             "movq %%gs:0x08, %%r14\n\t"
 	             "movq %%gs:0x10, %%r15\n\t"
-	             "xorq %%rcx, %%rcx\n\t"
-	             "movq %%rcx, %%gs:0x08\n\t"
-	             "movq %%rcx, %%gs:0x10\n\t"
+	             "movq %[guest_stack_base], %%rax\n\t"
+	             "movq %%rax, %%gs:0x08\n\t"
+	             "movq %[guest_stack_limit], %%rax\n\t"
+	             "movq %%rax, %%gs:0x10\n\t"
 #endif
 	             "movq %%rsp, %%r12\n\t"
 	             "movq %%rbp, %%r13\n\t"
@@ -917,6 +932,10 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             "popq %%r12\n\t"
 	             : "=a"(ret), "+D"(arg), "+S"(func)
 	             : [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	             , [guest_stack_base] "m"(guest_stack_base),
+	               [guest_stack_limit] "m"(guest_stack_limit)
+#endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
 	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",

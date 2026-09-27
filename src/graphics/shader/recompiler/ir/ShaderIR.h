@@ -132,6 +132,7 @@ struct ImageResource {
 	bool                          written           = false;
 	bool                          atomic            = false;
 	bool                          depth_compare     = false;
+	bool                          alu_depth_compare = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
 	uint32_t                      indirect_root     = NoIndirectImage;

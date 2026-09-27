@@ -24,6 +24,8 @@ public:
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
+	[[nodiscard]] bool HasWatchers(uint64_t vaddr, uint64_t size) const noexcept;
+	void               ReapplyProtection(uint64_t vaddr, uint64_t size);
 
 private:
 	struct Impl;

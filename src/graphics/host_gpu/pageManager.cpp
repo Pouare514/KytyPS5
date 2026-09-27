@@ -322,4 +322,80 @@ template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, Re
 template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&);
 
+bool PageManager::HasWatchers(uint64_t vaddr, uint64_t size) const noexcept {
+	if (vaddr == 0 || size == 0 || vaddr >= ADDRESS_SIZE || size > ADDRESS_SIZE - vaddr) {
+		return false;
+	}
+	const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
+	const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
+	for (auto chunk_begin = begin; chunk_begin < end;) {
+		const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+		const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+		auto*      region      = m_impl->FindRegion(chunk_begin);
+		if (region == nullptr) {
+			chunk_begin = chunk_end;
+			continue;
+		}
+		SpinGuard  lock(region->lock);
+		const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+		const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+		for (size_t page_index = first; page_index < last; page_index++) {
+			const auto& page = region->pages[page_index];
+			if (page.write_watchers != 0 || page.access_watchers != 0) {
+				return true;
+			}
+		}
+		chunk_begin = chunk_end;
+	}
+	return false;
+}
+
+void PageManager::ReapplyProtection(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0 || vaddr >= ADDRESS_SIZE || size > ADDRESS_SIZE - vaddr) {
+		return;
+	}
+	const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
+	const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
+	for (auto chunk_begin = begin; chunk_begin < end;) {
+		const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+		const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+		auto*      region      = m_impl->FindRegion(chunk_begin);
+		if (region == nullptr) {
+			chunk_begin = chunk_end;
+			continue;
+		}
+		SpinGuard  lock(region->lock);
+		const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+		const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+		auto       perms = region->pages[first].Perms();
+		uint64_t   range_begin = first;
+		uint64_t   range_bytes = 0;
+		const auto flush       = [&] {
+			if (range_bytes != 0) {
+				m_impl->Protect(region_base + range_begin * PAGE_SIZE, range_bytes, perms);
+				range_bytes = 0;
+			}
+		};
+		for (size_t page_index = first; page_index < last; page_index++) {
+			const auto page_perms = region->pages[page_index].Perms();
+			if (range_bytes == 0) {
+				perms       = page_perms;
+				range_begin = page_index;
+				range_bytes = PAGE_SIZE;
+				continue;
+			}
+			if (page_perms != perms) {
+				flush();
+				perms       = page_perms;
+				range_begin = page_index;
+				range_bytes = PAGE_SIZE;
+				continue;
+			}
+			range_bytes += PAGE_SIZE;
+		}
+		flush();
+		chunk_begin = chunk_end;
+	}
+}
+
 } // namespace Libs::Graphics

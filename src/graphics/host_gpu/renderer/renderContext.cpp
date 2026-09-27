@@ -55,19 +55,28 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 }
 
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	// The host reports the faulting byte, not the instruction's access width. Both caches
-	// resolve its page; guessing a width can cross the end of a valid guest mapping.
-	constexpr uint64_t fault_size = 1;
-	if (!IsMapped(fault_vaddr, fault_size)) {
+	try {
+		// The host reports the faulting byte, not the instruction's access width. Both caches
+		// resolve its page; guessing a width can cross the end of a valid guest mapping.
+		constexpr uint64_t fault_size = 1;
+		const bool         mapped     = IsMapped(fault_vaddr, fault_size);
+		const bool         watched    = m_page_manager.HasWatchers(fault_vaddr, fault_size);
+		if (!mapped && !watched) {
+			return false;
+		}
+		if (access == PageFaultAccess::Write) {
+			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		} else {
+			if (!mapped) {
+				return false;
+			}
+			m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+		}
+		return true;
+	} catch (...) {
 		return false;
 	}
-	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-	} else {
-		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
-	}
-	return true;
 }
 
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
@@ -77,6 +86,14 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
+}
+
+void RenderContext::ReapplyPageProtection(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+		return;
+	}
+	m_page_manager.ReapplyProtection(vaddr, size);
 }
 
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {

@@ -86,6 +86,62 @@ uint32_t ZeroF32(EmitterState& state) {
 	return ConstantF32(state, 0);
 }
 
+// Guest sampler compare function from dword 0, when it is a compile-time constant. Defaults to
+// LessEqual; the runtime snapshot is not available during emission.
+uint32_t ResolvedSamplerCompareFunc(const EmitterState& state, const IR::MemoryInfo& mem) {
+	if (mem.sampler < state.program.info.samplers.size()) {
+		const auto& sampler = state.program.info.samplers[mem.sampler];
+		if (sampler.source < state.program.descriptor_sources.size()) {
+			const auto& source = state.program.descriptor_sources[sampler.source];
+			if (source.dword_count > 0u) {
+				const auto dword0 = source.dwords[0].Resolve();
+				if (dword0.IsImmediate() && dword0.GetType() == IR::Type::U32) {
+					return (dword0.U32() >> 12u) & 0x7u;
+				}
+			}
+		}
+	}
+	return UINT32_MAX;
+}
+
+uint32_t SamplerCompareFunc(const EmitterState& state, const IR::MemoryInfo& mem) {
+	const auto func = ResolvedSamplerCompareFunc(state, mem);
+	return func == UINT32_MAX ? 3u : func;
+}
+
+// GCN IMAGE_SAMPLE_C on a guest depth format is emulated with a plain color sample plus an ALU
+// compare: host sampled views are color formats (including depth sampled as R16/R32), which do
+// not support depth-comparison sampling, so Vulkan Dref ops are illegal there. Images whose
+// guest format is not depth-like take a regular color sample; bitmap fonts use SAMPLE_C with
+// non-comparison samplers and expect the texel, not 0/1 coverage.
+bool ImageUsesAluDepthCompare(const EmitterState& state, const IR::MemoryInfo& mem) {
+	return mem.resource < state.program.info.images.size() &&
+	       state.program.info.images[mem.resource].alu_depth_compare;
+}
+
+uint32_t EmitAluDepthCompareF32(EmitterState& state, uint32_t sampled, uint32_t dref,
+                                uint32_t compare_func) {
+	const auto one  = ConstantF32Value(state, 1.0f);
+	const auto zero = ZeroF32(state);
+	switch (compare_func) {
+		case 0: return zero;
+		case 7: return one;
+		default: break;
+	}
+	auto opcode = spv::OpFOrdLessThanEqual;
+	switch (compare_func) {
+		case 1: opcode = spv::OpFOrdLessThan; break;
+		case 2: opcode = spv::OpFOrdEqual; break;
+		case 3: opcode = spv::OpFOrdLessThanEqual; break;
+		case 4: opcode = spv::OpFOrdGreaterThan; break;
+		case 5: opcode = spv::OpFOrdNotEqual; break;
+		case 6: opcode = spv::OpFOrdGreaterThanEqual; break;
+		default: break;
+	}
+	const auto pass = Binary(state, opcode, TypeBool(state), sampled, dref);
+	return Select(state, TypeF32(state), pass, one, zero);
+}
+
 uint32_t CubeAxis(EmitterState& state, uint32_t value) {
 	return Binary(state, spv::OpFSub, TypeF32(state), value, ConstantF32(state, 0x3f800000u));
 }
@@ -673,30 +729,20 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 			const auto            sampled = MakeSampledImage(state, mem.resource, mem.sampler);
 			const auto            sample  = state.builder.AllocateId();
-			std::vector<uint32_t> words;
-			if (dref) {
-				auto dref_value = ZeroF32(state);
-				if (layout.dref != NoImageComponent) {
-					dref_value = AddressF32(ctx, mem, *address, layout.dref);
-				}
-				words = {spv::OpImageDrefGather,
-				         TypeF32Vector(state, 4),
-				         sample,
-				         sampled,
-				         coord,
-				         dref_value};
-			} else {
-				uint32_t component = 0;
-				if (ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid) {
-					component = ImageGatherComponent(mem.dmask);
-				}
-				words = {spv::OpImageGather,
-				         ImageVectorType(state, numeric_class, 4),
-				         sample,
-				         sampled,
-				         coord,
-				         ConstantU32(state, component)};
+			const bool            alu_compare =
+			    dref && numeric_class == Prospero::TextureNumericClass::Float &&
+			    ImageUsesAluDepthCompare(state, mem);
+			uint32_t component = 0;
+			if (!alu_compare &&
+			    ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid) {
+				component = ImageGatherComponent(mem.dmask);
 			}
+			std::vector<uint32_t> words = {spv::OpImageGather,
+			                               ImageVectorType(state, numeric_class, 4),
+			                               sample,
+			                               sampled,
+			                               coord,
+			                               ConstantU32(state, component)};
 			if (HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
 				words.push_back(spv::ImageOperandsConstOffsetsMask);
 				words.push_back(HorizontalOffsets(state, dimension));
@@ -705,11 +751,29 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				words.push_back(PackedOffset(ctx, mem, *address, layout, dimension));
 			}
 			state.builder.AddFunction(words);
+			auto gathered = sample;
+			if (alu_compare) {
+				auto dref_value = ZeroF32(state);
+				if (layout.dref != NoImageComponent) {
+					dref_value = AddressF32(ctx, mem, *address, layout.dref);
+				}
+				const auto compare_func = SamplerCompareFunc(state, mem);
+				uint32_t   lanes[4] {};
+				for (uint32_t lane = 0; lane < 4u; lane++) {
+					const auto texel = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), texel,
+					                          sample, lane);
+					lanes[lane] = EmitAluDepthCompareF32(state, texel, dref_value, compare_func);
+				}
+				gathered = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4),
+				                          gathered, lanes[0], lanes[1], lanes[2], lanes[3]);
+			}
 			auto result_numeric_class = numeric_class;
 			if (dref) {
 				result_numeric_class = Prospero::TextureNumericClass::Float;
 			}
-			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
+			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, gathered),
 			                              result_numeric_class, false, mem, true));
 			return;
 		}
@@ -719,19 +783,20 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                          state.program.stage != ShaderType::Pixel;
 		auto       opcode       = spv::OpImageSampleImplicitLod;
 		if (explicit_lod) {
-			opcode = dref ? spv::OpImageSampleDrefExplicitLod : spv::OpImageSampleExplicitLod;
-		} else if (dref) {
-			opcode = spv::OpImageSampleDrefImplicitLod;
+			opcode = spv::OpImageSampleExplicitLod;
 		}
-		uint32_t result_type = ImageVectorType(state, numeric_class, 4);
-		uint32_t dref_value  = 0;
-		if (dref) {
-			result_type = TypeF32(state);
-			dref_value  = ZeroF32(state);
+		const uint32_t result_type = ImageVectorType(state, numeric_class, 4);
+		const bool     alu_compare =
+		    dref && numeric_class == Prospero::TextureNumericClass::Float &&
+		    ImageUsesAluDepthCompare(state, mem);
+		uint32_t dref_value = 0;
+		if (alu_compare) {
+			dref_value = ZeroF32(state);
 			if (layout.dref != NoImageComponent) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
 			}
 		}
+		const auto compare_func = alu_compare ? SamplerCompareFunc(state, mem) : 0u;
 		uint32_t              operand_mask = 0;
 		std::vector<uint32_t> operands;
 		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
@@ -760,9 +825,6 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto            sampled = MakeSampledImage(state, resource, mem.sampler);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> sample_operands {result_type, sample, sampled, coord};
-			if (dref) {
-				sample_operands.push_back(dref_value);
-			}
 			if (operand_mask != 0u) {
 				sample_operands.push_back(operand_mask);
 				sample_operands.insert(sample_operands.end(), operands.begin(), operands.end());
@@ -770,13 +832,21 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(opcode, sample_operands);
 			return sample;
 		};
+		const auto ApplyAluDepthCompare = [&](uint32_t color) {
+			const auto red = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), red,
+			                          UnpackImageTexel(ctx, mem, color), 0u);
+			return EmitAluDepthCompareF32(state, red, dref_value, compare_func);
+		};
 		if (image.indirect_root != mem.resource) {
 			const auto sample = EmitSample(mem.resource);
-			auto       result = sample;
-			if (!dref) {
-				result = UnpackImageTexel(ctx, mem, sample);
+			if (!alu_compare) {
+				ctx.Define(inst, ResultVector(ctx, UnpackImageTexel(ctx, mem, sample),
+				                              numeric_class, false, mem));
+				return;
 			}
-			ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
+			ctx.Define(inst, ResultVector(ctx, ApplyAluDepthCompare(sample), numeric_class, true,
+			                              mem));
 			return;
 		}
 		const auto* handle = image_arg.ResolveInstruction();
@@ -869,11 +939,13 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		EmitLabel(state, merge_label);
 		state.builder.AddFunction(phi_words);
-		auto result = phi_words[2];
-		if (!dref) {
-			result = UnpackImageTexel(ctx, mem, result);
+		const auto color = phi_words[2];
+		if (!alu_compare) {
+			ctx.Define(inst, ResultVector(ctx, UnpackImageTexel(ctx, mem, color), numeric_class,
+			                              false, mem));
+			return;
 		}
-		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
+		ctx.Define(inst, ResultVector(ctx, ApplyAluDepthCompare(color), numeric_class, true, mem));
 		return;
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);

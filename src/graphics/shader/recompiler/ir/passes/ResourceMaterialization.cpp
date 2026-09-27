@@ -61,6 +61,25 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 	return descriptor.dwords[0] == 0 && (descriptor.dwords[1] & 0xffu) == 0;
 }
 
+// Guest depth textures are sampled on the host as color (R16/R32), which cannot use Vulkan
+// depth-comparison sampling. Such images emulate IMAGE_SAMPLE_C with a color sample plus an
+// ALU compare; see ImageResource::alu_depth_compare and the SPIR-V image emitter.
+// NOTE: carrying this flag in ResourceSpecialization::Image (ResourceMaterialization.h, owned
+// by another worker) is still required end to end. Once that field exists, wire it here:
+//   - null descriptor -> alu_depth_compare = false;
+//   - otherwise alu_depth_compare = base.depth_compare && GuestFormatUsesAluDepthCompare(format);
+//   - reject when image.alu_depth_compare != (image.depth_compare &&
+//     GuestFormatUsesAluDepthCompare(format)) so color/depth format swaps recompile;
+//   - copy the flag in MaterializeResources init, the indirect exemplar propagation below,
+//     and ApplyResourceSpecialization.
+bool GuestFormatUsesAluDepthCompare(Prospero::BufferFormat format) {
+	switch (format) {
+		case Prospero::BufferFormat::k16UNorm:
+		case Prospero::BufferFormat::k32Float: return true;
+		default: return false;
+	}
+}
+
 bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) {
 	const auto& words = descriptor.dwords;
 	// Reject texture descriptors with nonzero reserved bits.
