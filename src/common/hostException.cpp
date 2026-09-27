@@ -82,11 +82,57 @@ bool InitializeThreadSignalStack() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+// ntdll!RtlRestoreContext fast-fails unless Context.Rsp is inside
+// TEB.StackLimit..StackBase. Thread entry already publishes guest bounds
+// (pthread.cpp RunOnGuestStack), but stacks entered through other paths
+// (fibers, APC/signal delivery, future entries) may not. Widen the TEB
+// bounds to the guest stack allocation as a complementary safety net:
+// only expand when Rsp is outside, never shrink.
+static void ExpandTebStackToInclude(uint64_t rsp) noexcept {
+	auto*          teb         = reinterpret_cast<uint8_t*>(NtCurrentTeb());
+	auto*          stack_base  = reinterpret_cast<uint64_t*>(teb + 0x08);
+	auto*          stack_limit = reinterpret_cast<uint64_t*>(teb + 0x10);
+	auto*          dealloc     = reinterpret_cast<uint64_t*>(teb + 0x1478);
+	const uint64_t base        = *stack_base;
+	const uint64_t limit       = *stack_limit;
+	if (rsp >= limit && rsp <= base) {
+		return;
+	}
+
+	uint64_t low  = rsp & ~0xFFFull;
+	uint64_t high = low + 0x1000u;
+	MEMORY_BASIC_INFORMATION mbi {};
+	if (VirtualQuery(reinterpret_cast<void*>(rsp), &mbi, sizeof(mbi)) != 0 &&
+	    mbi.State != MEM_FREE && mbi.AllocationBase != nullptr) {
+		low  = reinterpret_cast<uint64_t>(mbi.AllocationBase);
+		high = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+		MEMORY_BASIC_INFORMATION next {};
+		while (VirtualQuery(reinterpret_cast<void*>(high), &next, sizeof(next)) != 0 &&
+		       next.AllocationBase == mbi.AllocationBase) {
+			high = reinterpret_cast<uint64_t>(next.BaseAddress) + next.RegionSize;
+		}
+	}
+	if (high <= low) {
+		high = low + 0x1000u;
+	}
+	*stack_limit = low;
+	*stack_base  = high;
+	*dealloc     = low;
+}
+
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
 
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
-	    exception_record->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C) {
+	    exception_record->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C ||
+	    exception_record->ExceptionCode == 0xE06D7363 ||
+	    exception_record->ExceptionCode == EXCEPTION_BREAKPOINT ||
+	    exception_record->ExceptionCode == EXCEPTION_SINGLE_STEP ||
+	    exception_record->ExceptionCode == EXCEPTION_NONCONTINUABLE_EXCEPTION ||
+	    exception_record->ExceptionCode == 0xC0000409) {
+		// 0xE06D7363 = MSVC C++ EH; 0xC0000409 = STATUS_STACK_BUFFER_OVERRUN /
+		// __fastfail (int $0x29) — continuing it under a debugger re-fastfails.
+		// Let the OS/debugger own all of these.
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
@@ -134,6 +180,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
+		ExpandTebStackToInclude(exception->ContextRecord->Rsp);
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
 	return EXCEPTION_CONTINUE_SEARCH;

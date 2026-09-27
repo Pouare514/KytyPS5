@@ -65,14 +65,6 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 // Guest depth textures are sampled on the host as color (R16/R32), which cannot use Vulkan
 // depth-comparison sampling. Such images emulate IMAGE_SAMPLE_C with a color sample plus an
 // ALU compare; see ImageResource::alu_depth_compare and the SPIR-V image emitter.
-// NOTE: carrying this flag in ResourceSpecialization::Image (ResourceMaterialization.h, owned
-// by another worker) is still required end to end. Once that field exists, wire it here:
-//   - null descriptor -> alu_depth_compare = false;
-//   - otherwise alu_depth_compare = base.depth_compare && GuestFormatUsesAluDepthCompare(format);
-//   - reject when image.alu_depth_compare != (image.depth_compare &&
-//     GuestFormatUsesAluDepthCompare(format)) so color/depth format swaps recompile;
-//   - copy the flag in MaterializeResources init, the indirect exemplar propagation below,
-//     and ApplyResourceSpecialization.
 bool GuestFormatUsesAluDepthCompare(Prospero::BufferFormat format) {
 	switch (format) {
 		case Prospero::BufferFormat::k16UNorm:
@@ -491,6 +483,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			                                  : Prospero::TextureNumericClass::Float;
 			image.dimension     = Decoder::ImageDimension::Dim2D;
 			image.cube          = false;
+			image.alu_depth_compare = false;
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
@@ -506,6 +499,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		image.cube      = DescriptorIsCube(descriptor);
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+		image.alu_depth_compare = base.depth_compare && GuestFormatUsesAluDepthCompare(format);
 		if (base.atomic && format != Prospero::BufferFormat::k32UInt &&
 		    format != Prospero::BufferFormat::k32Float) {
 			return SpecializationFail(
@@ -593,6 +587,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				image.conversion_format = image_class.conversion_format;
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
+				image.alu_depth_compare = image_class.alu_depth_compare;
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
@@ -600,7 +595,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
-			    image.shader_swizzle != image_class.shader_swizzle) {
+			    image.shader_swizzle != image_class.shader_swizzle ||
+			    image.alu_depth_compare != image_class.alu_depth_compare) {
 				return SpecializationFail(
 				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
 				                program.info.images[root_index].first_use_pc));
@@ -1036,6 +1032,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		    .indirect_mapping_offset = image.indirect_mapping_offset,
 		    .indirect_search_iterations = image.indirect_search_iterations,
 		    .cube = image.cube,
+		    .alu_depth_compare = false,
 		};
 		const auto* source = Source(program, image.source);
 		if (source == nullptr) {
@@ -1106,6 +1103,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
+		image.alu_depth_compare          = source.alu_depth_compare;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {

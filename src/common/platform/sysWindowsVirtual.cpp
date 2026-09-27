@@ -44,7 +44,21 @@ static DWORD GetProtectionFlag(Mode mode) {
 	return protect;
 }
 
-void Init() {}
+void Init() {
+	// Windows 11 RtlRestoreContext validates CONTEXT.Rip after a VEH CONTINUE_EXECUTION.
+	// Guest JIT code lives in MEM_PRIVATE mappings (not IMAGE), so enable the documented
+	// JIT relaxed mode instead of redirecting RIP (that is itself FAST_FAIL_INVALID_SET_OF_CONTEXT).
+	PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY ssp {};
+	GetProcessMitigationPolicy(GetCurrentProcess(), ProcessUserShadowStackPolicy, &ssp,
+	                           sizeof(ssp));
+	ssp.SetContextIpValidation            = 1;
+	ssp.SetContextIpValidationRelaxedMode = 1;
+	if (SetProcessMitigationPolicy(ProcessUserShadowStackPolicy, &ssp, sizeof(ssp)) == 0) {
+		PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY relaxed {};
+		relaxed.SetContextIpValidationRelaxedMode = 1;
+		(void)SetProcessMitigationPolicy(ProcessUserShadowStackPolicy, &relaxed, sizeof(relaxed));
+	}
+}
 
 uint64_t Alloc(uint64_t address, uint64_t size, Mode mode) {
 	auto ptr = (address == 0 ? AllocAligned(address, size, mode, 1)
