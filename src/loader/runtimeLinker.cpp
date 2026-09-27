@@ -1,5 +1,7 @@
 #include "loader/runtimeLinker.h"
 
+#include "loader/x64InstructionDecoder.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -675,6 +677,63 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// Copy the faulting thread's register file into the shape the decoder expects. The reporter
+// owns every value it prints, so the decoder never has to reach for host state.
+static Loader::GuestX64Registers GuestRegistersFromInfo(
+    const Common::HostException::ExceptionInfo& info) {
+	return Loader::GuestX64Registers {
+	    .rip = info.exception_address,
+	    .rax = info.rax,
+	    .rbx = info.rbx,
+	    .rcx = info.rcx,
+	    .rdx = info.rdx,
+	    .rsi = info.rsi,
+	    .rdi = info.rdi,
+	    .rbp = info.rbp,
+	    .rsp = info.rsp,
+	    .r8  = info.r8,
+	    .r9  = info.r9,
+	    .r10 = info.r10,
+	    .r11 = info.r11,
+	    .r12 = info.r12,
+	    .r13 = info.r13,
+	    .r14 = info.r14,
+	    .r15 = info.r15,
+	};
+}
+
+// Defined further down, next to the other module-name helpers.
+static std::string GetProgramModuleName(const Program* program);
+
+// Render an already-resolved frame. The offset is clamped because a wrapped value in a fatal
+// report is worse than a zero offset.
+std::string FormatGuestFrame(const char* module_name, uint64_t base_vaddr, uint64_t vaddr) {
+	const std::string name = module_name != nullptr ? std::string(module_name) : std::string();
+	if (name.empty()) {
+		return std::string();
+	}
+	char text[32];
+	std::snprintf(text, sizeof(text), "+0x%016" PRIx64,
+	              vaddr >= base_vaddr ? vaddr - base_vaddr : 0);
+	return name + text;
+}
+
+// Serializes fault reporting against RuntimeLinker teardown.
+static Common::Mutex g_report_gate;
+
+// Print "0x<addr> module+0xoffset", or "module=<unknown>" when unattributable.
+static void ReportGuestAddress(RuntimeLinker* linker, uint64_t vaddr) {
+	const RuntimeLinker::GuestModuleInfo info =
+	    linker != nullptr ? linker->TryDescribeProgramByAddr(vaddr)
+	                      : RuntimeLinker::GuestModuleInfo{};
+	if (!info.found) {
+		std::printf("0x%016" PRIx64 " module=<unknown>\n", vaddr);
+		return;
+	}
+	std::printf("0x%016" PRIx64 " %s\n", vaddr,
+	            FormatGuestFrame(info.name.c_str(), info.base_vaddr, vaddr).c_str());
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -700,7 +759,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
 	{
-		char thread_name[64] = "(host thread)";
+		const bool gate_held = RuntimeLinker::Current() != nullptr && g_report_gate.TryLock();
+		auto*       linker    = gate_held ? RuntimeLinker::Current() : nullptr;
+		char        thread_name[64] = "(host thread)";
 		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
 			if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
 				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
@@ -715,21 +776,62 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
 		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
 		            info->r14, info->r15);
+		std::printf("fault pc: ");
+		ReportGuestAddress(linker, info->exception_address);
 		if (IsReadableRange(info->exception_address - 48, 96)) {
 			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
+			const auto faulting = Loader::DecodeGuestFaultingInstruction(
+			    reinterpret_cast<const uint8_t*>(info->exception_address), 48,
+			    GuestRegistersFromInfo(*info));
+			if (faulting.decoded) {
+				std::printf("fault insn: %s (len %u%s%s)\n", faulting.text, faulting.length,
+				            faulting.reads_memory ? ", read" : "",
+				            faulting.writes_memory ? ", write" : "");
+				if (faulting.reads_memory || faulting.writes_memory) {
+					std::printf("fault addr from insn: 0x%016" PRIx64 "\n",
+					            faulting.effective_address);
+				}
+			} else {
+				std::printf("fault insn: %s\n", faulting.text);
+			}
 			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
 			for (int i = 0; i < 96; i++) {
 				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
 			}
 			std::printf("\n");
 		}
+		{
+			void*     frames[20];
+			const int depth =
+			    WalkGuestStack(info->rbp, info->rsp, frames, static_cast<int>(std::size(frames)));
+			std::printf("backtrace: %d frame(s)\n", depth);
+			for (int i = 0; i < depth; i++) {
+				std::printf("  #%d ", i);
+				ReportGuestAddress(linker, reinterpret_cast<uint64_t>(frames[i]));
+			}
+		}
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 			std::printf("stack:");
 			for (int i = 0; i < 32; i++) {
-				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+				// Annotate the words that resolve to a loaded module. The raw value is
+				// always printed, so an unresolved word stays as informative as before.
+				const RuntimeLinker::GuestModuleInfo frame_info =
+				    linker != nullptr ? linker->TryDescribeProgramByAddr(stack[i])
+				                      : RuntimeLinker::GuestModuleInfo{};
+				if (frame_info.found) {
+					const std::string frame =
+					    FormatGuestFrame(frame_info.name.c_str(), frame_info.base_vaddr, stack[i]);
+					std::printf("%s %016" PRIx64 " <- %s", (i % 4 == 0) ? "\n " : "", stack[i],
+					            frame.c_str());
+				} else {
+					std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+				}
 			}
 			std::printf("\n");
+		}
+		if (gate_held) {
+			g_report_gate.Unlock();
 		}
 		std::fflush(stdout);
 	}
@@ -1198,12 +1300,23 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 	DeleteProgram(program);
 }
 
+std::atomic<RuntimeLinker*> RuntimeLinker::s_current {nullptr};
+
 RuntimeLinker::RuntimeLinker(): m_symbols(std::make_unique<SymbolDatabase>()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	s_current.store(this);
 }
 
 RuntimeLinker::~RuntimeLinker() {
+	{
+		Common::LockGuard lock(g_report_gate);
+		s_current.store(nullptr);
+	}
 	Clear();
+}
+
+RuntimeLinker* RuntimeLinker::Current() {
+	return s_current.load();
 }
 
 Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
@@ -1526,8 +1639,47 @@ Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_n
 	return nullptr;
 }
 
-Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
-	Common::LockGuard lock(m_mutex);
+RuntimeLinker::GuestModuleInfo RuntimeLinker::TryDescribeProgramByAddr(uint64_t vaddr) {
+	GuestModuleInfo info;
+	if (!m_mutex.TryLock()) {
+		return info;
+	}
+	Program* found = nullptr;
+	for (auto* p: m_programs) {
+		if (p == nullptr || p->elf == nullptr) {
+			continue;
+		}
+		const auto* ehdr = p->elf->GetEhdr();
+		const auto* phdr = p->elf->GetPhdr();
+		if (ehdr == nullptr || phdr == nullptr) {
+			continue;
+		}
+		for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
+			if (phdr[i].p_memsz != 0 &&
+			    (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
+				const uint64_t segment_addr = phdr[i].p_vaddr + p->base_vaddr;
+				const uint64_t segment_size = GetAlignedSize(phdr + i);
+				if (vaddr >= segment_addr && vaddr < segment_addr + segment_size) {
+					found = p;
+					break;
+				}
+			}
+		}
+		if (found != nullptr) {
+			break;
+		}
+	}
+	if (found != nullptr) {
+		// Copy what the report needs while the lock is still held.
+		info.found      = true;
+		info.name       = GetProgramModuleName(found);
+		info.base_vaddr = found->base_vaddr;
+	}
+	m_mutex.Unlock();
+	return info;
+}
+
+Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {	Common::LockGuard lock(m_mutex);
 
 	for (auto* p: m_programs) {
 		const auto* ehdr = p->elf->GetEhdr();
